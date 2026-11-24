@@ -26,6 +26,8 @@ Use the same full hash dataset for all variants. Measure cold starts, repeated u
 
 **First decision.** Capture the stock hash-only reference and freeze the memory threshold before testing either Rust index. Continue if a disk-backed index passes the memory, throughput, latency, and reference checks in the [hash baseline protocol](hash-baseline.md). Estimate its contribution to whole-engine savings using the stock allocation profile. [Hash signature formats](https://docs.clamav.net/manual/Signatures/HashSignatures.html)
 
+**Outcome.** On 2026-11-18, both disk-backed indexes saved about 39 MiB of warm idle memory. That missed the frozen 57 MiB threshold, so the experiment stopped for this generation. [Measured results](hash-benchmark-results.md)
+
 ## 3. Extend partial loading across the scan pipeline
 
 | Component | Rust implementation and parity test |

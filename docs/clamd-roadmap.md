@@ -32,7 +32,9 @@ The reference guest has one vCPU, 2 GiB RAM, and no swap. Five stock runs at con
 
 ## What to do next
 
-Finish the current hash issue first. Then work through the compatibility matrix, stock memory profile, and daemon interface in order. Use the memory profile to choose the next index experiment. Keep frequently accessed tables resident when paging them costs throughput. Count every mapped page charged to the scanner. Preserve all eligible signatures in every release candidate.
+The issues for tasks 1 through 5 are closed. Task 6 is in progress in [PR #19](https://github.com/yavosh/barnacle/pull/19). The whole-file hash experiment stopped because both disk-backed indexes missed the 57 MiB gate. [Hash results](hash-benchmark-results.md) · [Stock memory profile](stock-memory-profile.md)
+
+Use the memory profile to choose the next index experiment. Keep frequently accessed tables resident when paging them costs throughput. Count every mapped page charged to the scanner. Preserve all eligible signatures in every release candidate.
 
 Implement one issue at a time. For each PR, run the repository checks, compare the relevant behavior with a working stock clamd, and obtain independent review. Merge through the PR only after its acceptance criteria and required checks pass. Keep the umbrella [issue #5](https://github.com/yavosh/barnacle/issues/5) open until the full daemon qualifies.
 
