@@ -21,7 +21,7 @@ Each profile tests the same fixtures against the stock daemon and Barnacle. [Dae
 | `IDSESSION`, `END` | Check pipelined requests, numbered replies, session termination, and commands rejected inside a session. |
 | `STATS`, `DETSTATS`, `DETSTATSCLEAR` | Check the stats frame and its terminator. The two legacy commands close the connection without a payload. |
 | `SHUTDOWN`, `QUIT`, signals | Exercise both aliases, SIGHUP, SIGTERM, PID files, private socket cleanup, and a background launch. |
-| `RELOAD`, SIGUSR2, timed self-check | Replace local rules during service operation. Invalid updates retain the last validated index. Other official generations require [#11](https://github.com/yavosh/bacnacle/issues/11). |
+| `RELOAD`, SIGUSR2, timed self-check | Replace local rules during service operation. Invalid updates retain the last validated index. Other official generations require [#11](https://github.com/yavosh/barnacle/issues/11). |
 | Service startup | Exercise the packaged foreground flag and an inherited Unix listener with the real systemd socket launcher. |
 | Timeouts and cancellation | Compare command read deadlines with stock. Disconnect a partial upload and verify a new client can connect. |
 
@@ -58,7 +58,7 @@ Stock `clamdscan --ping` returned `PONG`. A path scan reported the fixture signa
 The inventory includes obsolete aliases, development options, and on-access client settings.
 The pinned parser accepts additional legacy directives, including `AllowSupplementaryGroups`, `ArchiveMaxFiles`, and `ScanOnAccess`.
 These legacy spellings and alternate engine policies still need individual compatibility tests.
-Full object scanning and bytecode execution have separate qualification tasks. [Object handling](https://github.com/yavosh/bacnacle/issues/9) · [Bytecode](https://github.com/yavosh/bacnacle/issues/4) · [Upstream options](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/common/optparser.c)
+Full object scanning and bytecode execution have separate qualification tasks. [Object handling](https://github.com/yavosh/barnacle/issues/9) · [Bytecode](https://github.com/yavosh/barnacle/issues/4) · [Upstream options](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/common/optparser.c)
 
 ## Database coverage
 
@@ -78,19 +78,19 @@ Use each profile's recorded database digests when comparing results.
 | Family and extensions | Archives containing these members | Coverage and next test |
 | --- | --- | --- |
 | Whole-file hashes, `.hdb .hsb` | main, daily | The offline matcher compares exact sizes, wildcards, miss behavior, duplicates, and competing names with stock. |
-| PUA-only hashes and rules, `.hdu .hsu .mdu .msu .ndu .ldu` | daily | The profile disables PUA. Test enabling the appropriate categories. [#10](https://github.com/yavosh/bacnacle/issues/10) |
-| Ignore names and file allowlists, `.ign .ign2 .fp .sfp` | daily has all four. Main has `.fp .sfp`. | Hash loading applies ignore entries. Test full-scan allowlist and competing-match precedence. [#10](https://github.com/yavosh/bacnacle/issues/10) |
+| PUA-only hashes and rules, `.hdu .hsu .mdu .msu .ndu .ldu` | daily | The profile disables PUA. Test enabling the appropriate categories. [#10](https://github.com/yavosh/barnacle/issues/10) |
+| Ignore names and file allowlists, `.ign .ign2 .fp .sfp` | daily has all four. Main has `.fp .sfp`. | Hash loading applies ignore entries. Test full-scan allowlist and competing-match precedence. [#10](https://github.com/yavosh/barnacle/issues/10) |
 | Extended patterns, `.ndb` | main, daily | 101,744 active rules compile. Raw object comparisons cover offsets, ranges, and match counts. [Body signature coverage](body-patterns.md) |
-| Logical patterns, `.ldb` | main, daily | Logical conditions and normalized-object comparisons remain open. [#3](https://github.com/yavosh/bacnacle/issues/3) |
-| PE section hashes, `.mdb .msb` | main, daily | Exercise benign sections and signed-file metadata. [#10](https://github.com/yavosh/bacnacle/issues/10) |
-| Container metadata and certificates, `.cdb .crb` | main, daily | Exercise nested object metadata and certificate decisions. [#9](https://github.com/yavosh/bacnacle/issues/9) · [#10](https://github.com/yavosh/bacnacle/issues/10) |
-| PE icons and URL rules, `.idb .pdb .wdb` | daily | Exercise benign local icon and URL fixtures. [#10](https://github.com/yavosh/bacnacle/issues/10) |
-| File types and dynamic settings, `.ftm .cfg` | daily | Check type reclassification at each layer and feature selection. [#9](https://github.com/yavosh/bacnacle/issues/9) · [#10](https://github.com/yavosh/bacnacle/issues/10) |
-| Bytecode, `.cbc` | bytecode | Compare supported hooks, execution limits, and detection names. [#4](https://github.com/yavosh/bacnacle/issues/4) |
-| Generation metadata, `.info` | main, daily, bytecode | Validate signed archives before activation. Exercise CVD and CLD update behavior. [#11](https://github.com/yavosh/bacnacle/issues/11) |
+| Logical patterns, `.ldb` | main, daily | Logical conditions and normalized-object comparisons remain open. [#3](https://github.com/yavosh/barnacle/issues/3) |
+| PE section hashes, `.mdb .msb` | main, daily | Exercise benign sections and signed-file metadata. [#10](https://github.com/yavosh/barnacle/issues/10) |
+| Container metadata and certificates, `.cdb .crb` | main, daily | Exercise nested object metadata and certificate decisions. [#9](https://github.com/yavosh/barnacle/issues/9) · [#10](https://github.com/yavosh/barnacle/issues/10) |
+| PE icons and URL rules, `.idb .pdb .wdb` | daily | Exercise benign local icon and URL fixtures. [#10](https://github.com/yavosh/barnacle/issues/10) |
+| File types and dynamic settings, `.ftm .cfg` | daily | Check type reclassification at each layer and feature selection. [#9](https://github.com/yavosh/barnacle/issues/9) · [#10](https://github.com/yavosh/barnacle/issues/10) |
+| Bytecode, `.cbc` | bytecode | Compare supported hooks, execution limits, and detection names. [#4](https://github.com/yavosh/barnacle/issues/4) |
+| Generation metadata, `.info` | main, daily, bytecode | Validate signed archives before activation. Exercise CVD and CLD update behavior. [#11](https://github.com/yavosh/barnacle/issues/11) |
 
 The pinned loader also recognizes `.db .sdb .imp .zmd .rmd .gdb .cat .ioc .pwdb .cud` and build-dependent `.yar .yara`.
-The frozen official archives contain none of these members. Track local-format qualification under [#10](https://github.com/yavosh/bacnacle/issues/10).
+The frozen official archives contain none of these members. Track local-format qualification under [#10](https://github.com/yavosh/barnacle/issues/10).
 [ClamAV 1.4.3 database loader](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/readdb.c) · [Signature formats](https://docs.clamav.net/manual/Signatures.html)
 
 ## Object handling coverage
@@ -108,7 +108,7 @@ ARM JIT, SWIZZOR, and the statistics module show as off in the dynamic settings.
 | Documents and mail | Cover PDF, XDP, RTF, OLE2, Office XML, HWP, OneNote, HTML mail, mbox, BinHex, TNEF, and uuencoding. |
 | Media, disk, and other embedded formats | Cover image metadata and fuzzy hashes, SWF, partition tables, UDF, ISO, HFS+, DMG, XAR, SIS, and compiled scripts. |
 
-Every remaining object handler needs a benign behavioral fixture under [#9](https://github.com/yavosh/bacnacle/issues/9).
+Every remaining object handler needs a benign behavioral fixture under [#9](https://github.com/yavosh/barnacle/issues/9).
 Each extracted object must retain its parent context and receive all eligible rules.
 For the complete dispatch cases, see the [pinned scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/scanners.c).
 

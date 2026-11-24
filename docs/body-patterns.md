@@ -46,7 +46,7 @@ Callers can count occurrences by rule ID. Offsets are relative to the supplied o
 Local names use the stock `.UNOFFICIAL` suffix. Unsupported active syntax reports the source file and line.
 
 `ObjectContext::raw` identifies the outer object. Use `ObjectContext::typed` when a parser supplies a normalized or extracted object.
-Every object needs its own context and offset calculations. [Object extraction work](https://github.com/yavosh/bacnacle/issues/9)
+Every object needs its own context and offset calculations. [Object extraction work](https://github.com/yavosh/barnacle/issues/9)
 
 ## Compare with stock
 

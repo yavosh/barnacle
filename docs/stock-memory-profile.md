@@ -62,11 +62,11 @@ The table subtracts each omission profile's median ready memory from the all-fam
 | Body patterns | 39.2 | 37.9–41.4 | 23.6 | 62.9 |
 | Container metadata, icons, and URL rules | 10.7 | 9.5–12.0 | 0.1 | 10.8 |
 
-All extracted families together used 998.5 MiB of anonymous memory at readiness. The fixed base used 10.4 MiB. Logical signatures account for the largest measured difference. When building the [logical matcher](https://github.com/yavosh/bacnacle/issues/3), measure pattern tables, expression programs, and per-scan state separately. The readiness measurement includes shared initialization costs. It cannot attribute bytes to individual compiled tables or measure scratch space allocated during a scan.
+All extracted families together used 998.5 MiB of anonymous memory at readiness. The fixed base used 10.4 MiB. Logical signatures account for the largest measured difference. When building the [logical matcher](https://github.com/yavosh/barnacle/issues/3), measure pattern tables, expression programs, and per-scan state separately. The readiness measurement includes shared initialization costs. It cannot attribute bytes to individual compiled tables or measure scratch space allocated during a scan.
 
 ## PE section storage results
 
-Mapping the 179.27 MiB section table saved **177.38–179.27 MiB** of warm idle memory. The mapped backend missed the unchanged-speed criterion. At one outstanding warm digest lookup, throughput fell 5.73% and p95 rose 8.40%. Keep this result as an engineering tradeoff when implementing [section detection](https://github.com/yavosh/bacnacle/issues/10). A complete daemon comparison is required before adopting this layout.
+Mapping the 179.27 MiB section table saved **177.38–179.27 MiB** of warm idle memory. The mapped backend missed the unchanged-speed criterion. At one outstanding warm digest lookup, throughput fell 5.73% and p95 rose 8.40%. Keep this result as an engineering tradeoff when implementing [section detection](https://github.com/yavosh/barnacle/issues/10). A complete daemon comparison is required before adopting this layout.
 
 | Trace | In flight | Pass | Idle saved (MiB) | Resident requests/s | Mapped requests/s | Resident p95 (µs) | Mapped p95 (µs) |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
