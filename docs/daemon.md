@@ -9,7 +9,7 @@ target/release/barnacle serve --foreground --config-file /path/to/clamd.conf
 
 Barnacle reads external databases from `DatabaseDirectory`. Use `TemporaryDirectory` for the compiled index during startup and reload.
 Keep FreshClam responsible for downloads. The current loader verifies the three [pinned archives](whole-file-hashes.md#reproduce-the-pinned-generation) before activation.
-A different official generation requires the update support tracked in [#11](https://github.com/yavosh/bacnacle/issues/11).
+A different official generation requires the update support tracked in [#11](https://github.com/yavosh/barnacle/issues/11).
 The Linux arm64 executable links to libc and the GCC runtime. It starts its own scanner and listeners.
 
 For offline use, compile a local whole-file signature database and verify the resulting index.
