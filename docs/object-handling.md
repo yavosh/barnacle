@@ -142,6 +142,10 @@ Both also match an outer PE hash before processing a nested PE resource.
 `ScanPE no` disables nested PE extraction. `MaxEmbeddedPE` includes an exact-size resource, and zero disables the size cap.
 [ELF comparisons](../tests/object_macho.rs) · [Embedded PE comparisons](../tests/object_embedded.rs)
 
+Barnacle does not unpack executables. Stock runs its UPX, FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
+Those stages belong to [#4](https://github.com/yavosh/barnacle/issues/4). A packed executable without an earlier match returns incomplete coverage, never a clean result.
+Matching stock's unpacked bytes also depends on the licensing review in [#17](https://github.com/yavosh/barnacle/issues/17). [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
+
 A Java 17 interface matched its target-12 body signature both directly and inside a JAR.
 A Java 11 class matched its whole-file hash in both locations. Stock treated the Java 21 control as generic data.
 Both daemons selected its whole-file hash over a target-12 rule. [Java fixtures](../tests/fixtures/java)
