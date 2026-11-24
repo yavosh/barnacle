@@ -10,16 +10,31 @@ md-5 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
 memmap2 = "0.9"
+memchr = "2"
 tempfile = "3"
 nix = { version = "0.30", features = ["fs", "poll", "user", "signal", "process", "resource"] }
 socket2 = { version = "0.6", features = ["all"] }
 signal-hook = "0.3"
 regex = "1"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-rs"] }
+bzip2 = "0.6"
+nsis = { version = "0.6.1", default-features = false }
+cfb = "0.15"
+delharc = { version = "0.8", default-features = false, features = ["std", "lh1", "lz", "no-unsafe-assertions"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
+lzxd = "0.2"
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2", "deflate", "ppmd"] }
 tar = "0.4"
 rustix = { version = "1", features = ["fs", "net"] }
 aho-corasick = "1"
+quick-xml = "0.42.0"
+encoding_rs = "0.8"
+deflate64 = "0.1.12"
+aes = "=0.9.4"
+cbc = "=0.2.1"
+lopdf = { version = "=0.47.0", default-features = false }
 
 [dev-dependencies]
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress"] }
 serde_json = "1"
 sha3 = "0.11"

@@ -9,6 +9,7 @@ use sha2::Sha256;
 pub mod body;
 mod feed;
 pub mod index;
+pub mod objects;
 pub use feed::{Feed, FileInventory, IgnoreSet, PINNED_FLEVEL};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -66,14 +67,18 @@ pub fn hash_reader(mut input: impl Read) -> io::Result<FileHashes> {
         sha1.update(&buf[..n]);
         sha256.update(&buf[..n]);
     }
-    let mut digests = [[0; 32]; 3];
-    digests[0][..16].copy_from_slice(&md5.finalize());
-    digests[1][..20].copy_from_slice(&sha1.finalize());
-    digests[2].copy_from_slice(&sha256.finalize());
-    Ok(FileHashes { size, digests })
+    Ok(FileHashes::finish(size, md5, sha1, sha256))
 }
 
 impl FileHashes {
+    fn finish(size: u64, md5: Md5, sha1: Sha1, sha256: Sha256) -> Self {
+        let mut digests = [[0; 32]; 3];
+        digests[0][..16].copy_from_slice(&md5.finalize());
+        digests[1][..20].copy_from_slice(&sha1.finalize());
+        digests[2].copy_from_slice(&sha256.finalize());
+        Self { size, digests }
+    }
+
     /// Format the whole-file MD5 reported by clamd's ExtendedDetectionInfo log.
     pub fn md5_hex(&self) -> String {
         use std::fmt::Write;

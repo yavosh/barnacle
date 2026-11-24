@@ -266,7 +266,7 @@ fn partial_reference(mut stock: Value) -> io::Result<Value> {
     for profile in ["local", "official"] {
         let results = &mut stock["profiles"][profile];
         let scans: &[&str] = if profile == "local" {
-            &["clean", "nested"]
+            &["clean"]
         } else {
             &["clean", "nested", "detected", "competing"]
         };

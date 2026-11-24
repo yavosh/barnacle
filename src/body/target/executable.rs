@@ -9,6 +9,7 @@ pub(super) struct Section {
 pub(super) struct Executable {
     pub(super) entry: usize,
     pub(super) sections: Vec<Section>,
+    pub(super) pe_overlay: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +98,8 @@ pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
 
     let mut result = Vec::with_capacity(count);
     let mut mapped_entry = None;
+    let mut high_rva = 0;
+    let mut pe_overlay = None;
     for h in sections {
         let rva = e.u32(h, 12)?;
         let pointer = e.u32(h, 20)?;
@@ -113,7 +116,18 @@ pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
         {
             return None;
         }
-        if let Some(delta) = entry.checked_sub(down(rva, salign))
+        let aligned_rva = down(rva, salign);
+        // The first section initializes the reference extent. Only a later section can start an overlay.
+        let end = aligned_rva.checked_add(size)?;
+        if result.is_empty() || end > high_rva {
+            high_rva = end;
+            if !result.is_empty() {
+                pe_overlay = raw
+                    .checked_add(size)
+                    .filter(|&offset| offset != 0 && offset < bytes.len());
+            }
+        }
+        if let Some(delta) = entry.checked_sub(aligned_rva)
             && delta < size
         {
             // The reference selects the last section containing the entry point.
@@ -130,6 +144,7 @@ pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
     Some(Executable {
         entry,
         sections: result,
+        pe_overlay,
     })
 }
 
@@ -194,6 +209,7 @@ pub(super) fn elf(bytes: &[u8]) -> Option<Executable> {
     Some(Executable {
         entry: entry as u32 as usize,
         sections,
+        pe_overlay: None,
     })
 }
 
@@ -264,5 +280,9 @@ pub(super) fn macho(bytes: &[u8]) -> Option<Executable> {
                 (delta < length).then(|| s.raw.checked_add(delta)).flatten()
             })?;
     }
-    Some(Executable { entry, sections })
+    Some(Executable {
+        entry,
+        sections,
+        pe_overlay: None,
+    })
 }

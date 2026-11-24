@@ -100,13 +100,13 @@ The daemon's scan options and installed libraries also affect dispatch.
 For example, the RAR switch is on. The pinned Debian image lacks the optional UnRAR interface.
 ARM JIT, SWIZZOR, and the statistics module show as off in the dynamic settings.
 
-| Handler group | Representative inputs and outstanding tests |
+| Handler group | Paired comparisons and remaining work |
 | --- | --- |
-| Raw, text, script, and HTML | The oracle scans harmless bytes. Compare ASCII and Unicode text, scripts, HTML normalization, and embedded objects. |
-| Archives and installers | The nested fixture exercises gzip extraction. Cover ZIP, tar, CPIO, bzip2, 7z, XZ, ARJ, RAR availability, ALZ, EGG, LHA, CAB, CHM, SZDD, and self-extractors. |
-| Executables | Compare PE packers and metadata, section hashes, ELF, and thin and universal Mach-O files. |
-| Documents and mail | Cover PDF, XDP, RTF, OLE2, Office XML, HWP, OneNote, HTML mail, mbox, BinHex, TNEF, and uuencoding. |
-| Media, disk, and other embedded formats | Cover image metadata and fuzzy hashes, SWF, partition tables, UDF, ISO, HFS+, DMG, XAR, SIS, and compiled scripts. |
+| Raw, text, script, and HTML | Paired tests exercise HTML, script normalization, MIME, TNEF, and uuencoded attachments. [Text comparisons](../tests/object_text.rs) |
+| Archives and installers | Tests cover compressed streams, archive order, NSIS, AutoIt EA05 and EA06, and ordinary InstallShield packages. Legacy InstallShield cabinets remain open. [Archive and installer coverage](object-handling.md#reference-handlers) |
+| Executables | Tests cover PE resources, ELF sections, thin and universal Mach-O files, and Java classes in JARs. PE unpacking remains open. [Executable comparisons](object-handling.md#executable-containers) |
+| Documents | Tests cover PDF, XDP, RTF, OLE2, Office XML, HWP, and OneNote. Excel comparisons cover picture entries, nested workbooks, and mixed Office extraction. VBA, XLM, and additional encryption cases remain open. [Document comparisons](object-handling.md#reference-handlers) · [Excel pictures](../tests/object_ole_xls.rs) |
+| Media and disks | Tests cover image signature targets, WAVE, SWF, optical images, partition tables, HFS+, DMG, and XAR. Image heuristics and several disk layouts need further comparisons. [Media and disk coverage](object-handling.md#reference-handlers) |
 
 Every remaining object handler needs a benign behavioral fixture under [#9](https://github.com/yavosh/barnacle/issues/9).
 Each extracted object must retain its parent context and receive all eligible rules.

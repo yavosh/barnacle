@@ -33,8 +33,9 @@ Use the following command to verify the partial daemon milestone.
 "$oracle" check-partial "$snapshot_dir" target/release/barnacle docs/compat-reference.json > /tmp/barnacle.json
 ```
 
-The two profiles contain 38 wire and client observations. At this milestone, 20 match stock exactly.
-The other 18 require specific incomplete-scan replies or client errors. These include nested detection and ordinary unmatched files.
+The two profiles contain 38 wire and client observations. The local gzip returns the inner signature through INSTREAM and clamdscan.
+The partial comparison requires 22 exact stock outcomes and 16 specific incomplete-scan responses.
+The incomplete cases include unmatched files and the full official database.
 The runner also checks the input hashes, configuration, version, signature names, framing, and client exit codes.
 Use `check` for full equivalence.
 

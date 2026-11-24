@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rustix::net::{self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
 
 use super::State;
-use super::engine::Detection;
+use super::engine::{Detection, ScanResult};
 
 mod jobs;
 mod order;
@@ -208,11 +208,7 @@ impl Reply<'_> {
         (&*self.conn).write_all(&bytes)
     }
 
-    fn scan(
-        &self,
-        generation: &super::Generation,
-        input: impl Read,
-    ) -> io::Result<Option<Detection>> {
+    fn scan(&self, generation: &super::Generation, input: impl Read) -> io::Result<ScanResult> {
         let mut checked: Option<Instant> = None;
         generation.scan_checked(input, || {
             if self.state.stopping() {
@@ -226,11 +222,11 @@ impl Reply<'_> {
         })
     }
 
-    fn result(&self, label: &OsStr, result: io::Result<Option<Detection>>) -> io::Result<bool> {
+    fn result(&self, label: &OsStr, result: io::Result<ScanResult>) -> io::Result<bool> {
         self.named_result(label, label, result)
     }
 
-    fn stream_result(&self, result: io::Result<Option<Detection>>) -> io::Result<bool> {
+    fn stream_result(&self, result: io::Result<ScanResult>) -> io::Result<bool> {
         let peer = match self.conn {
             Connection::Tcp(stream) => match stream.peer_addr() {
                 Ok(std::net::SocketAddr::V4(addr)) => {
@@ -247,12 +243,12 @@ impl Reply<'_> {
         &self,
         label: &OsStr,
         log_label: &OsStr,
-        result: io::Result<Option<Detection>>,
+        result: io::Result<ScanResult>,
     ) -> io::Result<bool> {
-        let detected = matches!(result, Ok(Some(_)));
+        let detected = matches!(result, Ok(ScanResult::Found(_)));
         let mut details = None;
         let status = match result {
-            Ok(Some(Detection { name, hashes })) => {
+            Ok(ScanResult::Found(Detection { name, hashes })) => {
                 if self.state.config.extended_detection_info
                     && let Some(hashes) = hashes
                 {
@@ -264,7 +260,8 @@ impl Reply<'_> {
                 }
                 format!("{name} FOUND")
             }
-            Ok(None) => INCOMPLETE.to_owned(),
+            Ok(ScanResult::Skipped) => "OK".to_owned(),
+            Ok(ScanResult::Incomplete) => INCOMPLETE.to_owned(),
             Err(error) => format!("{error}. ERROR"),
         };
         self.line_and_log(

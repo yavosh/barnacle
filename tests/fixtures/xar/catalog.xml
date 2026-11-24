@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inv:catalog xmlns:inv="urn:warehouse:inventory" xmlns:u="urn:warehouse:units">
+  <inv:part u:unit="box" id="P-042">Paper folders</inv:part>
+</inv:catalog>

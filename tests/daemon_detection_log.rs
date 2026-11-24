@@ -3,6 +3,7 @@
 mod client;
 
 use client::{Daemon, exchange, stream_frame, unix_request};
+use flate2::{Compression, write::GzEncoder};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
 use std::fs::{self, File};
 use std::io::{self, IoSlice, Read, Write};
@@ -13,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-fn detection_log(exe: &Path, extended: bool) -> io::Result<()> {
+fn detection_log(exe: &Path, extended: bool, input: &[u8]) -> io::Result<()> {
     let tmp = tempfile::tempdir_in("/tmp")?;
     let root = tmp.path().canonicalize()?;
     let config = root.join("clamd.conf");
@@ -27,7 +28,7 @@ fn detection_log(exe: &Path, extended: bool) -> io::Result<()> {
     drop(listener);
     fs::create_dir(&db)?;
     fs::write(db.join("test.hdb"), format!("{md5}:6:Test\n"))?;
-    fs::write(&path, b"abcdef")?;
+    fs::write(&path, input)?;
     fs::write(
         &config,
         format!(
@@ -47,7 +48,7 @@ fn detection_log(exe: &Path, extended: bool) -> io::Result<()> {
         format!("{}: {wire}", path.display())
     );
 
-    let stream = stream_frame(b"abcdef")?;
+    let stream = stream_frame(input)?;
     assert_eq!(unix_request(&socket, &stream)?, format!("stream: {wire}"));
     let tcp = TcpStream::connect(addr)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -81,7 +82,8 @@ fn detection_log(exe: &Path, extended: bool) -> io::Result<()> {
     assert!(fd.parse::<u32>().is_ok());
 
     let expected = if extended {
-        format!("Test.UNOFFICIAL({md5}:6) FOUND")
+        let digest = barnacle::hash_reader(input)?.md5_hex();
+        format!("Test.UNOFFICIAL({digest}:{}) FOUND", input.len())
     } else {
         "Test.UNOFFICIAL FOUND".into()
     };
@@ -125,15 +127,22 @@ fn detection_log(exe: &Path, extended: bool) -> io::Result<()> {
 
 #[test]
 fn extended_detection_info_controls_only_log_details() -> io::Result<()> {
-    let exe = Path::new(env!("CARGO_BIN_EXE_barnacle"));
-    detection_log(exe, false)?;
-    detection_log(exe, true)
+    compare(Path::new(env!("CARGO_BIN_EXE_barnacle")))
 }
 
 #[test]
 #[ignore = "requires pinned Debian clamd 1.4.3"]
 fn stock_extended_detection_info_controls_only_log_details() -> io::Result<()> {
-    let exe = Path::new("/usr/sbin/clamd");
-    detection_log(exe, false)?;
-    detection_log(exe, true)
+    compare(Path::new("/usr/sbin/clamd"))
+}
+
+fn compare(exe: &Path) -> io::Result<()> {
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(b"abcdef")?;
+    let compressed = gzip.finish()?;
+    for input in [b"abcdef".as_slice(), compressed.as_slice()] {
+        detection_log(exe, false, input)?;
+        detection_log(exe, true, input)?;
+    }
+    Ok(())
 }

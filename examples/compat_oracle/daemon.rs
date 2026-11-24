@@ -56,6 +56,7 @@ impl Daemon {
                 .spawn()?,
         );
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut first_permission_error = None;
         while Instant::now() < deadline {
             if let Some(status) = daemon.0.try_wait()? {
                 let message = fs::read_to_string(&log)?;
@@ -72,8 +73,13 @@ impl Daemon {
                     if matches!(
                         e.kind(),
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) =>
+                    ) || (e.kind() == io::ErrorKind::PermissionDenied
+                        && first_permission_error
+                            .get_or_insert_with(Instant::now)
+                            .elapsed()
+                            < Duration::from_secs(1)) =>
                 {
+                    // Stock binds the socket with mode 000 before applying LocalSocketMode.
                     thread::sleep(Duration::from_millis(50))
                 }
                 Err(e) => return Err(e),

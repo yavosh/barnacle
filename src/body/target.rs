@@ -89,6 +89,10 @@ pub struct Offset {
 }
 
 impl Offset {
+    pub(super) fn is_relative(&self) -> bool {
+        !matches!(self.base, Base::Any | Base::Absolute)
+    }
+
     pub fn parse(text: &str, target: Target) -> io::Result<Self> {
         if text.len() > 64 {
             return Err(invalid("offset exceeds 64 bytes"));
@@ -195,6 +199,14 @@ impl ObjectContext {
 
     pub fn is_valid_pe(&self) -> bool {
         self.target == Target::Pe && self.exe.is_some()
+    }
+
+    pub(crate) fn has_executable_layout(&self) -> bool {
+        self.exe.is_some()
+    }
+
+    pub(crate) fn pe_overlay(&self) -> Option<usize> {
+        self.exe.as_ref()?.pe_overlay
     }
 
     pub fn accepts(&self, target: Target) -> bool {

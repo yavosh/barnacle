@@ -9,7 +9,7 @@ use memmap2::Mmap;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{Algorithm, Rule};
+use crate::{Algorithm, FileHashes, Rule};
 
 const MAGIC: &[u8; 8] = b"BNHASH01";
 const HEADER: usize = 16;
@@ -186,10 +186,17 @@ fn name_span(row: &[u8]) -> io::Result<(usize, usize)> {
     ))
 }
 
+struct Sizes {
+    min: u32,
+    max: u32,
+    wildcard: bool,
+}
+
 pub struct Index {
     data: Storage,
     count: usize,
     directory: Vec<Key>,
+    sizes: [Sizes; 3],
 }
 
 impl Index {
@@ -251,6 +258,11 @@ impl Index {
             end,
         });
         let mut directory = Vec::new();
+        let mut sizes = std::array::from_fn(|_| Sizes {
+            min: u32::MAX,
+            max: 0,
+            wildcard: false,
+        });
         let mut hash = Sha256::new();
         hash.update(header);
         let mut previous = None;
@@ -265,6 +277,14 @@ impl Index {
             }
             if !valid_key(&k) || previous.is_some_and(|p| p >= k) {
                 return Err(invalid("invalid or unordered lookup key"));
+            }
+            let range = &mut sizes[usize::from(k[0])];
+            if k[33] == 0 {
+                range.wildcard = true;
+            } else {
+                let size = u32::from_be_bytes(k[34..38].try_into().unwrap());
+                range.min = range.min.min(size);
+                range.max = range.max.max(size);
             }
             name.resize(len, 0);
             names.read_exact(&mut name)?;
@@ -287,7 +307,56 @@ impl Index {
             data,
             count,
             directory,
+            sizes,
         })
+    }
+
+    /// Hash extracted bytes only when the generation could match their algorithm and size.
+    pub fn match_bytes(
+        &self,
+        bytes: &[u8],
+        check: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<String>> {
+        check()?;
+        let size = u32::try_from(bytes.len()).ok();
+        let exact = self
+            .sizes
+            .each_ref()
+            .map(|r| size.is_some_and(|n| (r.min..=r.max).contains(&n)));
+        let eligible = Algorithm::ALL.map(|a| exact[a as usize] || self.sizes[a as usize].wildcard);
+        if !eligible.contains(&true) {
+            return Ok(None);
+        }
+        let mut md5 = md5::Md5::new();
+        let mut sha1 = sha1::Sha1::new();
+        let mut sha256 = Sha256::new();
+        for chunk in bytes.chunks(32 * 1024) {
+            if eligible[0] {
+                md5.update(chunk);
+            }
+            if eligible[1] {
+                sha1.update(chunk);
+            }
+            if eligible[2] {
+                sha256.update(chunk);
+            }
+            check()?;
+        }
+        FileHashes::finish(bytes.len() as u64, md5, sha1, sha256).lookup(
+            |algorithm, digest, size| {
+                let i = algorithm as usize;
+                let can_match = if size.is_some() {
+                    exact[i]
+                } else {
+                    self.sizes[i].wildcard
+                };
+                if can_match {
+                    self.lookup(algorithm, digest, size)
+                } else {
+                    Ok(None)
+                }
+            },
+        )
     }
 
     pub fn lookup(
@@ -338,6 +407,53 @@ mod tests {
             size: Some(11),
             name: format!("Example.{i}"),
         }
+    }
+
+    #[test]
+    fn extracted_hashes_keep_reference_order_and_check_cancellation() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let payload = vec![b'Q'; 96 * 1024];
+        let hashes = crate::hash_reader(&payload[..])?;
+        let mut rows = Vec::new();
+        hashes.lookup(|algorithm, digest, size| {
+            rows.push(Rule {
+                algorithm,
+                digest: *digest,
+                size,
+                name: format!("{algorithm:?}.{size:?}"),
+            });
+            Ok(None)
+        })?;
+        // Remove each winning rule in turn. Both exact and wildcard lookups must
+        // still precede the next algorithm, including when only SHA-256 remains.
+        for start in 0..=rows.len() {
+            let path = directory.path().join(start.to_string());
+            let mut rules = rows[start..].to_vec();
+            let mut unrelated = rows[0].clone();
+            unrelated.size = Some(8);
+            rules.push(unrelated);
+            build(&path, &mut rules)?;
+            let index = Index::open_pread(&path)?;
+            let actual = index.match_bytes(&payload, &mut || Ok(()))?;
+            let reference = hashes.lookup(|a, d, s| index.lookup(a, d, s))?;
+            assert_eq!(actual, reference);
+            assert_eq!(actual.as_ref(), rows.get(start).map(|r| &r.name));
+            if start == 0 {
+                let mut checks = 0;
+                let error = index
+                    .match_bytes(&payload, &mut || {
+                        checks += 1;
+                        if checks == 3 {
+                            Err(io::ErrorKind::TimedOut.into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            }
+        }
+        Ok(())
     }
 
     #[test]

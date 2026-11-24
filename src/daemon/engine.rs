@@ -3,8 +3,9 @@ mod cvd;
 mod raw;
 
 use super::Config;
-use barnacle::body::{BodyIndex, ObjectContext};
+use barnacle::body::BodyIndex;
 use barnacle::index::{self, Index};
+use barnacle::objects::{self, Limit, Options, Snapshot, Verdict};
 use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
 use nix::libc;
 use std::ffi::CStr;
@@ -159,6 +160,12 @@ pub(super) struct Detection {
     pub hashes: Option<FileHashes>,
 }
 
+pub(super) enum ScanResult {
+    Found(Detection),
+    Incomplete,
+    Skipped,
+}
+
 pub(super) struct Generation {
     sources: Vec<Source>,
     index: Index,
@@ -166,9 +173,11 @@ pub(super) struct Generation {
     temporary_directory: PathBuf,
     version: String,
     scan_limit: u64,
+    objects: Options,
     scan_time: Duration,
     partial_only: bool,
     needs_hashes: bool,
+    has_hash_rules: bool,
 }
 
 fn daily_version() -> io::Result<String> {
@@ -249,8 +258,8 @@ impl Generation {
             Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
         };
         let partial_only = has_cvd || feed.inventory.iter().any(|i| i.outside_matcher > 0);
-        let needs_hashes =
-            !partial_only && (!feed.rules.is_empty() || config.extended_detection_info);
+        let has_hash_rules = !feed.rules.is_empty();
+        let needs_hashes = (!partial_only && has_hash_rules) || config.extended_detection_info;
         let db = temp.path().join("index.bhi");
         index::build(&db, &mut feed.rules)?;
         drop(feed);
@@ -265,20 +274,25 @@ impl Generation {
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }
-        let scan_limit = [config.max_file_size, config.max_scan_size]
+        let scan_limit = [config.objects.max_file_size, config.objects.max_scan_size]
             .into_iter()
             .filter(|&n| n != 0)
             .min()
             .unwrap_or(u64::MAX);
+        let mut objects = config.objects.clone();
+        objects.scan_normalized_script = body.needs_normalized_script();
+        objects.map_normalized_script = body.needs_normalized_script_map();
         Ok(Self {
             sources: inputs,
             index,
             body,
             temporary_directory: config.temporary_directory.clone(),
             scan_limit,
+            objects,
             scan_time: config.max_scan_time,
             partial_only,
             needs_hashes,
+            has_hash_rules,
             version: if has_cvd {
                 daily_version()?
             } else {
@@ -297,27 +311,29 @@ impl Generation {
 
     #[cfg(test)]
     fn scan(&self, reader: impl Read) -> io::Result<Option<Detection>> {
-        self.scan_checked(reader, || Ok(()))
+        Ok(match self.scan_checked(reader, || Ok(()))? {
+            ScanResult::Found(hit) => Some(hit),
+            ScanResult::Incomplete | ScanResult::Skipped => None,
+        })
     }
 
     pub(super) fn scan_checked(
         &self,
         reader: impl Read,
         mut alive: impl FnMut() -> io::Result<()>,
-    ) -> io::Result<Option<Detection>> {
-        let deadline = (!self.scan_time.is_zero())
-            .then(|| Instant::now().checked_add(self.scan_time))
-            .flatten();
-        let mut check = || {
-            check_deadline(deadline)?;
-            alive()
+    ) -> io::Result<ScanResult> {
+        // clamd receives the upload before starting the engine's scan timer.
+        let root_limit = self.objects.max_file_size;
+        let read_limit = if root_limit == 0 {
+            u64::MAX
+        } else {
+            root_limit.saturating_add(1)
         };
         let mut input = ScanInput {
-            reader: reader.take(self.scan_limit.saturating_add(1)),
-            header: Vec::with_capacity(raw::HEADER_SIZE),
-            object: (!self.body.is_empty() && !self.partial_only)
-                .then(|| tempfile::spooled_tempfile_in(64 * 1024, &self.temporary_directory)),
-            check: &mut check,
+            reader: reader.take(read_limit),
+            object: (!self.partial_only).then(|| Snapshot::new(&self.temporary_directory)),
+            capture_left: self.scan_limit,
+            check: &mut alive,
         };
         let (size, hashes) = if self.needs_hashes {
             let hashes = hash_reader(&mut input)?;
@@ -326,65 +342,100 @@ impl Generation {
             (io::copy(&mut input, &mut io::sink())?, None)
         };
         (input.check)()?;
+        if root_limit != 0 && size > root_limit {
+            return Ok(self.limit_result(Limit::MaxFileSize, None));
+        }
         if size > self.scan_limit {
-            return Err(invalid("scan size limit exceeded"));
+            return Ok(self.limit_result(Limit::MaxScanSize, hashes));
         }
         // The pinned engine skips files of five bytes or less. Unimplemented
         // allowlists and other official matchers can suppress or supersede a hash.
-        if self.partial_only || size <= 5 || size > i32::MAX as u64 {
-            return Ok(None);
+        if size <= 5 {
+            return Ok(ScanResult::Skipped);
         }
-        let eligible = raw::eligible(&input.header);
-        if let Some(object) = input.object {
-            let mut find = |bytes: &[u8]| -> io::Result<Option<String>> {
-                let context = ObjectContext::raw(bytes);
-                // In the pinned scanner PE signature matching precedes PE unpacking.
-                // Other container or normalized objects may first produce a nested winner.
-                if !eligible && !context.is_valid_pe() {
-                    return Ok(None);
-                }
-                Ok(self
-                    .body
-                    .first_match_checked(bytes, &context, &mut *input.check)?
-                    .map(str::to_owned))
-            };
-            let name = match object.into_inner() {
-                tempfile::SpooledData::InMemory(bytes) => find(bytes.get_ref())?,
-                tempfile::SpooledData::OnDisk(file) => {
-                    // SAFETY: this unlinked scratch file has a single owner. All writes
-                    // finished before mapping. The map is dropped before the file handle.
-                    let bytes = unsafe { memmap2::Mmap::map(&file)? };
-                    find(&bytes)?
-                }
-            };
-            if let Some(name) = name {
-                return Ok(Some(Detection { name, hashes }));
-            }
+        if self.partial_only || size > i32::MAX as u64 {
+            return Ok(ScanResult::Incomplete);
         }
-        if eligible && let Some(digests) = &hashes {
-            let result = digests
-                .lookup(|algorithm, digest, size| self.index.lookup(algorithm, digest, size))?;
-            return Ok(result.map(|name| Detection { name, hashes }));
+        let object = input
+            .object
+            .expect("active matcher owns an object snapshot");
+        let deadline = (!self.scan_time.is_zero())
+            .then(|| Instant::now().checked_add(self.scan_time))
+            .flatten();
+        let mut expired = false;
+        let verdict = object.with_bytes(|bytes| {
+            objects::scan(
+                bytes,
+                &self.objects,
+                &self.temporary_directory,
+                |obj, check| {
+                    let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
+                    let eligible = obj.normalized
+                        || obj.handled_format
+                        || raw::eligible(header, obj.layer.file_type);
+                    if !eligible && !obj.context.is_valid_pe() {
+                        return Ok(Verdict::Incomplete);
+                    }
+                    if let Some(name) =
+                        self.body
+                            .first_match_checked(obj.bytes, obj.context, &mut *check)?
+                    {
+                        return Ok(Verdict::Found(name.to_owned()));
+                    }
+                    // The script buffer goes directly to the body matcher. HTML parser
+                    // artifacts are files and also pass through whole-file matching.
+                    if self.has_hash_rules && eligible && !obj.body_only {
+                        let found = if obj.parents.is_empty() && !obj.normalized {
+                            hashes
+                                .as_ref()
+                                .expect("hash rules require root digests")
+                                .lookup(|a, d, s| self.index.lookup(a, d, s))?
+                        } else {
+                            self.index.match_bytes(obj.bytes, check)?
+                        };
+                        if let Some(name) = found {
+                            return Ok(Verdict::Found(name));
+                        }
+                    }
+                    Ok(Verdict::Miss)
+                },
+                || {
+                    (input.check)()?;
+                    if deadline.is_some_and(|when| Instant::now() >= when) {
+                        expired = true;
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    Ok(())
+                },
+            )
+        });
+        if expired {
+            return Ok(self.limit_result(Limit::MaxScanTime, hashes));
         }
-        Ok(None)
+        Ok(match verdict? {
+            Verdict::Found(name) => ScanResult::Found(Detection { name, hashes }),
+            Verdict::Incomplete | Verdict::Miss => ScanResult::Incomplete,
+            Verdict::Skipped => ScanResult::Skipped,
+        })
+    }
+
+    fn limit_result(&self, limit: Limit, hashes: Option<FileHashes>) -> ScanResult {
+        if self.objects.alert_exceeds_max {
+            ScanResult::Found(Detection {
+                name: limit.signature(),
+                hashes,
+            })
+        } else {
+            ScanResult::Skipped
+        }
     }
 }
 
 struct ScanInput<'a, R> {
     reader: R,
-    header: Vec<u8>,
-    object: Option<tempfile::SpooledTempFile>,
+    object: Option<Snapshot>,
+    capture_left: u64,
     check: &'a mut dyn FnMut() -> io::Result<()>,
-}
-
-fn check_deadline(deadline: Option<Instant>) -> io::Result<()> {
-    if deadline.is_some_and(|t| Instant::now() >= t) {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "MaxScanTime exceeded",
-        ));
-    }
-    Ok(())
 }
 
 impl<R: Read> Read for ScanInput<'_, R> {
@@ -392,10 +443,13 @@ impl<R: Read> Read for ScanInput<'_, R> {
         (self.check)()?;
         let n = self.reader.read(buffer)?;
         if let Some(object) = &mut self.object {
-            object.write_all(&buffer[..n])?;
+            if n as u64 > self.capture_left {
+                self.object = None;
+            } else {
+                object.write_all(&buffer[..n])?;
+                self.capture_left -= n as u64;
+            }
         }
-        let keep = n.min(raw::HEADER_SIZE - self.header.len());
-        self.header.extend_from_slice(&buffer[..keep]);
         Ok(n)
     }
 }
@@ -403,6 +457,7 @@ impl<R: Read> Read for ScanInput<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use barnacle::body::ObjectContext;
     use md5::{Digest, Md5};
 
     struct Fixture {
@@ -437,6 +492,46 @@ mod tests {
     }
 
     #[test]
+    fn active_generation_selects_normalized_text_views() {
+        let f = Fixture::new();
+        let receipt = b"WAREHOUSE blue FOLDERS. ".repeat(6000);
+        f.write(
+            "receipt.hdb",
+            rule(&receipt.to_ascii_lowercase(), "Receipt"),
+        );
+        let hash_only = Generation::load(&f.config).unwrap();
+        f.write(
+            "receipt.ndb",
+            "Ignored:7:EOF-6:666f6c646572\nFuture:0:*:666f6c646572:255\nMail:4:*:666f6c646572\n",
+        );
+        f.write("receipt.ign2", "Ignored\n");
+        f.write("optional.ndu", "Optional:7:*:666f6c646572\n");
+        let filtered = Generation::load(&f.config).unwrap();
+        f.write("receipt.ndb", "Generic:0:*:77617265686f757365\n");
+        let generic = Generation::load(&f.config).unwrap();
+        f.write("receipt.ndb", "Mapped:7:EOF-6:616273656e74\n");
+        let mapped = Generation::load(&f.config).unwrap();
+
+        for skipped in [hash_only, filtered] {
+            assert!(!skipped.objects.scan_normalized_script);
+            assert!(!skipped.objects.map_normalized_script);
+            assert!(skipped.scan(receipt.as_slice()).unwrap().is_none());
+        }
+        assert!(generic.objects.scan_normalized_script);
+        assert!(!generic.objects.map_normalized_script);
+        assert_eq!(
+            generic.scan(receipt.as_slice()).unwrap().unwrap().name,
+            "Generic.UNOFFICIAL"
+        );
+        assert!(mapped.objects.scan_normalized_script);
+        assert!(mapped.objects.map_normalized_script);
+        assert_eq!(
+            mapped.scan(receipt.as_slice()).unwrap().unwrap().name,
+            "Receipt.UNOFFICIAL"
+        );
+    }
+
+    #[test]
     fn reload_preserves_old_generation_and_applies_ignores_and_limits() {
         let mut f = Fixture::new();
         let bytes = b"raw binary payload";
@@ -459,14 +554,15 @@ mod tests {
         assert!(new.scan(&bytes[..]).unwrap().is_none());
         assert!(new.scan(&b"unknown content"[..]).unwrap().is_none());
         fs::remove_file(f.config.database_directory.join("fixture.ign2")).unwrap();
-        f.config.max_file_size = bytes.len() as u64 - 1;
+        f.config.objects.max_file_size = bytes.len() as u64 - 1;
         assert!(
             Generation::load(&f.config)
                 .unwrap()
                 .scan(&bytes[..])
-                .is_err()
+                .unwrap()
+                .is_none()
         );
-        f.config.max_file_size = bytes.len() as u64;
+        f.config.objects.max_file_size = bytes.len() as u64;
         assert!(
             Generation::load(&f.config)
                 .unwrap()
