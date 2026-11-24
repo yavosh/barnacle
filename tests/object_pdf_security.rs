@@ -479,6 +479,65 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
             expected,
         )?;
     }
+    // Stock flags an attachment only when its type precedes the filter list.
+    // LZW alone is not dumped, so the later spelling hides the attachment.
+    check(
+        include_bytes!("fixtures/pdf/open/lzw.pdf"),
+        &note,
+        "",
+        "",
+        "Note",
+    )?;
+    check(
+        include_bytes!("fixtures/pdf/open/lzw-late.pdf"),
+        &note,
+        "",
+        "",
+        "Miss",
+    )?;
+    // Only the final filter output counts against the scan budget.
+    let hex_lzw = include_bytes!("fixtures/pdf/open/hex-lzw.pdf");
+    for (short, want) in [(0, "Note"), (1, "Heuristics.Limits.Exceeded.MaxScanSize")] {
+        check(
+            hex_lzw,
+            &note,
+            "",
+            &format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                hex_lzw.len() + NOTE.len() - short
+            ),
+            want,
+        )?;
+    }
+    // Encrypted LZW chains decode from the decrypted stream. A DCT image keeps its ciphertext.
+    for bytes in [
+        include_bytes!("fixtures/pdf/open/r3-hex-lzw.pdf").as_slice(),
+        include_bytes!("fixtures/pdf/open/r4-hex-lzw.pdf"),
+        include_bytes!("fixtures/pdf/open/r6-hex-lzw.pdf"),
+    ] {
+        check(bytes, &note, "", "", "Note")?;
+        for (short, want) in [(0, "Note"), (1, "Heuristics.Limits.Exceeded.MaxScanSize")] {
+            check(
+                bytes,
+                &note,
+                "",
+                &format!(
+                    "MaxScanSize {}\nAlertExceedsMax yes",
+                    bytes.len() + NOTE.len() - short
+                ),
+                want,
+            )?;
+        }
+        let image = physical_stream(bytes, b"\n7 0 obj\n");
+        let image = hash(image.strip_suffix(b"\n").unwrap_or(image), "Image")?;
+        check(bytes, &image, "", "", "Image")?;
+    }
+    let lzw_only = include_bytes!("fixtures/pdf/open/r6-lzw.pdf");
+    check(lzw_only, &note, "", "", "Miss")?;
+    let image = physical_stream(lzw_only, b"\n7 0 obj\n");
+    let image = hash(image.strip_suffix(b"\n").unwrap_or(image), "Image")?;
+    check(lzw_only, &image, "", "", "Image")?;
+
     let locked = include_bytes!("fixtures/pdf/open/locked.pdf");
     check(locked, &note, "", "", "Miss")?;
     check(locked, &(note + &hash(locked, "Outer")?), "", "", "Outer")?;

@@ -281,6 +281,115 @@ fn read_stream<'a>(
     Ok(None)
 }
 
+// Stock reads every `/` in a dictionary through a small name state machine.
+// `/EmbeddedFile` sets its flag only in the idle state. `/Filter` keeps the
+// filter state until `/Length` or `/Crypt`, so a later type name is ignored.
+fn embedded_flag(dict: &[u8]) -> bool {
+    #[derive(PartialEq)]
+    enum State {
+        Idle,
+        S,
+        Filter,
+        Launch,
+    }
+    const IDLE_NAMES: &[&[u8]] = &[
+        b"EmbeddedFile",
+        b"Image",
+        b"Type",
+        b"Page",
+        b"Author",
+        b"Producer",
+        b"CreationDate",
+        b"ModDate",
+        b"Creator",
+        b"Title",
+        b"Keywords",
+        b"Subject",
+        b"Pages",
+        b"Colors",
+        b"RichMedia",
+        b"AcroForm",
+        b"XFA",
+        b"Linearized",
+        b"Contents",
+        b"S",
+    ];
+    const FILTER_NAMES: &[&[u8]] = &[
+        b"ASCIIHexDecode",
+        b"ASCII85Decode",
+        b"A85",
+        b"AHx",
+        b"FlateDecode",
+        b"Fl",
+        b"LZWDecode",
+        b"LZW",
+        b"RunLengthDecode",
+        b"RL",
+        b"CCITTFaxDecode",
+        b"CCF",
+        b"JBIG2Decode",
+        b"DCTDecode",
+        b"DCT",
+        b"JPXDecode",
+        b"Standard",
+        b"Crypt",
+        b"Length",
+    ];
+    let mut state = State::Idle;
+    let mut flag = false;
+    let mut at = 0;
+    let mut name = Vec::with_capacity(63);
+    while let Some(slash) = memchr::memchr(b'/', &dict[at..]) {
+        at += slash + 1;
+        name.clear();
+        // The reference keeps at most 63 bytes and decodes `#xx` escapes.
+        while name.len() < 63 && at < dict.len() {
+            let b = dict[at];
+            if b == b'#' {
+                let Some(byte) = dict
+                    .get(at + 1..at + 3)
+                    .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
+                else {
+                    break;
+                };
+                name.push(byte);
+                at += 3;
+                continue;
+            }
+            if b" \t\r\n/>[]<(".contains(&b) {
+                break;
+            }
+            name.push(b);
+            at += 1;
+        }
+        let name = name.as_slice();
+        state = match name {
+            b"Filter" => State::Filter,
+            b"Launch" => State::Launch,
+            b"Sig" | b"V" | b"R" | b"JavaScript" | b"OpenAction" => State::Idle,
+            _ if IDLE_NAMES.contains(&name) && state == State::Idle => {
+                flag |= name == b"EmbeddedFile";
+                if name == b"S" { State::S } else { State::Idle }
+            }
+            _ if FILTER_NAMES.contains(&name) && state == State::Filter => {
+                if matches!(name, b"Crypt" | b"Length") {
+                    State::Idle
+                } else {
+                    State::Filter
+                }
+            }
+            // A known name from another state resets only the `/S` state.
+            _ if (IDLE_NAMES.contains(&name) || FILTER_NAMES.contains(&name))
+                && state == State::S =>
+            {
+                State::Idle
+            }
+            _ => state,
+        };
+    }
+    flag
+}
+
 fn trim_eol(bytes: &[u8]) -> &[u8] {
     bytes
         .strip_suffix(b"\r\n")
@@ -373,6 +482,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                     break;
                 }
                 b"stream" => {
+                    obj.embedded = embedded_flag(&data[obj.start..input.pos]);
                     obj.directory = object_stream::Directory::read(&data[obj.start..input.pos]);
                     let Some(encoded) = read_stream(&mut input, &mut || sink.check())? else {
                         return Ok(None);
@@ -422,7 +532,6 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 }
                 b"/Image" => obj.image = true,
                 b"/Metadata" => obj.metadata = true,
-                b"/EmbeddedFile" => obj.embedded = true,
                 b"/ObjStm" => obj.object_stream = true,
                 b"/XRef" => obj.xref = true,
                 b"/OpenAction" => {
@@ -589,7 +698,8 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                 obj.filters.clear();
                 name = stream.explicit.filter(|v| *v != b"Identity");
             }
-            if obj.filters.is_empty() && name.is_none() {
+            // A leading DCT stage stops stock's chain before the decrypted bytes are kept.
+            if name.is_none() && matches!(obj.filters.as_slice(), [] | [Filter::Jpeg]) {
                 if physical_stream(&bytes[..end], content, sink)? {
                     return Ok(Handling::Stopped);
                 }
@@ -598,7 +708,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             if !obj.filters.iter().all(|f| {
                 matches!(
                     f,
-                    Filter::Flate | Filter::Hex | Filter::Ascii85 | Filter::RunLength
+                    Filter::Flate | Filter::Hex | Filter::Ascii85 | Filter::RunLength | Filter::Lzw
                 )
             }) {
                 return Ok(Handling::Incomplete);
@@ -621,6 +731,16 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                     _ => return Ok(Handling::Incomplete),
                 }
                 obj.filters.clear();
+            } else if obj.filters.contains(&Filter::Lzw) {
+                // Decrypt first, then decode the plaintext with the unencrypted LZW rules.
+                let chain = std::mem::take(&mut obj.filters);
+                let plain =
+                    handler.decode(&obj, name, stream.bytes, filters::Retain::Carrier, sink)?;
+                obj.filters = chain;
+                let Output::Decoded(plain) = plain else {
+                    return Ok(Handling::Incomplete);
+                };
+                decoded = Some(plain);
             } else {
                 let mut retain = if sink.child_limit().is_some() {
                     filters::Retain::Count
@@ -678,6 +798,9 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             let limit = if obj.object_stream && filter == Filter::Flate {
                 // Stock inflates the first 256 KiB before checking its next allocation.
                 (sink.remaining() / (256 << 10)).max(1) * (256 << 10)
+            } else if matches!(filter, Filter::Hex | Filter::Ascii85) && filters.peek().is_some() {
+                // These stock decoders check no limit. Only the final output is counted.
+                u64::MAX
             } else {
                 sink.remaining()
             };

@@ -325,6 +325,9 @@ impl Packed {
                 continue;
             }
             let mut dump = selected.then_some(Deferred::Raw);
+            if super::embedded_flag(bytes) {
+                dump.get_or_insert(Deferred::Raw);
+            }
             let mut seen_opening = false;
             while let Some(token) = input.next_checked(&mut budget, sink)? {
                 match token {
@@ -343,9 +346,6 @@ impl Packed {
                             }
                             _ => dump = Some(Deferred::Contents),
                         }
-                    }
-                    b"/EmbeddedFile" => {
-                        dump.get_or_insert(Deferred::Raw);
                     }
                     b"/OpenAction"
                         if !seen_opening && opening.is_some_and(|open| open.owner == n) =>

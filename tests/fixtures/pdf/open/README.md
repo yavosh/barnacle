@@ -55,3 +55,19 @@ Its packed member contains a 65-byte inventory label.
 `r6-packed-large-carrier.pdf` adds an 8,200-row shipment ledger before that label.
 The encrypted carrier expands to 174,576 bytes. The test leaves 141 scan bytes for eligible objects.
 Both Rust-authored files retain the page and statement from `r6.pdf`.
+
+The LZW controls use a 36-byte LZW encoding of the accounting statement with 9-bit codes.
+`lzw.pdf` writes `/Type /EmbeddedFile` before `/Filter /LZWDecode`. `lzw-late.pdf` reverses that order.
+Stock flags the attachment only in `lzw.pdf`, so it skips the LZW-only attachment in `lzw-late.pdf`.
+`hex-lzw.pdf` applies `[/ASCIIHexDecode /LZWDecode]` to the same statement.
+Each file also has a DCT image XObject whose 33-byte payload is a JPEG start marker, a comment, and an end marker.
+
+```sh
+qpdf --stream-data=preserve --object-streams=disable --allow-weak-crypto --encrypt '' '' 128 --use-aes=n -- hex-lzw.pdf r3-hex-lzw.pdf
+qpdf --stream-data=preserve --object-streams=disable --encrypt '' '' 128 --use-aes=y -- hex-lzw.pdf r4-hex-lzw.pdf
+qpdf --stream-data=preserve --object-streams=disable --encrypt '' '' 256 --allow-insecure -- hex-lzw.pdf r6-hex-lzw.pdf
+qpdf --stream-data=preserve --object-streams=disable --encrypt '' '' 256 --allow-insecure -- lzw.pdf r6-lzw.pdf
+```
+
+qpdf sorts dictionary keys, so `r6-lzw.pdf` places the filter before the type. Stock skips its attachment.
+Stock decodes the encrypted ASCIIHex and LZW chain. It scans each encrypted DCT image as ciphertext.

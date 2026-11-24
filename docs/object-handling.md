@@ -318,7 +318,7 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Nested inputs | ZIP containing a PDF and a PDF with competing raw and child rules. |
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
-| Standard encryption | Classic xref tables and cross-reference streams, qpdf RC4 (R2–R4), AES-128 (R4), and AES-256 (R5/R6), including encrypted object streams. Locked documents expose their ciphertext. |
+| Standard encryption | Classic xref tables and cross-reference streams, qpdf RC4 (R2–R4), AES-128 (R4), and AES-256 (R5/R6), including encrypted object streams, LZW chains, and DCT images. Locked documents expose their ciphertext. |
 | Additional PDF stages | JavaScript actions and other stream filters require further comparisons. |
 
 For physical objects, both daemons scan the referenced page dictionary for an explicit catalog opening destination.
@@ -341,6 +341,10 @@ Stock scans stored carriers and stored streams as ciphertext.
 
 When the empty user password fails, stock does not decrypt. Its Flate stage then fails on the ciphertext and it scans each stream's physical bytes.
 Barnacle does the same only when both of stock's inflate attempts must fail at the zlib header. Other locked layouts yield incomplete coverage.
+Stock sets its attachment flag only when `/EmbeddedFile` appears before the filter list.
+Without that flag, a stream whose only filters are LZW or run-length is not scanned. The flag also selects the `/EFF` crypt filter.
+In encrypted documents, stock decrypts a stream before its LZW chain. A leading DCT stage keeps the ciphertext.
+Stock's ASCIIHex and ASCII85 decoders have no size limit. Only the final filter output counts against the scan budget.
 Unsupported filters also yield incomplete coverage. [Security comparisons](../tests/object_pdf_security.rs)
 
 Four clients scanned a 117,423-byte PDF with restricted copy permissions and a 221,880-byte CSV attachment.

@@ -356,7 +356,8 @@ pub(super) enum Retain {
     Count,
     Verify,
     Keep,
-    /// Keep an object stream past the scan budget so its directory can still be read.
+    /// Keep output past the scan budget: an object stream's directory or an
+    /// intermediate plaintext that later filters decode.
     Carrier,
 }
 
@@ -460,7 +461,7 @@ pub(super) fn chain(
         };
         size += n as u64;
         if size > limit {
-            if !filters.contains(&Filter::Flate) {
+            if !filters.contains(&Filter::Flate) && retain != Retain::Carrier {
                 return Ok(Output::TooLarge(size));
             }
             if retain != Retain::Carrier {
