@@ -142,9 +142,18 @@ Both also match an outer PE hash before processing a nested PE resource.
 `ScanPE no` disables nested PE extraction. `MaxEmbeddedPE` includes an exact-size resource, and zero disables the size cap.
 [ELF comparisons](../tests/object_macho.rs) · [Embedded PE comparisons](../tests/object_embedded.rs)
 
-Barnacle does not unpack executables. Stock runs its UPX, FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
-Those stages belong to [#4](https://github.com/yavosh/barnacle/issues/4). A packed executable without an earlier match returns incomplete coverage, never a clean result.
-Matching stock's unpacked bytes also depends on the licensing review in [#17](https://github.com/yavosh/barnacle/issues/17). [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
+Barnacle unpacks UPX 4.2.4 PE32 executables that use NRV2B, NRV2D, or NRV2E.
+It rebuilds the image as stock does and scans that image as a child object.
+Before decoding, both daemons check the virtual size of the UPX0 and UPX1 sections against `MaxFileSize` and `MaxScanSize`.
+A whole-file hash of the packed file wins over the unpacked child. `ScanPE no` disables unpacking.
+A recognized UPX stream that Barnacle cannot decode or rebuild returns incomplete coverage.
+Barnacle does not unpack LZMA streams, DLL stubs, PE32+ files, or other UPX versions.
+Stock did not unpack the LZMA, DLL, or PE32+ fixtures either. [UPX comparisons](../tests/object_upx.rs)
+
+Stock also runs FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
+Those stages and the other UPX formats belong to [#4](https://github.com/yavosh/barnacle/issues/4). A packed executable without an earlier match returns incomplete coverage, never a clean result.
+The UPX code follows the NRV bit-stream format and stock's observed output, not ClamAV source.
+See the licensing review in [#17](https://github.com/yavosh/barnacle/issues/17). [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
 
 A Java 17 interface matched its target-12 body signature both directly and inside a JAR.
 A Java 11 class matched its whole-file hash in both locations. Stock treated the Java 21 control as generic data.

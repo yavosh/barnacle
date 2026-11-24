@@ -326,9 +326,19 @@ impl Parser {
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
         match self {
-            Self::Pe {
-                overlay: Some(start),
-            } if options.scan_pe => super::installer::legacy(&bytes[start..], sink),
+            Self::Pe { overlay } if options.scan_pe => {
+                let installer = match overlay {
+                    Some(start) => super::installer::legacy(&bytes[start..], sink)?,
+                    None => Handling::Unrecognized,
+                };
+                if matches!(installer, Handling::Stopped | Handling::Incomplete) {
+                    return Ok(installer);
+                }
+                match super::upx::extract(bytes, sink)? {
+                    Handling::Unrecognized => Ok(installer),
+                    unpacked => Ok(unpacked),
+                }
+            }
             Self::Pdf if options.scan_pdf => pdf::extract(bytes, sink),
             Self::Text if options.scan_html && options.scan_normalized_script => {
                 text::after_raw(bytes, sink)
