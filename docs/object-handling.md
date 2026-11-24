@@ -318,8 +318,8 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Nested inputs | ZIP containing a PDF and a PDF with competing raw and child rules. |
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
-| Standard encryption | Classic xref tables, qpdf RC4 (R2–R4), AES-128 (R4), and AES-256 (R5/R6). The empty user password must authenticate. |
-| Additional PDF stages | Encrypted packed objects, JavaScript actions, and other stream filters require further comparisons. |
+| Standard encryption | Classic xref tables and cross-reference streams, qpdf RC4 (R2–R4), AES-128 (R4), and AES-256 (R5/R6), including encrypted object streams. Locked documents expose their ciphertext. |
+| Additional PDF stages | JavaScript actions and other stream filters require further comparisons. |
 
 For physical objects, both daemons scan the referenced page dictionary for an explicit catalog opening destination.
 An inline local GoTo exposes the catalog. An indirect local action exposes the referenced object at its physical position.
@@ -333,7 +333,15 @@ Stock scans physical bytes for the sampled explicit `Crypt` records. That range 
 Flate and ASCIIHex can decode in sequence. The final attachment can fit its scan budget even when its intermediate is larger.
 A Flate stage that cannot grow past its allowed block leaves its input eligible for matching.
 When the output could exceed the byte limit, Barnacle counts it before writing large decoded attachments to disk.
-Encrypted packed objects, unsupported filters, and documents requiring credentials yield incomplete coverage. [Security comparisons](../tests/object_pdf_security.rs)
+A cross-reference stream can hold the encryption reference. Stock leaves that stream unencrypted and scans its inflated predictor rows.
+Stock decrypts and inflates an encrypted object stream before reading its directory. It reads packed members only with the compact `/Type/ObjStm` spelling.
+A decoded carrier larger than the remaining scan budget is skipped, but its eligible members are still scanned.
+That carrier fits stock's first 256 KiB Flate allocation, so Barnacle keeps it in memory instead of a scratch file.
+Stock scans stored carriers and stored streams as ciphertext.
+
+When the empty user password fails, stock does not decrypt. Its Flate stage then fails on the ciphertext and it scans each stream's physical bytes.
+Barnacle does the same only when both of stock's inflate attempts must fail at the zlib header. Other locked layouts yield incomplete coverage.
+Unsupported filters also yield incomplete coverage. [Security comparisons](../tests/object_pdf_security.rs)
 
 Four clients scanned a 117,423-byte PDF with restricted copy permissions and a 221,880-byte CSV attachment.
 Each engine used three fresh containers on one pinned ARM64 CPU with 2 GiB of RAM and scan caching disabled.

@@ -28,3 +28,30 @@ The second uses direct `Crypt` with `Identity`. Stock passes the same note with 
 `r6-explicit-eff.pdf` uses `/EFF /StdCF` for its receipt. Stock, qpdf, and Poppler recover the same 52 bytes.
 `r6-stored-mime.pdf` uses the same explicit default with an uncompressed receipt. Stock scans its 81 physical stream bytes.
 `r6-explicit-name.pdf` selects a named crypt filter on its receipt and page. Stock scans 96 bytes of the stored page stream.
+
+The packed controls use qpdf 12.4.2 with cross-reference and object streams.
+They retain the accounting statement and page text from the ordinary fixture.
+The two-attachment control also contains the dispatch slip.
+
+```sh
+qpdf --allow-weak-crypto --object-streams=generate --encrypt '' '' 128 --use-aes=n -- ordinary.pdf r3-packed.pdf
+qpdf --object-streams=generate --encrypt '' '' 128 --use-aes=y -- ordinary.pdf r4-packed.pdf
+qpdf --object-streams=generate --encrypt '' '' 256 --allow-insecure --force-R5 -- ordinary.pdf r5-packed.pdf
+qpdf --object-streams=generate --encrypt '' '' 256 --allow-insecure -- ordinary.pdf r6-packed.pdf
+qpdf --object-streams=generate --encrypt '' '' 256 --allow-insecure --extract=n -- ordinary.pdf r6-restricted-packed.pdf
+qpdf --compress-streams=n --object-streams=generate --encrypt '' '' 256 --allow-insecure -- ordinary.pdf r6-stored-packed.pdf
+qpdf --object-streams=generate --decrypt two.pdf two-plain-packed.pdf
+qpdf --object-streams=preserve --encrypt '' '' 256 --allow-insecure -- two-plain-packed.pdf r6-two-packed.pdf
+```
+
+The Rust test compacts the object-stream type name without shifting any offsets.
+Stock reads packed page dictionaries only with that spelling in these controls.
+The stored control exposes its ciphertext. The compressed cross-reference control exposes the inflated predictor rows.
+
+The Rust-authored `r6-packed-classic.pdf` adds an object stream before the page and attachment.
+It keeps the R6 encryption dictionary and uses a classic cross-reference table.
+Its packed member contains a 65-byte inventory label.
+
+`r6-packed-large-carrier.pdf` adds an 8,200-row shipment ledger before that label.
+The encrypted carrier expands to 174,576 bytes. The test leaves 141 scan bytes for eligible objects.
+Both Rust-authored files retain the page and statement from `r6.pdf`.

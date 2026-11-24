@@ -122,9 +122,7 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"\x00BE",
         b"%PDF",
         b"InstallS",
-        b"MZ",
         b"\xa3H",
-        b"\xef\xbe",
         b"MIME",
         b"\nFrom",
         b"\nMessage",
@@ -141,7 +139,7 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
                 .build(MARKERS)
                 .expect("static raw-stage markers")
         });
-    if CONTENT_MARKERS.is_match(header) {
+    if CONTENT_MARKERS.is_match(header) || embedded_pe_or_nsis(header) {
         return false;
     }
     // The classifier already checked HTML, mail and legacy Office XML.
@@ -210,9 +208,45 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
     true
 }
 
+// The built-in content records `4d5a{60-300}50450000` and
+// `efbeadde4e756c6c736f6674496e7374` need more than their leading bytes.
+// Case folding keeps this check at least as broad as the reference.
+fn embedded_pe_or_nsis(header: &[u8]) -> bool {
+    let at = |i: usize, s: &[u8]| {
+        header
+            .get(i..i + s.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(s))
+    };
+    (0..header.len()).any(|i| {
+        at(i, b"\xef\xbe\xad\xdeNullsoftInst")
+            || at(i, b"MZ") && (i + 62..=i + 302).any(|j| at(j, b"PE\0\0"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::eligible;
+
+    #[test]
+    fn embedded_pe_and_nsis_need_their_complete_records() {
+        let test = |bytes: &[u8]| eligible(bytes, "CL_TYPE_TEXT_UTF16BE");
+        let mut header = vec![b'x'; 400];
+        header[6..8].copy_from_slice(b"MZ");
+        header[30..32].copy_from_slice(b"\xef\xbe");
+        assert!(test(&header));
+        for gap in [60, 300] {
+            let mut pe = header.clone();
+            pe[8 + gap..12 + gap].copy_from_slice(b"pe\0\0");
+            assert!(!test(&pe), "{gap}");
+        }
+        for gap in [59, 301] {
+            let mut pe = header.clone();
+            pe[8 + gap..12 + gap].copy_from_slice(b"PE\0\0");
+            assert!(test(&pe), "{gap}");
+        }
+        header[30..46].copy_from_slice(b"\xef\xbe\xad\xdeNullsoftInst");
+        assert!(!test(&header));
+    }
 
     #[test]
     fn content_markers_fold_ascii_inside_binary_headers() {

@@ -214,6 +214,12 @@ pub(super) fn ciphertext<'a>(
     })
 }
 
+/// A standard handler either opens with the empty user password or stays locked.
+pub(super) enum Access {
+    Open(Box<Security>),
+    Locked,
+}
+
 pub(super) struct Security {
     state: EncryptionState,
     streams: Arc<dyn CryptFilter>,
@@ -221,7 +227,7 @@ pub(super) struct Security {
 }
 
 impl Security {
-    pub(super) fn open(id: Id, metadata: &[u8], trailer: &[u8]) -> Option<Self> {
+    pub(super) fn open(id: Id, metadata: &[u8], trailer: &[u8]) -> Option<Access> {
         let id: ObjectId = (id.0.try_into().ok()?, id.1.try_into().ok()?);
         let trailer = dictionary(trailer)?;
         if trailer.get(b"Encrypt").ok()?.as_reference().ok()? != id
@@ -252,7 +258,9 @@ impl Security {
         doc.trailer.set("ID", trailer.get(b"ID").ok()?.clone());
         doc.trailer.set("Encrypt", Object::Reference(id));
         doc.objects.insert(id, Object::Dictionary(dict));
-        doc.authenticate_raw_user_password(b"").ok()?;
+        if doc.authenticate_raw_user_password(b"").is_err() {
+            return Some(Access::Locked);
+        }
         let state = EncryptionState::decode(&doc, b"").ok()?;
         let dict = doc.get_encrypted().ok()?;
         let selected = |name: &[u8]| -> Option<Arc<dyn CryptFilter>> {
@@ -302,11 +310,11 @@ impl Security {
             Ok(name) => selected(name.as_name().ok()?)?,
             Err(_) => streams.clone(),
         };
-        Some(Self {
+        Some(Access::Open(Box::new(Self {
             state,
             streams,
             attachments,
-        })
+        })))
     }
 
     pub(super) fn decode(
@@ -458,7 +466,8 @@ fn aes_filters<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
     let mut compressed = [0; 8192];
     let mut plain = [0; 8192];
     let limit = sink.remaining();
-    let mut output = (retain != Retain::Count).then(|| Snapshot::new(sink.temporary_directory()));
+    let mut output = retain.output(limit, sink.temporary_directory());
+    let carrier = retain == Retain::Carrier;
     let capacity = super::filters::flate_capacity(limit);
     let mut chunks = bytes[16..].chunks(compressed.len()).peekable();
     while let Some(chunk) = chunks.next() {
@@ -482,7 +491,7 @@ fn aes_filters<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
             if zlib.total_out() > capacity {
                 return Ok(Output::StageLimit(0, capacity.saturating_add(256 * 1024)));
             }
-            if zlib.total_out() > limit {
+            if zlib.total_out() > limit && !carrier {
                 output = None;
             }
             if retain == Retain::Verify && zlib.total_out() > Snapshot::MEMORY_LIMIT as u64 {
@@ -500,7 +509,7 @@ fn aes_filters<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
                 output.write_all(&plain[..written])?;
             }
             if status == Status::StreamEnd {
-                if zlib.total_out() > limit {
+                if zlib.total_out() > limit && !carrier {
                     return Ok(Output::TooLarge(zlib.total_out()));
                 }
                 return Ok(output.map_or(Output::Counted(zlib.total_out()), Output::Decoded));

@@ -2,10 +2,17 @@
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod client;
 use client::{Daemon, stream_frame, unix_request};
-use std::{fs, io, path::Path};
+use std::{
+    fs,
+    io::{self, Read},
+    path::Path,
+};
 
 const NOTE: &[u8] = b"Quarterly statement from accounting.";
 const DISPATCH: &[u8] = b"Dispatch note for seven boxes of stationery.\n";
+const INVENTORY_LABEL: &[u8] =
+    b"<< /Type /EmbeddedFile /Description (Archive inventory label) >>\n";
+const LARGE_PACKED: &[u8] = include_bytes!("fixtures/pdf/open/r6-packed-large-carrier.pdf");
 const FILES: &[(&str, &[u8])] = &[
     ("plain", include_bytes!("fixtures/pdf/open/ordinary.pdf")),
     ("r4", include_bytes!("fixtures/pdf/open/r4.pdf")),
@@ -54,6 +61,154 @@ fn physical_stream<'a>(bytes: &'a [u8], object: &[u8]) -> &'a [u8] {
     &bytes[start..end]
 }
 
+fn check_packed(
+    check: impl Fn(&[u8], &str, &str, &str, &str) -> io::Result<()>,
+    note: &str,
+) -> io::Result<()> {
+    const R6: &[u8] = include_bytes!("fixtures/pdf/open/r6-packed.pdf");
+    for bytes in [
+        include_bytes!("fixtures/pdf/open/r3-packed.pdf").as_slice(),
+        include_bytes!("fixtures/pdf/open/r4-packed.pdf").as_slice(),
+        include_bytes!("fixtures/pdf/open/r5-packed.pdf").as_slice(),
+        R6,
+        include_bytes!("fixtures/pdf/open/r6-restricted-packed.pdf").as_slice(),
+    ] {
+        check(bytes, note, "", "", "Note")?;
+        for (short, want) in [(0, "Note"), (1, "Heuristics.Limits.Exceeded.MaxScanSize")] {
+            check(
+                bytes,
+                note,
+                "",
+                &format!(
+                    "MaxScanSize {}\nAlertExceedsMax yes",
+                    bytes.len() + NOTE.len() - short
+                ),
+                want,
+            )?;
+        }
+    }
+    for limit in ["MaxFiles", "MaxRecursion"] {
+        check(
+            R6,
+            note,
+            "",
+            &format!("{limit} 1\nAlertExceedsMax yes"),
+            &format!("Heuristics.Limits.Exceeded.{limit}"),
+        )?;
+    }
+    check(R6, note, "", "ScanPDF no", "Miss")?;
+
+    let carrier = b"3 0 4 32 5 88 6 132\n\
+        << /Title (Quarterly report) >>\n\
+        << /EF << /F 7 0 R >> /F (notes.txt) /Type /Filespec >>\n\
+        << /Count 1 /Kids [ 6 0 R ] /Type /Pages >>\n\
+        << /Contents 8 0 R /MediaBox [ 0 0 100 100 ] /Parent 5 0 R /Resources << >> /Type /Page >>\n";
+    let carrier_rule = hash(carrier, "Carrier")?;
+    let competing = carrier_rule + note;
+    check(R6, &competing, "", "", "Carrier")?;
+    check(R6, &(competing + &hash(R6, "Outer")?), "", "", "Outer")?;
+
+    let xref = physical_stream(R6, b"\n10 0 obj\n");
+    let stored_xref = xref.strip_suffix(b"\n").unwrap();
+    let mut predictor_rows = Vec::new();
+    flate2::read::ZlibDecoder::new(stored_xref).read_to_end(&mut predictor_rows)?;
+    assert_eq!(predictor_rows.len(), 55);
+    let xref_rule = hash(&predictor_rows, "Xref")?;
+    let packed_xref = hash(stored_xref, "CompressedXref")? + &hash(xref, "PhysicalXref")?;
+    check(R6, &packed_xref, "", "", "Miss")?;
+    check(R6, &(packed_xref + &xref_rule), "", "", "Xref")?;
+    let page = hash(b"[(Quarterly REPORT)] TJ\n", "Page")?;
+    check(R6, &(xref_rule + &page), "", "", "Page")?;
+
+    let text = hash(b"quarterly report", "Text")?;
+    check(R6, &text, "", "", "Miss")?;
+    // Keep the encrypted bytes and cross-reference offsets intact.
+    let mut compact = R6.to_vec();
+    let spelling = b"/Type /ObjStm";
+    let at = memchr::memmem::find(R6, spelling).unwrap();
+    compact[at..at + spelling.len()].copy_from_slice(b"/Type/ObjStm ");
+    check(&compact, &text, "", "", "Text")?;
+    check(&compact, &(text + &page), "", "", "Page")?;
+
+    let classic = include_bytes!("fixtures/pdf/open/r6-packed-classic.pdf");
+    let member_rule = hash(INVENTORY_LABEL, "Member")?;
+    let carrier = [b"10 0 ".as_slice(), INVENTORY_LABEL].concat();
+    check(classic, &member_rule, "", "", "Member")?;
+    check(
+        classic,
+        &(member_rule.clone() + &hash(&carrier, "ClassicCarrier")?),
+        "",
+        "",
+        "ClassicCarrier",
+    )?;
+    check(
+        classic,
+        &member_rule,
+        "",
+        "MaxFiles 5\nAlertExceedsMax yes",
+        "Heuristics.Limits.Exceeded.MaxFiles",
+    )?;
+    check(classic, &member_rule, "", "MaxFiles 6", "Member")?;
+
+    for (space, expected) in [
+        (141, "Member"),
+        (140, "Heuristics.Limits.Exceeded.MaxScanSize"),
+    ] {
+        check(
+            LARGE_PACKED,
+            &member_rule,
+            "",
+            &format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                LARGE_PACKED.len() + space
+            ),
+            expected,
+        )?;
+    }
+
+    let two = include_bytes!("fixtures/pdf/open/r6-two-packed.pdf");
+    check(
+        two,
+        &(hash(DISPATCH, "Dispatch")? + note),
+        "",
+        "",
+        "Dispatch",
+    )?;
+    check(two, note, "", "", "Note")?;
+
+    let stored = include_bytes!("fixtures/pdf/open/r6-stored-packed.pdf");
+    check(stored, note, "", "", "Miss")?;
+    let carrier = physical_stream(stored, b"\n2 0 obj\n");
+    let receipt = physical_stream(stored, b"\n7 0 obj\n");
+    assert_eq!((carrier.len(), receipt.len()), (272, 64));
+    let stored_receipt = hash(receipt, "StoredReceipt")?;
+    check(stored, &stored_receipt, "", "", "StoredReceipt")?;
+    check(
+        stored,
+        &(stored_receipt + &hash(carrier, "StoredCarrier")?),
+        "",
+        "",
+        "StoredCarrier",
+    )?;
+    let xref = physical_stream(stored, b"\n10 0 obj\n");
+    assert_eq!(xref.len(), 45);
+    check(stored, &hash(xref, "StoredXref")?, "", "", "StoredXref")?;
+
+    let r4_stored = include_bytes!("fixtures/pdf/open/r4-stored-packed.pdf");
+    let receipt = physical_stream(r4_stored, b"\n9 0 obj\n");
+    let page = physical_stream(r4_stored, b"\n8 0 obj\n");
+    assert_eq!((receipt.len(), page.len()), (80, 96));
+    check(
+        r4_stored,
+        &hash(receipt, "StoredReceipt")?,
+        "",
+        "",
+        "StoredReceipt",
+    )?;
+    check(r4_stored, &hash(page, "StoredPage")?, "", "", "StoredPage")?;
+    Ok(())
+}
+
 fn check(exe: &Path, stock: bool) -> io::Result<()> {
     let root = tempfile::tempdir_in("/tmp")?;
     let db = root.path().join("db");
@@ -99,6 +254,7 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
         Ok(())
     };
     let note = hash(NOTE, "Note")?;
+    check_packed(check, &note)?;
     let unrelated = hash(b"Unrelated stationery", "Other")?;
     let sig = NOTE.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let parent = format!("Pdf.Parent;Engine:81-255,Target:0,Container:CL_TYPE_PDF;0;{sig}\n");
@@ -326,6 +482,42 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
     let locked = include_bytes!("fixtures/pdf/open/locked.pdf");
     check(locked, &note, "", "", "Miss")?;
     check(locked, &(note + &hash(locked, "Outer")?), "", "", "Outer")?;
+    // Flate fails on each locked stream, so stock scans its ciphertext in physical order.
+    let receipt = hash(physical_stream(locked, b"\n5 0 obj\n"), "LockedReceipt")?;
+    let page = hash(physical_stream(locked, b"\n7 0 obj\n"), "LockedPage")?;
+    check(locked, &(page.clone() + &receipt), "", "", "LockedReceipt")?;
+    let limit = |name: &str, value: usize| format!("{name} {value}\nAlertExceedsMax yes");
+    let exceeded = |name: &str| format!("Heuristics.Limits.Exceeded.{name}");
+    for (rules, files, scan_bytes, want) in [
+        (&receipt, 2, 64, "LockedReceipt"),
+        (&page, 3, 128, "LockedPage"),
+    ] {
+        check(locked, rules, "", &limit("MaxFiles", files), want)?;
+        check(
+            locked,
+            rules,
+            "",
+            &limit("MaxFiles", files - 1),
+            &exceeded("MaxFiles"),
+        )?;
+        let size = locked.len() + scan_bytes;
+        check(locked, rules, "", &limit("MaxScanSize", size), want)?;
+        check(
+            locked,
+            rules,
+            "",
+            &limit("MaxScanSize", size - 1),
+            &exceeded("MaxScanSize"),
+        )?;
+    }
+    check(
+        locked,
+        &page,
+        "",
+        &limit("MaxRecursion", 1),
+        &exceeded("MaxRecursion"),
+    )?;
+    check(locked, &page, "", &limit("MaxRecursion", 2), "LockedPage")?;
     Ok(())
 }
 #[test]
@@ -413,5 +605,41 @@ fn denied_large_attachment_counts_without_creating_scratch() -> io::Result<()> {
     )
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    Ok(())
+}
+
+#[test]
+fn excluded_packed_carrier_keeps_eligible_member_without_scratch() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let dir = tempfile::tempdir()?;
+    let missing = dir.path().join("missing");
+    for (space, expected) in [
+        (141, "InventoryLabel"),
+        (140, "Heuristics.Limits.Exceeded.MaxScanSize"),
+    ] {
+        let options = Options {
+            max_scan_size: (LARGE_PACKED.len() + space) as u64,
+            alert_exceeds_max: true,
+            ..Options::default()
+        };
+        let result = scan(
+            LARGE_PACKED,
+            &options,
+            &missing,
+            |object, _| {
+                if object.bytes == INVENTORY_LABEL && !object.normalized {
+                    assert_eq!(
+                        object.parents.last().map(|p| p.file_type),
+                        Some("CL_TYPE_PDF")
+                    );
+                    return Ok(Verdict::Found("InventoryLabel".into()));
+                }
+                Ok(Verdict::Miss)
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, Verdict::Found(expected.into()));
+    }
+    assert!(!missing.exists());
     Ok(())
 }

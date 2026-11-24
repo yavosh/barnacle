@@ -238,7 +238,11 @@ impl Snapshot {
     const MEMORY_LIMIT: usize = 64 * 1024;
 
     pub fn new(directory: &Path) -> Self {
-        Self(tempfile::spooled_tempfile_in(Self::MEMORY_LIMIT, directory))
+        Self::with_memory(Self::MEMORY_LIMIT, directory)
+    }
+
+    fn with_memory(memory: usize, directory: &Path) -> Self {
+        Self(tempfile::spooled_tempfile_in(memory, directory))
     }
 
     fn read_bounded(

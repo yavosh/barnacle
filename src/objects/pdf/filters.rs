@@ -104,6 +104,29 @@ impl Filter {
         })
     }
 }
+// Stock skips one leading CR. When inflation writes nothing, it retries once
+// after the next line break and otherwise keeps the stream bytes. Report only
+// inputs whose zlib headers fail at both points before producing output.
+pub(super) fn flate_fails_at_start(data: &[u8]) -> bool {
+    let header_fails = |d: &[u8]| match d {
+        [cmf, flg, ..] => {
+            (u16::from(*cmf) << 8 | u16::from(*flg)) % 31 != 0 || cmf & 0x0f != 8 || cmf >> 4 > 7
+        }
+        _ => false,
+    };
+    let data = data.strip_prefix(b"\r").unwrap_or(data);
+    if !header_fails(data) {
+        return false;
+    }
+    let line = |b: &u8| matches!(b, b'\n' | b'\r');
+    let Some(at) = data.iter().position(line) else {
+        return true;
+    };
+    let retry = &data[at..];
+    let retry = &retry[retry.iter().position(|b| !line(b)).unwrap_or(retry.len())..];
+    retry.is_empty() || header_fails(retry)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid PDF filter data")
 }
@@ -333,6 +356,22 @@ pub(super) enum Retain {
     Count,
     Verify,
     Keep,
+    /// Keep an object stream past the scan budget so its directory can still be read.
+    Carrier,
+}
+
+impl Retain {
+    // Output beyond a scan budget of `limit` bytes also fits the first Flate
+    // allocation. That happens only below 256 KiB, so a carrier stays in memory.
+    pub(super) fn output(self, limit: u64, directory: &std::path::Path) -> Option<Snapshot> {
+        match self {
+            Self::Count => None,
+            Self::Carrier if limit < FLATE_STEP => {
+                Some(Snapshot::with_memory(FLATE_STEP as usize, directory))
+            }
+            _ => Some(Snapshot::new(directory)),
+        }
+    }
 }
 
 const FLATE_STEP: u64 = 256 * 1024;
@@ -372,7 +411,7 @@ pub(super) fn chain(
 ) -> io::Result<Output> {
     use std::cell::RefCell;
     let limit = sink.remaining();
-    let mut output = (retain != Retain::Count).then(|| Snapshot::new(sink.temporary_directory()));
+    let mut output = retain.output(limit, sink.temporary_directory());
     let sink = RefCell::new(sink);
     let interrupted = RefCell::new(None);
     let poll = || {
@@ -424,7 +463,9 @@ pub(super) fn chain(
             if !filters.contains(&Filter::Flate) {
                 return Ok(Output::TooLarge(size));
             }
-            output = None;
+            if retain != Retain::Carrier {
+                output = None;
+            }
         }
         if retain == Retain::Verify && size > Snapshot::MEMORY_LIMIT as u64 {
             output = None;
@@ -433,8 +474,29 @@ pub(super) fn chain(
             out.write_all(&buf[..n])?;
         }
     }
-    if size > limit {
+    if size > limit && retain != Retain::Carrier {
         return Ok(Output::TooLarge(size));
     }
     Ok(output.map_or(Output::Counted(size), Output::Decoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flate_fails_at_start;
+
+    #[test]
+    fn flate_failure_follows_the_reference_retry() {
+        // 0x78 0x9c is a valid zlib header. 0x78 0x00 fails the header checksum.
+        assert!(flate_fails_at_start(b"\x78\x00garbage"));
+        assert!(flate_fails_at_start(b"\r\x78\x00garbage"));
+        assert!(!flate_fails_at_start(b"\x78\x9cdata"));
+        assert!(!flate_fails_at_start(b"\r\x78\x9cdata"));
+        assert!(!flate_fails_at_start(b"x"));
+        // Stock retries after the first run of line breaks.
+        assert!(flate_fails_at_start(b"\x78\x00bad\r\n\x78\x00bad"));
+        assert!(!flate_fails_at_start(b"\x78\x00bad\r\n\x78\x9cdata"));
+        assert!(flate_fails_at_start(b"\x78\x00bad\n\n"));
+        // A lone byte after the line break can still be consumed as a partial header.
+        assert!(!flate_fails_at_start(b"\x78\x00bad\nx"));
+    }
 }
