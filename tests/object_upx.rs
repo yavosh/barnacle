@@ -16,6 +16,9 @@ const UNSUPPORTED: &[(&str, &[u8])] = &[
 ];
 // Stock rebuilds the same image from each NRV method.
 const UNPACKED: &str = "52bd7b6f5b3a2c728c73c46d48c1ac51:69632:Upx.Unpacked\n";
+// This GUI program keeps a resource section and imports from two libraries.
+const RICH: &[u8] = include_bytes!("fixtures/upx/rich-nrv2b.exe");
+const RICH_UNPACKED: &str = "698e5c674981701552d61d76f56f6bff:73728:Upx.Rich\n";
 const LEDGER: &str = "Upx.Ledger:0:*:4261726e61636c6520555058206c6564676572\n";
 const UNRELATED: &str = "00000000000000000000000000000000:6:Upx.Unrelated\n";
 // Stock checks a buffer that spans the UPX0 and UPX1 sections before it decodes.
@@ -27,6 +30,15 @@ fn hash(data: &[u8], name: &str) -> io::Result<String> {
         barnacle::hash_reader(data)?.md5_hex(),
         data.len()
     ))
+}
+
+fn virtual_size(bytes: &[u8], section: usize, size: u32) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let optional = u16::from_le_bytes([bytes[pe + 20], bytes[pe + 21]]) as usize;
+    let at = pe + 24 + optional + 40 * section + 8;
+    bytes[at..at + 4].copy_from_slice(&size.to_le_bytes());
+    bytes
 }
 
 fn check(exe: &Path, stock: bool) -> io::Result<()> {
@@ -97,6 +109,19 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
         )?;
         check(bytes, rules, "", &limit("MaxFiles", 2), "Unpacked")?;
     }
+    // Stock rounds each section size up to 0x1000 before it checks the buffer.
+    for (section, size, buffer) in [(0, 0xc001, 0x13000), (1, 0x5401, 0x12000)] {
+        let bytes = virtual_size(PACKED[0].1, section, size);
+        let size = limit("MaxFileSize", buffer);
+        check(&bytes, UNPACKED, "", &size, "Unpacked")?;
+        let size = limit("MaxFileSize", buffer - 1);
+        check(&bytes, UNPACKED, "", &size, &exceeded("MaxFileSize"))?;
+    }
+    check(RICH, RICH_UNPACKED, "", "", "Rich")?;
+    let size = limit("MaxFileSize", 0x13000);
+    check(RICH, RICH_UNPACKED, "", &size, "Rich")?;
+    let size = limit("MaxFileSize", 0x12fff);
+    check(RICH, RICH_UNPACKED, "", &size, &exceeded("MaxFileSize"))?;
     // Stock does not unpack these files. Barnacle keeps them incomplete.
     for &(_, bytes) in UNSUPPORTED {
         check(bytes, UNPACKED, LEDGER, "", "Miss")?;

@@ -143,10 +143,14 @@ Both also match an outer PE hash before processing a nested PE resource.
 [ELF comparisons](../tests/object_macho.rs) · [Embedded PE comparisons](../tests/object_embedded.rs)
 
 Barnacle unpacks UPX 4.2.4 PE32 executables that use NRV2B, NRV2D, or NRV2E.
-It rebuilds the image as stock does and scans that image as a child object.
-Before decoding, both daemons check the virtual size of the UPX0 and UPX1 sections against `MaxFileSize` and `MaxScanSize`.
+Before decoding, stock rounds the UPX0 and UPX1 virtual sizes up to 0x1000 and adds them.
+It checks that sum against `MaxFileSize` and the remaining `MaxScanSize`. Barnacle applies the same check.
+Barnacle rebuilds only the image layout that matches stock's output. It scans that image as a child object.
 A whole-file hash of the packed file wins over the unpacked child. `ScanPE no` disables unpacking.
-A recognized UPX stream that Barnacle cannot decode or rebuild returns incomplete coverage.
+Barnacle returns incomplete coverage when another NRV decoder also accepts the stream, or when no decoder yields the declared sizes.
+It also returns incomplete coverage when the last `PE\0\0` in the decompressed data is not a valid PE32 header.
+The same applies to an empty, unaligned, or out-of-image section, and to an image size that differs from the last section end.
+Stock rebuilds some of these layouts differently, or scans the raw decompressed data instead.
 Barnacle does not unpack LZMA streams, DLL stubs, PE32+ files, or other UPX versions.
 Stock did not unpack the LZMA, DLL, or PE32+ fixtures either. [UPX comparisons](../tests/object_upx.rs)
 
