@@ -40,6 +40,20 @@ Start with the verified FreshClam snapshot. The build helper checks all three ar
 | daily.cvd | 28187 | `423f7774182bfbc82b50c7796c68a93f8b1817ef7ebbc88d7def444bc2c8f35b` |
 | bytecode.cvd | 339 | `6d4aa01f219e988060fc419f495d07f27e0cdf1a2cccc065971da922c76f7ffb` |
 
+The archived Soenneker.Clamav.Definitions 11.0.165 NuGet package contains all three pinned files.
+Extract the CVD files into a new directory. Check their SHA-256 digests against the table.
+[Archived NuGet package](https://api.nuget.org/v3-flatcontainer/soenneker.clamav.definitions/11.0.165/soenneker.clamav.definitions.11.0.165.nupkg)
+
+```sh
+snapshot_dir=$(mktemp -d)
+curl --fail --location --output "$snapshot_dir/source.nupkg" \
+  https://api.nuget.org/v3-flatcontainer/soenneker.clamav.definitions/11.0.165/soenneker.clamav.definitions.11.0.165.nupkg
+for archive in main daily bytecode; do
+  unzip -p "$snapshot_dir/source.nupkg" "contentFiles/any/any/Resources/clamav-database/$archive.cvd" > "$snapshot_dir/$archive.cvd"
+done
+(cd "$snapshot_dir" && sha256sum main.cvd daily.cvd bytecode.cvd)
+```
+
 ```sh
 python3 scripts/build_pinned_hash_index.py target/release/barnacle "$snapshot_dir" /tmp/pinned.bhi
 cargo test --locked --test hash_reference

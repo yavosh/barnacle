@@ -175,6 +175,33 @@ Use the archive benchmark procedure with `rich-nrv2b.exe` as the input.
 Load `698e5c674981701552d61d76f56f6bff:73728:Workspace.Reference` as the only rule.
 [Raw measurements](benchmarks/object-upx.csv) · [Benchmark procedure](benchmarks/object-decoder-workspace.md#reproduction)
 
+A second benchmark added a 262,144-row inventory resource to the same GUI program.
+The packed file is 2,417,664 bytes and the stock child is 14,458,880 bytes.
+Five rounds used the same container settings. The sustained run sent 16 requests per client.
+All 650 replies matched the same local hash rule. Stock's sustained p95 ranged from 230 to 1,611 ms.
+
+| Daemon | First request (ms) | Sustained scans/s | Sustained p95 (ms) | Sustained peak cgroup memory (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Barnacle | 34.90 | 29.58 | 141 | 70.64 |
+| Debian clamd 1.4.3+dfsg-1 | 59.79 | 17.83 | 239 | 223.65 |
+
+Generate the resource using the fixture sources, i686 MinGW GCC 16.2.0, and GNU windres 2.47.20260726.
+Pack the result with Debian `upx-ucl` 4.2.4-1.1. [Debian package](https://packages.debian.org/trixie/arm64/upx-ucl)
+
+```sh
+fixture_dir=$(mktemp -d)
+cp tests/fixtures/upx/rich.c tests/fixtures/upx/rich.rc "$fixture_dir"
+cd "$fixture_dir"
+awk 'BEGIN { for (i = 0; i < 262144; i++) printf "%06d,consignment,letter folders,shelf %03d,carton %03d\n", i, i % 251, i % 131 }' > inventory.csv
+printf '\n%s\n' '2 RCDATA "inventory.csv"' >> rich.rc
+i686-w64-mingw32-windres rich.rc -O coff -o rich.res
+i686-w64-mingw32-gcc -O2 -s -mwindows -Wl,--no-insert-timestamp -o inventory.exe rich.c rich.res -ladvapi32 -luser32
+upx-ucl -q -9 --nrv2b -o inventory-nrv2b.exe inventory.exe
+```
+
+Load `f1115e67ad8ce1425b5e945896ce4316:14458880:Workspace.Reference` as the only rule.
+The packed fixture SHA-256 was `297ef42f6d4249288d1cab6f9f0a772a12eb8b95ea8841dae9de4749eb25edad`. [Raw measurements](benchmarks/object-upx-inventory.csv)
+
 Stock also runs FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
 Those stages belong to [#26](https://github.com/yavosh/barnacle/issues/26). Other UPX releases belong to [#24](https://github.com/yavosh/barnacle/issues/24). A packed executable without an earlier match returns incomplete coverage, never a clean result.
 The UPX code follows the NRV bit-stream format and stock's observed output, not ClamAV source.
