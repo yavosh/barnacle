@@ -11,3 +11,7 @@ Use the [Rust compatibility runner](docs/compatibility/replay.md) to compare a c
 The [compatibility matrix](docs/compatibility-matrix.md) links measured behavior and remaining coverage gaps.
 
 The [stock memory profile](docs/stock-memory-profile.md) measures clamd during scans and reloads and compares signature-family storage costs.
+
+## License
+
+Barnacle is licensed under the [MIT License](LICENSE). [Licensing and provenance](docs/licensing.md)

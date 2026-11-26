@@ -3,6 +3,7 @@ name = "barnacle"
 version = "0.1.0"
 edition = "2024"
 description = "Experimental Rust scanner for ClamAV signatures"
+license = "MIT"
 publish = false
 
 [dependencies]
