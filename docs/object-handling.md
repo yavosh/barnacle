@@ -15,7 +15,7 @@ The raw engine inventory lists individual submodules, including disabled entries
 | Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, AutoIt EA05 and EA06, InstallShield, and embedded PE resources. [AutoIt comparisons](../tests/object_autoit.rs) · [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
-| Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Image heuristics and executable unpacking remain open. [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
+| Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover UPX NRV PE32, Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Other unpackers and image heuristics remain open. [UPX comparisons](../tests/object_upx.rs) · [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
 
 The engine also enables password support for archives and format-specific detection heuristics.
 The reference image lacks an installed UnRAR helper even though its engine configuration lists RAR.
@@ -158,6 +158,22 @@ The same applies when the last `PE\0\0` in the decompressed data is not a valid 
 For some of these files, stock builds a different image, scans the raw decompressed data, or decodes nothing.
 Barnacle does not unpack LZMA streams, DLL stubs, PE32+ files, or other UPX versions.
 Stock did not unpack the LZMA, DLL, or PE32+ fixtures either. [UPX comparisons](../tests/object_upx.rs)
+
+The benchmark used the 23,552-byte `rich-nrv2b.exe` and one local hash for its 73,728-byte rebuilt child.
+It used one pinned ARM64 CPU, 2 GiB of memory, no swap, and disabled scan caching.
+The Rust driver checked every INSTREAM reply. Each median comes from three fresh containers per engine and phase.
+One client sent the first request after daemon readiness. Four clients sent 256 requests each in the sustained run.
+
+| Daemon | First request (ms) | Sustained scans/s | Sustained p95 (ms) | Sustained peak cgroup memory (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Barnacle | 0.46 | 4,105 | 1.83 | 3.54 |
+| Debian clamd 1.4.3+dfsg-1 | 1.42 | 1,441 | 6.13 | 6.00 |
+
+Cgroup memory includes the driver and any file-backed pages charged to the container.
+The release executable SHA-256 was `107b9436619a39621ece90d5a0ef4eae84e1a5125ddcc29dc37b0b93b184065b`.
+Use the archive benchmark procedure with `rich-nrv2b.exe` as the input.
+Load `698e5c674981701552d61d76f56f6bff:73728:Workspace.Reference` as the only rule.
+[Raw measurements](benchmarks/object-upx.csv) · [Benchmark procedure](benchmarks/object-decoder-workspace.md#reproduction)
 
 Stock also runs FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
 Those stages belong to [#26](https://github.com/yavosh/barnacle/issues/26). Other UPX releases belong to [#24](https://github.com/yavosh/barnacle/issues/24). A packed executable without an earlier match returns incomplete coverage, never a clean result.
