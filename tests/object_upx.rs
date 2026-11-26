@@ -21,6 +21,8 @@ const RICH: &[u8] = include_bytes!("fixtures/upx/rich-nrv2b.exe");
 const RICH_UNPACKED: &str = "698e5c674981701552d61d76f56f6bff:73728:Upx.Rich\n";
 // NRV2B reads this NRV2D stream past its declared size to an end marker.
 const STEERED: &[u8] = include_bytes!("fixtures/upx/ledger-nrv2d-steered.exe");
+// Stock builds this child from the NRV2B decoding of the steered file.
+const STOCK_ONLY: &str = "96528825d91d01f6cbcd99b0c341b6fd:69632:Upx.StockOnly\n";
 const LEDGER: &str = "Upx.Ledger:0:*:4261726e61636c6520555058206c6564676572\n";
 const UNRELATED: &str = "00000000000000000000000000000000:6:Upx.Unrelated\n";
 // Stock checks a buffer that spans the UPX0 and UPX1 sections before it decodes.
@@ -40,6 +42,17 @@ fn virtual_size(bytes: &[u8], section: usize, size: u32) -> Vec<u8> {
     let optional = u16::from_le_bytes([bytes[pe + 20], bytes[pe + 21]]) as usize;
     let at = pe + 24 + optional + 40 * section + 8;
     bytes[at..at + 4].copy_from_slice(&size.to_le_bytes());
+    bytes
+}
+
+// Insert one byte before UPX1 and move the UPX1 and UPX2 raw pointers with it.
+fn unaligned(bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    bytes.insert(0x1f0, 0);
+    for at in [0x1b4, 0x1dc] {
+        let value = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        bytes[at..at + 4].copy_from_slice(&(value + 1).to_le_bytes());
+    }
     bytes
 }
 
@@ -79,7 +92,8 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
         if !body.is_empty() {
             fs::remove_file(db.join("body.ndb"))?;
         }
-        let expected = if want == "Miss" {
+        // Barnacle returns incomplete coverage where only stock finds a match.
+        let expected = if want == "Miss" || want == "StockOnly" && !stock {
             if stock {
                 "stream: OK\0".into()
             } else {
@@ -141,8 +155,11 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
     check(&bytes, UNPACKED, LEDGER, "", "Miss")?;
     let size = limit("MaxFileSize", 70000);
     check(&bytes, UNPACKED, "", &size, &exceeded("MaxFileSize"))?;
-    // Stock builds its image from the NRV2B decoding. Barnacle keeps the file incomplete.
-    check(STEERED, UNPACKED, "", "", "Miss")?;
+    // Stock builds its child from the NRV2B decoding. Barnacle keeps the file incomplete.
+    let rules = UNPACKED.to_owned() + STOCK_ONLY;
+    check(STEERED, &rules, "", "", "StockOnly")?;
+    // Stock reads UPX1 from 0x200 when its raw pointer is 0x201, and decodes nothing.
+    check(&unaligned(PACKED[0].1), UNPACKED, LEDGER, "", "Miss")?;
     // Stock does not unpack these files. Barnacle keeps them incomplete.
     for &(_, bytes) in UNSUPPORTED {
         check(bytes, UNPACKED, LEDGER, "", "Miss")?;

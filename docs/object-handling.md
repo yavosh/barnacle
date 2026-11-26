@@ -146,7 +146,8 @@ Barnacle unpacks UPX 4.2.4 PE32 executables that use NRV2B, NRV2D, or NRV2E.
 Before decoding, stock rounds the UPX0 and UPX1 virtual sizes up to 0x1000 and adds them.
 It checks that sum against `MaxFileSize` and the remaining `MaxScanSize`. Barnacle applies the same check.
 Barnacle rebuilds only the layout that the tests verify. It scans the rebuilt image as a child object.
-In that layout, UPX0 starts at RVA 0x1000, and the stream starts 0x15 bytes into UPX1.
+In that layout, the file alignment is 0x200, and UPX1's raw pointer is a multiple of it.
+UPX0 starts at RVA 0x1000, and the stream starts 0x15 bytes into UPX1.
 The original sections are contiguous, so stock's sequential layout and the RVA layout agree.
 Other layouts return incomplete coverage.
 A whole-file hash of the packed file wins over the unpacked child. `ScanPE no` disables unpacking.

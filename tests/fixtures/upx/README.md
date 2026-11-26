@@ -48,9 +48,11 @@ Its MD5 is `52bd7b6f5b3a2c728c73c46d48c1ac51`. Stock does not unpack the LZMA, D
 Stock unpacks `rich-nrv2b.exe` to a 73,728-byte image with MD5 `698e5c674981701552d61d76f56f6bff`.
 Its UPX0 and UPX1 sections are 0xd000 and 0x6000 bytes. So `MaxFileSize` must be at least 0x13000.
 The tests also patch the ledger section sizes to 0xc001 and 0x5401 to check stock's rounding.
-A test script built `ledger-nrv2d-steered.exe` from the decompressed ledger data.
+A review script built `ledger-nrv2d-steered.exe` from the decompressed ledger data, with its last 16 bytes set to zero.
+The script is not in the repository.
 Its NRV2D stream decodes to that data within the declared sizes.
 NRV2B reads the same stream without error. A tail after the declared stream, still inside UPX1, leads NRV2B to a second PE header and an end marker.
+Stock decodes the file with NRV2B. Its child is 69,632 bytes with MD5 `96528825d91d01f6cbcd99b0c341b6fd`.
 [Comparisons](../../object_upx.rs)
 
 ## Provenance

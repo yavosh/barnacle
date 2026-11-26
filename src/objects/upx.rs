@@ -9,6 +9,9 @@ const VERSION: &[u8] = b"4.24\0";
 const PACK_HEADER: &[u8] = b"UPX!\x0d\x09";
 const PACK_HEADER_SIZE: usize = 32;
 const ALIGNMENT: u32 = 0x1000;
+// Stock read UPX1 from offset 0x200 when its raw pointer was 0x201.
+// The tests verify only this file alignment and raw pointers aligned to it.
+const FILE_ALIGNMENT: u32 = 0x200;
 // Stock writes the first section at offset 0x1000 and each later section right after it.
 const FIRST_SECTION: usize = 0x1000;
 // Stock's fallback path decoded only streams that start 0x15 bytes into UPX1.
@@ -110,6 +113,7 @@ impl<'a> Packed<'a> {
             || le16(header, 6)? < 2
             || le16(optional, 0)? != 0x10b
             || le32(optional, 32)? != ALIGNMENT
+            || le32(optional, 36)? != FILE_ALIGNMENT
         {
             return None;
         }
@@ -118,7 +122,12 @@ impl<'a> Packed<'a> {
         let table = 24 + le16(header, 20)? as usize;
         let upx0 = Section::read(header, table)?;
         let upx1 = Section::read(header, table + 40)?;
-        if upx0.raw_size != 0 || upx0.size == 0 || upx1.raw_size == 0 || upx1.size == 0 {
+        if upx0.raw_size != 0
+            || upx0.size == 0
+            || upx1.raw_size == 0
+            || upx1.size == 0
+            || upx1.raw % FILE_ALIGNMENT != 0
+        {
             return None;
         }
         // The stub starts with pushad, mov esi, stream and lea edi, [esi + disp].
@@ -168,11 +177,13 @@ impl<'a> Packed<'a> {
         {
             return Ok(None);
         }
-        let buffer = usize::try_from(self.buffer).unwrap_or(usize::MAX);
+        let Ok(buffer) = usize::try_from(self.buffer) else {
+            return Ok(None);
+        };
         for method in [Method::Nrv2b, Method::Nrv2d, Method::Nrv2e] {
-            // Stock ignores the declared sizes and tries several decoders. It accepts
-            // the first one that reaches its end marker. Another such decoder makes
-            // its choice uncertain.
+            // Stock ignores the declared sizes. It tries a recognized stub's decoder
+            // first, then the others, and keeps the first one that reaches its end
+            // marker. Another such decoder makes its choice uncertain.
             if method != self.method && ends(method, self.rest, buffer, check)? {
                 return Ok(None);
             }
@@ -403,7 +414,10 @@ fn decode(
     check: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
-    if out.try_reserve_exact(size + spare).is_err() {
+    let Some(capacity) = size.checked_add(spare) else {
+        return Ok(None);
+    };
+    if out.try_reserve_exact(capacity).is_err() {
         return Ok(None);
     }
     let mut decoder = Decoder::new(method, input, size, Some(out));
@@ -491,6 +505,11 @@ mod tests {
         ] {
             assert!(Packed::recognize(&fixture(name)).is_none(), "{name}");
         }
+        let bytes = fixture("ledger-nrv2b.exe");
+        assert!(Packed::recognize(&unaligned(&bytes)).is_none());
+        let mut patched = bytes;
+        patched[0xbc..0xc0].copy_from_slice(&0x400u32.to_le_bytes());
+        assert!(Packed::recognize(&patched).is_none());
     }
 
     #[test]
@@ -625,6 +644,17 @@ mod tests {
         bytes
     }
 
+    /// Insert one byte before UPX1 and move the UPX1 and UPX2 raw pointers with it.
+    fn unaligned(bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        bytes.insert(0x1f0, 0);
+        for at in [0x1b4, 0x1dc] {
+            let value = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            bytes[at..at + 4].copy_from_slice(&(value + 1).to_le_bytes());
+        }
+        bytes
+    }
+
     /// Scan a file and return the verdict with the size and MD5 of each child.
     fn scan_children(bytes: &[u8]) -> io::Result<(Verdict, Vec<(usize, String)>)> {
         let dir = tempfile::tempdir()?;
@@ -750,14 +780,12 @@ mod tests {
                 let reached = ends(other, packed.rest, buffer, &mut || Ok(()))?;
                 assert_eq!(reached, other == method, "{method:?} read as {other:?}");
             }
-            assert!(!ends(
-                method,
-                packed.rest,
-                packed.unpacked - 1,
-                &mut || Ok(())
-            )?);
+            // The declared decoder reaches its end marker only when the output fits.
+            let size = packed.unpacked;
+            assert!(ends(method, packed.rest, size, &mut || Ok(()))?);
+            assert!(!ends(method, packed.rest, size - 1, &mut || Ok(()))?);
         }
-        // NRV2B fails within this NRV2D stream's declared size.
+        // NRV2B reads this NRV2D stream to its declared end without an end marker.
         // It reaches an end marker in the bytes after it.
         let bytes = fixture("ledger-nrv2d-steered.exe");
         let packed = Packed::recognize(&bytes).unwrap();
