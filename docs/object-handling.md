@@ -162,7 +162,7 @@ Stock did not unpack the LZMA, DLL, or PE32+ fixtures either. [UPX comparisons](
 Stock also runs FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
 Those stages belong to [#26](https://github.com/yavosh/barnacle/issues/26). Other UPX releases belong to [#24](https://github.com/yavosh/barnacle/issues/24). A packed executable without an earlier match returns incomplete coverage, never a clean result.
 The UPX code follows the NRV bit-stream format and stock's observed output, not ClamAV source.
-See the licensing review in [#17](https://github.com/yavosh/barnacle/issues/17). [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
+The rebuilt image keeps stock's fixed DOS header and stub, so unpacked-child hashes match stock. The licensing decision in [#17](https://github.com/yavosh/barnacle/issues/17) keeps these bytes. [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
 
 A Java 17 interface matched its target-12 body signature both directly and inside a JAR.
 A Java 11 class matched its whole-file hash in both locations. Stock treated the Java 21 control as generic data.
