@@ -19,6 +19,8 @@ const UNPACKED: &str = "52bd7b6f5b3a2c728c73c46d48c1ac51:69632:Upx.Unpacked\n";
 // This GUI program keeps a resource section and imports from two libraries.
 const RICH: &[u8] = include_bytes!("fixtures/upx/rich-nrv2b.exe");
 const RICH_UNPACKED: &str = "698e5c674981701552d61d76f56f6bff:73728:Upx.Rich\n";
+// NRV2B reads this NRV2D stream past its declared size to an end marker.
+const STEERED: &[u8] = include_bytes!("fixtures/upx/ledger-nrv2d-steered.exe");
 const LEDGER: &str = "Upx.Ledger:0:*:4261726e61636c6520555058206c6564676572\n";
 const UNRELATED: &str = "00000000000000000000000000000000:6:Upx.Unrelated\n";
 // Stock checks a buffer that spans the UPX0 and UPX1 sections before it decodes.
@@ -139,6 +141,8 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
     check(&bytes, UNPACKED, LEDGER, "", "Miss")?;
     let size = limit("MaxFileSize", 70000);
     check(&bytes, UNPACKED, "", &size, &exceeded("MaxFileSize"))?;
+    // Stock builds its image from the NRV2B decoding. Barnacle keeps the file incomplete.
+    check(STEERED, UNPACKED, "", "", "Miss")?;
     // Stock does not unpack these files. Barnacle keeps them incomplete.
     for &(_, bytes) in UNSUPPORTED {
         check(bytes, UNPACKED, LEDGER, "", "Miss")?;

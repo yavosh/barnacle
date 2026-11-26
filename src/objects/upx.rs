@@ -11,7 +11,8 @@ const PACK_HEADER_SIZE: usize = 32;
 const ALIGNMENT: u32 = 0x1000;
 // Stock writes the first section at offset 0x1000 and each later section right after it.
 const FIRST_SECTION: usize = 0x1000;
-// Stock decoded the tested stubs only when the stream starts 0x15 bytes into UPX1.
+// Stock's fallback path decoded only streams that start 0x15 bytes into UPX1.
+// Other offsets are unverified.
 const STREAM_START: u32 = 0x15;
 const CHECK_BLOCK: usize = 64 * 1024;
 
@@ -91,6 +92,9 @@ struct Packed<'a> {
     method: Method,
     start: u32,
     stream: &'a [u8],
+    // The stream and the rest of the file. Stock reads the rest of UPX1.
+    // A longer input only lets more decoders reach an end marker.
+    rest: &'a [u8],
     unpacked: usize,
     buffer: u64,
     rva: usize,
@@ -144,6 +148,7 @@ impl<'a> Packed<'a> {
             method,
             start,
             stream: upx1.raw_bytes(bytes, start, le32(pack, 20)?)?,
+            rest: bytes.get(offset..)?,
             unpacked: le32(pack, 16)? as usize,
             // Stock rounds each section size up before it sizes its decompression buffer.
             buffer: aligned(upx0.size) + aligned(upx1.size),
@@ -163,19 +168,17 @@ impl<'a> Packed<'a> {
         {
             return Ok(None);
         }
+        let buffer = usize::try_from(self.buffer).unwrap_or(usize::MAX);
         for method in [Method::Nrv2b, Method::Nrv2d, Method::Nrv2e] {
-            if method == self.method {
-                continue;
-            }
-            match decode(method, self.stream, self.unpacked, 0, check)? {
-                Err(Failure::Invalid) => {}
-                // Stock tries several decoders. Another accepted or untried decoding
-                // makes its choice uncertain.
-                Ok(_) | Err(Failure::Memory) => return Ok(None),
+            // Stock ignores the declared sizes and tries several decoders. It accepts
+            // the first one that reaches its end marker. Another such decoder makes
+            // its choice uncertain.
+            if method != self.method && ends(method, self.rest, buffer, check)? {
+                return Ok(None);
             }
         }
         // Keep room for the headers below UPX0, so the image reuses this buffer.
-        let Ok(data) = decode(self.method, self.stream, self.unpacked, self.rva, check)? else {
+        let Some(data) = decode(self.method, self.stream, self.unpacked, self.rva, check)? else {
             return Ok(None);
         };
         Ok(rebuild(data, self.rva, limit))
@@ -274,22 +277,59 @@ impl Bits<'_> {
 struct Decoder<'a> {
     method: Method,
     bits: Bits<'a>,
-    out: Vec<u8>,
+    // None when only the output length matters.
+    out: Option<Vec<u8>>,
+    len: usize,
     size: usize,
     last: u32,
 }
 
-impl Decoder<'_> {
+impl<'a> Decoder<'a> {
+    fn new(method: Method, input: &'a [u8], size: usize, out: Option<Vec<u8>>) -> Self {
+        Self {
+            method,
+            bits: Bits {
+                input,
+                pos: 0,
+                word: 0,
+                count: 0,
+            },
+            out,
+            len: 0,
+            size,
+            last: 1,
+        }
+    }
+
+    /// Decode until the end marker. Return false for a corrupt stream.
+    fn run(&mut self, check: &mut dyn FnMut() -> io::Result<()>) -> io::Result<bool> {
+        let mut next_check = 0;
+        loop {
+            if self.len >= next_check {
+                check()?;
+                next_check = self.len.saturating_add(CHECK_BLOCK);
+            }
+            match self.step() {
+                Some(true) => {}
+                Some(false) => return Ok(true),
+                None => return Ok(false),
+            }
+        }
+    }
+
     /// Decode one literal or one match. Return false after the end marker.
     fn step(&mut self) -> Option<bool> {
         let nrv2b = self.method == Method::Nrv2b;
         let bits = &mut self.bits;
         if bits.bit()? == 1 {
             let byte = bits.byte()?;
-            if self.out.len() == self.size {
+            if self.len == self.size {
                 return None;
             }
-            self.out.push(byte);
+            self.len += 1;
+            if let Some(out) = &mut self.out {
+                out.push(byte);
+            }
             return Some(true);
         }
         let offset = if nrv2b {
@@ -337,72 +377,56 @@ impl Decoder<'_> {
         let far = if nrv2b { 0xd00 } else { 0x500 };
         let count = (length as usize).checked_add(1 + usize::from(offset > far))?;
         let distance = offset as usize;
-        if distance > self.out.len() || count > self.size - self.out.len() {
+        if distance > self.len || count > self.size - self.len {
             return None;
         }
-        let start = self.out.len() - distance;
-        for at in start..start + count {
-            let byte = self.out[at];
-            self.out.push(byte);
+        if let Some(out) = &mut self.out {
+            let start = out.len() - distance;
+            for at in start..start + count {
+                let byte = out[at];
+                out.push(byte);
+            }
         }
+        self.len += count;
         Some(true)
     }
 }
 
-#[derive(Debug)]
-enum Failure {
-    Invalid,
-    Memory,
-}
-
 /// Decode exactly `size` bytes from the whole input.
 /// The buffer reserves `spare` more bytes, so the caller can grow it in place.
+/// Return None for a corrupt stream or a failed allocation.
 fn decode(
     method: Method,
     input: &[u8],
     size: usize,
     spare: usize,
     check: &mut dyn FnMut() -> io::Result<()>,
-) -> io::Result<Result<Vec<u8>, Failure>> {
+) -> io::Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     if out.try_reserve_exact(size + spare).is_err() {
-        return Ok(Err(Failure::Memory));
+        return Ok(None);
     }
-    let mut decoder = Decoder {
-        method,
-        bits: Bits {
-            input,
-            pos: 0,
-            word: 0,
-            count: 0,
-        },
-        out,
-        size,
-        last: 1,
-    };
-    let mut next_check = 0;
-    loop {
-        if decoder.out.len() >= next_check {
-            check()?;
-            next_check = decoder.out.len() + CHECK_BLOCK;
-        }
-        match decoder.step() {
-            Some(true) => {}
-            Some(false) => break,
-            None => return Ok(Err(Failure::Invalid)),
-        }
+    let mut decoder = Decoder::new(method, input, size, Some(out));
+    if !decoder.run(check)? || decoder.len != size || decoder.bits.pos != input.len() {
+        return Ok(None);
     }
-    let Decoder { bits, out, .. } = decoder;
-    Ok(if out.len() == size && bits.pos == input.len() {
-        Ok(out)
-    } else {
-        Err(Failure::Invalid)
-    })
+    Ok(decoder.out)
+}
+
+/// Return whether the stream reaches its end marker within `size` output bytes.
+/// The bits never depend on the output bytes, so this counts them without storing them.
+fn ends(
+    method: Method,
+    input: &[u8],
+    size: usize,
+    check: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
+    Decoder::new(method, input, size, None).run(check)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Failure, Method, Packed, decode};
+    use super::{Method, Packed, decode, ends};
     use crate::objects::{Options, Verdict};
     use std::io;
 
@@ -438,7 +462,7 @@ mod tests {
                     assert_eq!(data.len(), 0x10701);
                     assert_eq!(md5(&data), "1e23fddba97e6c7501185cbcd57913b0");
                 } else {
-                    assert!(data.is_err(), "{method:?} stream decoded as {other:?}");
+                    assert!(data.is_none(), "{method:?} stream decoded as {other:?}");
                 }
             }
         }
@@ -476,13 +500,13 @@ mod tests {
             let stream = packed.stream;
             for cut in [0, 1, 4, 5, stream.len() / 2, stream.len() - 1] {
                 let data = decode(method, &stream[..cut], packed.unpacked, 0, &mut || Ok(()))?;
-                assert!(data.is_err(), "{method:?} cut at {cut}");
+                assert!(data.is_none(), "{method:?} cut at {cut}");
             }
             let mut longer = stream.to_vec();
             longer.push(0);
-            assert!(decode(method, &longer, packed.unpacked, 0, &mut || Ok(()))?.is_err());
+            assert!(decode(method, &longer, packed.unpacked, 0, &mut || Ok(()))?.is_none());
             let short = packed.unpacked - 1;
-            assert!(decode(method, stream, short, 0, &mut || Ok(()))?.is_err());
+            assert!(decode(method, stream, short, 0, &mut || Ok(()))?.is_none());
             for at in (0..stream.len()).step_by(61) {
                 let mut corrupt = stream.to_vec();
                 corrupt[at] ^= 0xa5;
@@ -500,10 +524,10 @@ mod tests {
             .collect();
         for method in METHODS {
             for size in [0, 1, 0x10000] {
-                assert!(decode(method, &noise, size, 0, &mut || Ok(()))?.is_err());
+                assert!(decode(method, &noise, size, 0, &mut || Ok(()))?.is_none());
             }
-            assert!(decode(method, &[0xff; 64], 0x10000, 0, &mut || Ok(()))?.is_err());
-            assert!(decode(method, &[0; 64], 0x10000, 0, &mut || Ok(()))?.is_err());
+            assert!(decode(method, &[0xff; 64], 0x10000, 0, &mut || Ok(()))?.is_none());
+            assert!(decode(method, &[0; 64], 0x10000, 0, &mut || Ok(()))?.is_none());
         }
         Ok(())
     }
@@ -709,11 +733,46 @@ mod tests {
     }
 
     #[test]
-    fn allocation_failure_is_distinct() -> io::Result<()> {
+    fn allocation_failure_does_not_abort() -> io::Result<()> {
         let bytes = fixture("ledger-nrv2b.exe");
         let packed = Packed::recognize(&bytes).unwrap();
-        let result = decode(Method::Nrv2d, packed.stream, usize::MAX, 0, &mut || Ok(()))?;
-        assert!(matches!(result, Err(Failure::Memory)));
+        let result = decode(Method::Nrv2b, packed.stream, usize::MAX, 0, &mut || Ok(()))?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn other_decoders_read_past_the_declared_sizes() -> io::Result<()> {
+        for (bytes, method) in packed() {
+            let packed = Packed::recognize(&bytes).unwrap();
+            let buffer = packed.buffer as usize;
+            for other in METHODS {
+                let reached = ends(other, packed.rest, buffer, &mut || Ok(()))?;
+                assert_eq!(reached, other == method, "{method:?} read as {other:?}");
+            }
+            assert!(!ends(
+                method,
+                packed.rest,
+                packed.unpacked - 1,
+                &mut || Ok(())
+            )?);
+        }
+        // NRV2B fails within this NRV2D stream's declared size.
+        // It reaches an end marker in the bytes after it.
+        let bytes = fixture("ledger-nrv2d-steered.exe");
+        let packed = Packed::recognize(&bytes).unwrap();
+        assert_eq!(packed.method, Method::Nrv2d);
+        let strict = decode(
+            Method::Nrv2b,
+            packed.stream,
+            packed.unpacked,
+            0,
+            &mut || Ok(()),
+        )?;
+        assert!(strict.is_none());
+        let buffer = packed.buffer as usize;
+        assert!(ends(Method::Nrv2b, packed.rest, buffer, &mut || Ok(()))?);
+        assert!(packed.unpack(u64::MAX, &mut || Ok(()))?.is_none());
         Ok(())
     }
 }

@@ -150,14 +150,16 @@ In that layout, UPX0 starts at RVA 0x1000, and the stream starts 0x15 bytes into
 The original sections are contiguous, so stock's sequential layout and the RVA layout agree.
 Other layouts return incomplete coverage.
 A whole-file hash of the packed file wins over the unpacked child. `ScanPE no` disables unpacking.
-Barnacle also returns incomplete coverage when another NRV decoder accepts the stream, or when no decoder yields the declared sizes.
+For a crafted NRV2D file, stock used an NRV2B decoding that ran past the declared stream size to an end marker.
+Barnacle returns incomplete coverage when any other NRV decoder reaches an end marker in the rest of the file.
+It also returns incomplete coverage when the declared decoder does not yield exactly the declared sizes.
 The same applies when the last `PE\0\0` in the decompressed data is not a valid PE32 header.
 For some of these files, stock builds a different image, scans the raw decompressed data, or decodes nothing.
 Barnacle does not unpack LZMA streams, DLL stubs, PE32+ files, or other UPX versions.
 Stock did not unpack the LZMA, DLL, or PE32+ fixtures either. [UPX comparisons](../tests/object_upx.rs)
 
 Stock also runs FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
-Those stages and the other UPX formats belong to [#4](https://github.com/yavosh/barnacle/issues/4). A packed executable without an earlier match returns incomplete coverage, never a clean result.
+Those stages belong to [#26](https://github.com/yavosh/barnacle/issues/26). Other UPX releases belong to [#24](https://github.com/yavosh/barnacle/issues/24). A packed executable without an earlier match returns incomplete coverage, never a clean result.
 The UPX code follows the NRV bit-stream format and stock's observed output, not ClamAV source.
 See the licensing review in [#17](https://github.com/yavosh/barnacle/issues/17). [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
 

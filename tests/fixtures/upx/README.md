@@ -33,6 +33,7 @@ upx -q -9 --nrv2b -o rich-nrv2b.exe rich.exe
 | `ledger-lzma.exe` | PE32, LZMA | `1976971122153658f312e6a84a4be16d0094bee677e1a316bc18c0903f07f11c` |
 | `ledger-dll-nrv2b.dll` | PE32 DLL, NRV2B | `91c0cd77958f0eca56115611bab64ab210cb881ff6673d21182f3c52ee7b1ecc` |
 | `ledger64-nrv2b.exe` | PE32+, NRV2B | `ae6ce6854d7e0c4870804523eaf74559eff8eff3cafb51d86f9a10308f4a8ed9` |
+| `ledger-nrv2d-steered.exe` | Crafted PE32, NRV2D stream followed by an NRV2B tail | `1b9914196d6c6000b974c756d375c396b1d484e7b02accac6a511c06e7e4018d` |
 | `rich.c` | Source | `7964edc327af91bbb4107b6b59951f0e290752af005e0127b90bfd6d65119ad9` |
 | `rich.rc` | Resource script | `c8651d8e75e9b16bedf3f4724e07cc3736510ba676c0a2f53fc5288da06c03e1` |
 | `rich-nrv2b.exe` | PE32 GUI program with `.rsrc`, NRV2B | `8661966383999f6cccb7e5840104fc41429e85c19f3094dead5747087fd4a35b` |
@@ -47,6 +48,9 @@ Its MD5 is `52bd7b6f5b3a2c728c73c46d48c1ac51`. Stock does not unpack the LZMA, D
 Stock unpacks `rich-nrv2b.exe` to a 73,728-byte image with MD5 `698e5c674981701552d61d76f56f6bff`.
 Its UPX0 and UPX1 sections are 0xd000 and 0x6000 bytes. So `MaxFileSize` must be at least 0x13000.
 The tests also patch the ledger section sizes to 0xc001 and 0x5401 to check stock's rounding.
+A test script built `ledger-nrv2d-steered.exe` from the decompressed ledger data.
+Its NRV2D stream decodes to that data within the declared sizes.
+NRV2B reads the same stream without error. A tail after the declared stream, still inside UPX1, leads NRV2B to a second PE header and an end marker.
 [Comparisons](../../object_upx.rs)
 
 ## Provenance
