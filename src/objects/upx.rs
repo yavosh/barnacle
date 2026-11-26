@@ -9,6 +9,10 @@ const VERSION: &[u8] = b"4.24\0";
 const PACK_HEADER: &[u8] = b"UPX!\x0d\x09";
 const PACK_HEADER_SIZE: usize = 32;
 const ALIGNMENT: u32 = 0x1000;
+// Stock writes the first section at offset 0x1000 and each later section right after it.
+const FIRST_SECTION: usize = 0x1000;
+// Stock decoded the tested stubs only when the stream starts 0x15 bytes into UPX1.
+const STREAM_START: u32 = 0x15;
 const CHECK_BLOCK: usize = 64 * 1024;
 
 // Stock writes this DOS header and stub before the original PE header.
@@ -85,6 +89,7 @@ impl Section {
 
 struct Packed<'a> {
     method: Method,
+    start: u32,
     stream: &'a [u8],
     unpacked: usize,
     buffer: u64,
@@ -137,6 +142,7 @@ impl<'a> Packed<'a> {
         };
         Some(Self {
             method,
+            start,
             stream: upx1.raw_bytes(bytes, start, le32(pack, 20)?)?,
             unpacked: le32(pack, 16)? as usize,
             // Stock rounds each section size up before it sizes its decompression buffer.
@@ -151,26 +157,34 @@ impl<'a> Packed<'a> {
         limit: u64,
         check: &mut dyn FnMut() -> io::Result<()>,
     ) -> io::Result<Option<Vec<u8>>> {
-        if self.unpacked as u64 > self.buffer || self.rva as u64 > limit {
+        if self.rva != FIRST_SECTION
+            || self.start != STREAM_START
+            || self.unpacked as u64 > self.buffer
+        {
             return Ok(None);
         }
-        // Stock tries several decoders. Another accepted decoding makes its choice uncertain.
         for method in [Method::Nrv2b, Method::Nrv2d, Method::Nrv2e] {
-            if method != self.method
-                && decode(method, self.stream, self.unpacked, 0, check)?.is_some()
-            {
-                return Ok(None);
+            if method == self.method {
+                continue;
+            }
+            match decode(method, self.stream, self.unpacked, 0, check)? {
+                Err(Failure::Invalid) => {}
+                // Stock tries several decoders. Another accepted or untried decoding
+                // makes its choice uncertain.
+                Ok(_) | Err(Failure::Memory) => return Ok(None),
             }
         }
         // Keep room for the headers below UPX0, so the image reuses this buffer.
-        let data = decode(self.method, self.stream, self.unpacked, self.rva, check)?;
-        Ok(data.and_then(|data| rebuild(data, self.rva, limit)))
+        let Ok(data) = decode(self.method, self.stream, self.unpacked, self.rva, check)? else {
+            return Ok(None);
+        };
+        Ok(rebuild(data, self.rva, limit))
     }
 }
 
 // UPX stores the original PE header after the image. Stock uses the last
-// "PE\0\0" in the decompressed data and gives up on sections it cannot map.
-// It also sizes the image from the sections. Other layouts stay unverified.
+// "PE\0\0" in the decompressed data. The tests verify only contiguous sections
+// from UPX0's RVA. There, stock's sequential layout matches the RVA layout.
 fn rebuild(mut data: Vec<u8>, rva: usize, limit: u64) -> Option<Vec<u8>> {
     let at = memchr::memmem::rfind(&data, b"PE\0\0")?;
     let header = &data[at..];
@@ -188,21 +202,15 @@ fn rebuild(mut data: Vec<u8>, rva: usize, limit: u64) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let stored = (rva + at) as u64;
-    let mut image_end = 0;
+    let mut image_end = rva as u64;
     for section in header[24 + 0xe0..].as_chunks::<40>().0 {
-        let start = le32(section, 12)?;
         let virtual_size = le32(section, 8)?;
-        image_end = u64::from(start) + aligned(virtual_size);
-        if virtual_size == 0
-            || start % ALIGNMENT != 0
-            || (start as usize) < rva
-            || image_end > stored.min(size.into())
-        {
+        if virtual_size == 0 || u64::from(le32(section, 12)?) != image_end {
             return None;
         }
+        image_end += aligned(virtual_size);
     }
-    if image_end != u64::from(size) {
+    if image_end != u64::from(size) || image_end > (rva + at) as u64 {
         return None;
     }
     let header = header.to_vec();
@@ -341,7 +349,13 @@ impl Decoder<'_> {
     }
 }
 
-/// Decode exactly `size` bytes from the whole input. None marks an invalid stream.
+#[derive(Debug)]
+enum Failure {
+    Invalid,
+    Memory,
+}
+
+/// Decode exactly `size` bytes from the whole input.
 /// The buffer reserves `spare` more bytes, so the caller can grow it in place.
 fn decode(
     method: Method,
@@ -349,10 +363,10 @@ fn decode(
     size: usize,
     spare: usize,
     check: &mut dyn FnMut() -> io::Result<()>,
-) -> io::Result<Option<Vec<u8>>> {
+) -> io::Result<Result<Vec<u8>, Failure>> {
     let mut out = Vec::new();
     if out.try_reserve_exact(size + spare).is_err() {
-        return Ok(None);
+        return Ok(Err(Failure::Memory));
     }
     let mut decoder = Decoder {
         method,
@@ -375,16 +389,20 @@ fn decode(
         match decoder.step() {
             Some(true) => {}
             Some(false) => break,
-            None => return Ok(None),
+            None => return Ok(Err(Failure::Invalid)),
         }
     }
     let Decoder { bits, out, .. } = decoder;
-    Ok((out.len() == size && bits.pos == input.len()).then_some(out))
+    Ok(if out.len() == size && bits.pos == input.len() {
+        Ok(out)
+    } else {
+        Err(Failure::Invalid)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Method, Packed, decode};
+    use super::{Failure, Method, Packed, decode};
     use crate::objects::{Options, Verdict};
     use std::io;
 
@@ -420,7 +438,7 @@ mod tests {
                     assert_eq!(data.len(), 0x10701);
                     assert_eq!(md5(&data), "1e23fddba97e6c7501185cbcd57913b0");
                 } else {
-                    assert!(data.is_none(), "{method:?} stream decoded as {other:?}");
+                    assert!(data.is_err(), "{method:?} stream decoded as {other:?}");
                 }
             }
         }
@@ -458,18 +476,18 @@ mod tests {
             let stream = packed.stream;
             for cut in [0, 1, 4, 5, stream.len() / 2, stream.len() - 1] {
                 let data = decode(method, &stream[..cut], packed.unpacked, 0, &mut || Ok(()))?;
-                assert!(data.is_none(), "{method:?} cut at {cut}");
+                assert!(data.is_err(), "{method:?} cut at {cut}");
             }
             let mut longer = stream.to_vec();
             longer.push(0);
-            assert!(decode(method, &longer, packed.unpacked, 0, &mut || Ok(()))?.is_none());
+            assert!(decode(method, &longer, packed.unpacked, 0, &mut || Ok(()))?.is_err());
             let short = packed.unpacked - 1;
-            assert!(decode(method, stream, short, 0, &mut || Ok(()))?.is_none());
+            assert!(decode(method, stream, short, 0, &mut || Ok(()))?.is_err());
             for at in (0..stream.len()).step_by(61) {
                 let mut corrupt = stream.to_vec();
                 corrupt[at] ^= 0xa5;
                 for other in METHODS {
-                    decode(other, &corrupt, packed.unpacked, 0, &mut || Ok(()))?;
+                    let _ = decode(other, &corrupt, packed.unpacked, 0, &mut || Ok(()))?;
                 }
             }
         }
@@ -482,10 +500,10 @@ mod tests {
             .collect();
         for method in METHODS {
             for size in [0, 1, 0x10000] {
-                assert!(decode(method, &noise, size, 0, &mut || Ok(()))?.is_none());
+                assert!(decode(method, &noise, size, 0, &mut || Ok(()))?.is_err());
             }
-            assert!(decode(method, &[0xff; 64], 0x10000, 0, &mut || Ok(()))?.is_none());
-            assert!(decode(method, &[0; 64], 0x10000, 0, &mut || Ok(()))?.is_none());
+            assert!(decode(method, &[0xff; 64], 0x10000, 0, &mut || Ok(()))?.is_err());
+            assert!(decode(method, &[0; 64], 0x10000, 0, &mut || Ok(()))?.is_err());
         }
         Ok(())
     }
@@ -570,6 +588,19 @@ mod tests {
         bytes
     }
 
+    /// Move the pack header and stream of ledger-nrv2b.exe one byte later.
+    fn skewed() -> Vec<u8> {
+        let mut bytes = fixture("ledger-nrv2b.exe");
+        bytes.insert(0x1f0, 0);
+        // Move the entry point, the stub's esi, and its edi displacement.
+        for (at, delta) in [(0xa8, 1), (0x52f3, 1), (0x52f9, -1)] {
+            let value = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let value = value.wrapping_add_signed(delta);
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
     /// Scan a file and return the verdict with the size and MD5 of each child.
     fn scan_children(bytes: &[u8]) -> io::Result<(Verdict, Vec<(usize, String)>)> {
         let dir = tempfile::tempdir()?;
@@ -628,8 +659,14 @@ mod tests {
         moved[header] = b'X';
         let mut garbage = data.clone();
         garbage.extend(b"PE\0\0garbage");
+        let mut swapped = data.clone();
+        swapped[table + 40..table + 120].rotate_left(40);
         let rva = u32::from_le_bytes(data[table + 52..table + 56].try_into().unwrap());
         for (name, data) in [
+            ("gap after a section", set(table + 128, 0x500)),
+            ("overlapping section", set(table + 48, 0x2000)),
+            ("sections out of order", swapped),
+            ("small first section", set(table + 8, 0x100)),
             ("empty section", set(table + 48, 0)),
             (
                 "section past the image",
@@ -649,10 +686,34 @@ mod tests {
                 "{name}"
             );
         }
+        // Move UPX0 to RVA 0x2000 and the stored sections and image size with it.
+        let mut later = data.clone();
+        for at in (0..count).map(|i| table + 40 * i + 12).chain([header + 80]) {
+            let value = u32::from_le_bytes(later[at..at + 4].try_into().unwrap()) + 0x1000;
+            later[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut upx0 = repack(&later);
+        upx0[0x184..0x188].copy_from_slice(&0x2000u32.to_le_bytes());
+        // The stub's edi displacement is the last word of the repacked file.
+        let disp = upx0.len() - 4;
+        let value = u32::from_le_bytes(upx0[disp..].try_into().unwrap()) + 0x1000;
+        upx0[disp..].copy_from_slice(&value.to_le_bytes());
+        for (name, bytes) in [("UPX0 at RVA 0x2000", upx0), ("stream at 0x16", skewed())] {
+            assert_eq!(scan_children(&bytes)?.0, Verdict::Incomplete, "{name}");
+        }
         // An earlier valid header, such as an embedded PE, does not change the choice.
         let (verdict, children) = scan_children(&repack(&inside))?;
         assert_eq!(verdict, Verdict::Miss);
         assert!(children.iter().any(|&(size, _)| size == 0x11000));
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_failure_is_distinct() -> io::Result<()> {
+        let bytes = fixture("ledger-nrv2b.exe");
+        let packed = Packed::recognize(&bytes).unwrap();
+        let result = decode(Method::Nrv2d, packed.stream, usize::MAX, 0, &mut || Ok(()))?;
+        assert!(matches!(result, Err(Failure::Memory)));
         Ok(())
     }
 }

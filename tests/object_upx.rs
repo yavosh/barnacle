@@ -41,6 +41,17 @@ fn virtual_size(bytes: &[u8], section: usize, size: u32) -> Vec<u8> {
     bytes
 }
 
+// Move the pack header and stream one byte later, and point the stub at them.
+fn skewed(bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    bytes.insert(0x1f0, 0);
+    for (at, delta) in [(0xa8, 1), (0x52f3, 1), (0x52f9, -1)] {
+        let value = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        bytes[at..at + 4].copy_from_slice(&value.wrapping_add_signed(delta).to_le_bytes());
+    }
+    bytes
+}
+
 fn check(exe: &Path, stock: bool) -> io::Result<()> {
     let root = tempfile::tempdir_in("/tmp")?;
     let db = root.path().join("db");
@@ -122,6 +133,12 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
     check(RICH, RICH_UNPACKED, "", &size, "Rich")?;
     let size = limit("MaxFileSize", 0x12fff);
     check(RICH, RICH_UNPACKED, "", &size, &exceeded("MaxFileSize"))?;
+    // Stock decodes nothing when the stream starts 0x16 bytes into UPX1.
+    // It still checks the buffer first.
+    let bytes = skewed(PACKED[0].1);
+    check(&bytes, UNPACKED, LEDGER, "", "Miss")?;
+    let size = limit("MaxFileSize", 70000);
+    check(&bytes, UNPACKED, "", &size, &exceeded("MaxFileSize"))?;
     // Stock does not unpack these files. Barnacle keeps them incomplete.
     for &(_, bytes) in UNSUPPORTED {
         check(bytes, UNPACKED, LEDGER, "", "Miss")?;
