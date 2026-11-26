@@ -14,7 +14,7 @@ Some bytes must match stock exactly for compatibility:
 
 - Replies follow the clamd protocol. Signature names come from the loaded databases.
 - Built-in heuristic names, such as `Heuristics.Limits.Exceeded.MaxFileSize`, match stock.
-- A rebuilt UPX image starts with the fixed 0xd0-byte DOS header and stub that stock writes. The stub contains the text "This file was created by ClamAV for internal use and should not be run. ClamAV - A GPL virus scanner - http://www.clamav.net". Barnacle keeps these bytes so that hash signatures on unpacked children match stock. The decision in #17 keeps them.
+- A rebuilt UPX image starts with the fixed 0xd0-byte DOS header and stub that stock writes. The stub contains the text "This file was created by ClamAV for internal use and should not be run. ClamAV - A GPL virus scanner - http://www.clamav.net". Barnacle keeps these bytes so that hash signatures on unpacked children match stock. The [decision in #17](https://github.com/yavosh/barnacle/issues/17) keeps them.
 
 ## Signature databases and indexes
 
