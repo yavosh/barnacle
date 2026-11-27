@@ -8,6 +8,7 @@ use crate::IgnoreSet;
 use pattern::Pattern;
 use search::SearchIndex;
 
+mod byte_compare;
 mod logic_expression;
 mod logical;
 mod logical_pcre;
@@ -255,7 +256,10 @@ fn parse_record(
     };
 
     let static_matcher = target == Target::Generic
-        || (target == Target::Pe && offset_text != "*" && !offset_text.contains(','));
+        || (target == Target::Pe
+            && offset_text != "*"
+            && !offset_text.contains(',')
+            && !offset.is_version_info());
     let bm_prefix = if static_matcher && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         let bytes = pattern.parts()[0]
             .literal()
@@ -282,6 +286,8 @@ fn parse_record(
         .map_or((offset_text, false), |(a, _)| (a, true));
     let form = if base == "*" {
         "any"
+    } else if base == "VI" {
+        "PE version information"
     } else if base.starts_with("EOF") {
         "EOF"
     } else if base.starts_with("EP+") {

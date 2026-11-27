@@ -53,6 +53,12 @@ impl RegexChild {
         }
         let (position, trigger) = prefix.split_once(':').unwrap_or(("*", prefix));
         let offset = Offset::parse(position, target)?;
+        // In stock PCRE, VI validates the executable target and leaves the subject unrestricted.
+        let offset = if offset.is_version_info() {
+            Offset::parse("*", target)?
+        } else {
+            offset
+        };
         let trigger = Expression::trigger(trigger, slot)?;
         let options = options
             .split_once("::")

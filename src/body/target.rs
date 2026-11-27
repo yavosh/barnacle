@@ -3,6 +3,7 @@ use std::io;
 use std::ops::RangeInclusive;
 
 mod executable;
+mod version_info;
 use executable::Executable;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -79,6 +80,7 @@ enum Base {
     LastSection,
     Section(u32),
     EntireSection(u32),
+    VersionInfo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +91,10 @@ pub struct Offset {
 }
 
 impl Offset {
+    pub(super) fn is_version_info(&self) -> bool {
+        self.base == Base::VersionInfo
+    }
+
     pub(super) fn is_any(&self) -> bool {
         self.base == Base::Any
     }
@@ -116,7 +122,12 @@ impl Offset {
             Some((position, shift)) => (position, decimal(shift)?),
             None => (text, 0),
         };
-        let (base, displacement) = if let Some(n) = position.strip_prefix("EOF-") {
+        let (base, displacement) = if position == "VI" {
+            if !target.executable() {
+                return Err(invalid("VI requires an executable target"));
+            }
+            (Base::VersionInfo, 0)
+        } else if let Some(n) = position.strip_prefix("EOF-") {
             (Base::End, decimal(n)?)
         } else if position.starts_with(['E', 'S']) {
             if !target.executable() {
@@ -226,12 +237,27 @@ impl ObjectContext {
         target == Target::Generic || target == self.target
     }
 
+    pub(super) fn version_keys(
+        &self,
+        bytes: &[u8],
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<usize>> {
+        if let Some(exe) = &self.exe
+            && self.target == Target::Pe
+        {
+            return version_info::keys(bytes, &exe.sections, check);
+        }
+        Ok(Vec::new())
+    }
+
     /// Inclusive range of eligible pattern starts, clipped to the object.
     pub fn offset_range(&self, offset: &Offset, size: usize) -> Option<RangeInclusive<usize>> {
         let n = offset.displacement as usize;
         let mut shift = offset.shift as usize;
         let exe = self.exe.as_ref();
         let start = match offset.base {
+            // VI is a disjoint set of resource string keys, not an interval.
+            Base::VersionInfo => return None,
             Base::Any => return Some(0..=size),
             Base::Absolute => n,
             Base::End if self.target.executable() && exe.is_none() => return None,

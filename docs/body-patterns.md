@@ -64,14 +64,25 @@ The matcher uses the ClamAV body pattern and extended offset formats.
 ## Local logical signatures
 
 Local `.ldb` rules can combine extended patterns with Boolean expressions, occurrence counts, and distinct subsignature counts.
-The loader applies functionality levels and ignore rules. It supports `Target`, `FileSize`, `Container`, `EntryPoint`, and `NumberOfSections`.
+The loader applies functionality levels and ignore rules. It supports `Target`, `FileSize`, `Container`, `EntryPoint`, `NumberOfSections`, and `Intermediates`.
 Executable conditions use the parsed PE, ELF, or Mach-O layout. The entry point is a file offset.
 `Container:CL_TYPE_ANY` selects root objects. A named container selects children with that parent type.
+
+`Intermediates` checks the ancestor chain in outer-to-inner order.
+Normalized layers count toward depth. Named types select non-normalized ancestors.
+`CL_TYPE_ANY` adds one required level. Named types consume one visible ancestor each.
+
+The `VI` offset matches the start of a Unicode key in a PE version resource.
+Body patterns check each part at a key offset. The PCRE matcher uses the entire executable subject.
 
 The matcher supports ASCII case folding (`i`), wide bytes (`w`), ASCII with wide bytes (`a`), and fullword boundaries (`f`).
 Case folding applies to literal letters. Wide patterns still measure offsets and brace gaps in bytes.
 ASCII and wide variants share a logical subsignature ID. Two single-part variants at the same start count once.
 Fullword checks run inside the pattern matcher. For multipart patterns, they check the outer edges.
+Patterns support single-arm groups and trailing empty arms after preceding atoms.
+
+Byte comparisons read binary integers or numeric text at a signed offset from a matched body pattern.
+They use the latest match offset and run at the end of each scan window, before PCRE.
 
 PCRE subsignatures run after the indexed patterns for the current scan object.
 A trigger can use occurrence counts from earlier patterns and PCRE subsignatures.
@@ -117,7 +128,7 @@ The test preserved offsets, triggers, and sibling patterns and replaced the rule
 The feed includes generic, executable, document, graphics, mail, and normalized text targets.
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
-A batch compile accepted 312,081 of 312,303 eligible records. The table counts the first rejection per record.
+A batch compile accepted 312,101 of 312,303 eligible records. The table counts the first rejection per record.
 
 | First rejection | Records |
 | --- | ---: |
@@ -125,11 +136,6 @@ A batch compile accepted 312,081 of 312,303 eligible records. The table counts t
 | `IconGroup1` | 52 |
 | `IconGroup2` | 28 |
 | `HandlerType` | 11 |
-| PE version-information offset | 10 |
-| Single-branch alternative | 6 |
-| Empty alternative branch | 2 |
-| Byte comparison | 1 |
-| `Intermediates` | 1 |
 
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
 
@@ -154,7 +160,7 @@ Full-feed memory and throughput remain unverified for logical rules. [Raw result
 ### Supported pinned subset
 
 Both daemons loaded the same 312,081 eligible logical records and one harmless local PCRE rule.
-The workload omitted the 222 records listed above. Both daemons used logical signatures and the pinned ignore lists.
+The benchmark used the earlier 312,081-record subset. Both daemons used the same pinned ignore lists.
 Each one-CPU, 2 GiB trial used four INSTREAM clients and issued 1,024 scans of a 64 KiB binary.
 A padded fixture used repeated punctuation. A varied fixture replaced that padding with changing bytes.
 Every reply named the local PCRE rule. The table shows medians of three trials.

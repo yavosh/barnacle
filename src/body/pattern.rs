@@ -144,6 +144,10 @@ impl Atom {
             }
             Self::Choice { options, negative } => {
                 for option in options {
+                    // Stock's backward verifier skips zero-length arms.
+                    if reverse && option.is_empty() {
+                        continue;
+                    }
                     if let Some((s, next)) = span(option.len())
                         && option
                             .iter()
@@ -504,7 +508,16 @@ fn parse_atoms(mut text: &str, nocase: bool) -> io::Result<Vec<Atom>> {
                 let mut choices: Vec<Box<[Byte]>> = Vec::new();
                 for option in options.split('|') {
                     if option.is_empty() {
-                        return Err(invalid("empty alternative"));
+                        if negative
+                            || choices.len() != 1
+                            || !options.ends_with('|')
+                            || options.matches('|').count() != 1
+                        {
+                            return Err(invalid("unsupported empty alternative"));
+                        }
+                        if atoms.is_empty() && literal.is_empty() {
+                            return Err(invalid("unsupported leading group with an empty arm"));
+                        }
                     }
                     let mut bytes = Vec::new();
                     let mut raw = option;
@@ -536,9 +549,6 @@ fn parse_atoms(mut text: &str, nocase: bool) -> io::Result<Vec<Atom>> {
                         ));
                     }
                     choices.push(bytes.into_boxed_slice());
-                }
-                if choices.len() < 2 {
-                    return Err(invalid("unsupported special or single alternative"));
                 }
                 if choices
                     .iter()
@@ -1037,6 +1047,44 @@ mod tests {
     }
 
     #[test]
+    fn single_arm_groups_keep_the_stock_anchor_and_width() {
+        assert_eq!(part_hits("4142(6364)4546", b"--ABcdEF--", 2..=2), [(2, 8)]);
+        assert!(part_hits("4142(6364)4546", b"---ABcdEF--", 2..=2).is_empty());
+        assert!(part_hits("4142(6364)4546", b"--ABEF--", 2..=2).is_empty());
+        assert!(Pattern::compile("(414263644546)").is_err());
+        assert_eq!(
+            part_hits("4142!(6364)4546", b"--ABcdEF--ABxyEF--", 0..=18),
+            [(10, 16)]
+        );
+        assert_eq!(part_hits("4142(63?4)4546", b"--ABcTEF--", 0..=10), [(2, 8)]);
+        let fullword = Pattern::compile_modified("4142(6364)4546", false, false, true).unwrap();
+        assert_eq!(
+            modified_hits(&fullword, 0, b"-ABcdEF-ABcdEFx", &[]),
+            [(1, 7)]
+        );
+    }
+
+    #[test]
+    fn trailing_empty_arm_depends_on_anchor_direction() {
+        let data = b"--ABCDcdEFGH--ABCDEFGH--ABCDxyEFGH--";
+        assert_eq!(
+            part_hits("41424344(6364|)45464748", data, 0..=data.len()),
+            [(2, 12), (14, 22)]
+        );
+        assert_eq!(
+            part_hits("4142(6364|)4546", b"--ABcdEF--ABEF--", 0..=16),
+            [(2, 8)]
+        );
+        let wide = Pattern::compile_modified("4142(6364|)4546", true, false, false).unwrap();
+        assert_eq!(modified_hits(&wide, 0, b"A\0B\0E\0F\0", &[]), [(0, 8)]);
+        let fullword = Pattern::compile_modified("41424344(6364|)", false, false, true).unwrap();
+        assert_eq!(
+            modified_hits(&fullword, 0, b" ABCDcd ABCD! ABCDxy ", &[]),
+            [(1, 7), (8, 12)]
+        );
+    }
+
+    #[test]
     fn bracket_flanks_keep_core_coordinates() {
         let pattern = "41[1-2]424344[0-1]45";
         assert_eq!(part_hits(pattern, b"AxBCDE", 2..=2), [(2, 5)]);
@@ -1084,7 +1132,11 @@ mod tests {
             "6162[1-2]ff00",
             "6162(63|646)",
             "6162!(63|6465)",
-            "6162(63|)",
+            "6162()",
+            "6162(|63)",
+            "6162!(63|)",
+            "(63|)6162",
+            "6162(63||64)",
             "6162(6*|6465)",
             "6162(B)",
             "6162{2",

@@ -318,12 +318,19 @@ impl Root {
                 else {
                     continue;
                 };
+                let keys = object.version_keys(rule, check)?;
+                if keys.is_some_and(<[usize]>::is_empty) {
+                    continue;
+                }
                 part.hits_for_anchor(
                     object.bytes,
                     preceding,
                     anchor_start,
                     range,
                     |start, end| {
+                        if keys.is_some_and(|v| v.binary_search(&(start + object.base)).is_err()) {
+                            return;
+                        }
                         let order = if let Some(prefix) = rule.bm_prefix {
                             // Equal static buckets in 1.4.3 insert a new record at the head.
                             Order {
@@ -372,7 +379,7 @@ impl Root {
         progress: &mut Progress,
         events: &mut Vec<Event>,
         check: &mut impl FnMut() -> io::Result<()>,
-        emit: &mut impl FnMut(BodyMatch),
+        emit: &mut impl FnMut(BodyMatch) -> io::Result<()>,
     ) -> io::Result<Option<BodyMatch>> {
         let mut best: Option<(Order, BodyMatch)> = None;
         let mut start = 1;
@@ -432,7 +439,7 @@ impl Root {
                         start,
                         end,
                     };
-                    emit(hit);
+                    emit(hit)?;
                     if best.is_none_or(|(prior, _)| e.order < prior) {
                         best = Some((e.order, hit));
                     }
@@ -445,6 +452,7 @@ impl Root {
 }
 
 struct Window<'a> {
+    version_info: &'a std::cell::OnceCell<Vec<usize>>,
     rules: &'a [Rule],
     context: &'a ObjectContext,
     bytes: &'a [u8],
@@ -454,6 +462,21 @@ struct Window<'a> {
 }
 
 impl Window<'_> {
+    fn version_keys(
+        &self,
+        rule: &Rule,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<&[usize]>> {
+        if !rule.offset.is_version_info() {
+            return Ok(None);
+        }
+        if self.version_info.get().is_none() {
+            let keys = self.context.version_keys(self.input, check)?;
+            self.version_info.set(keys).expect("first VI lookup");
+        }
+        Ok(self.version_info.get().map(Vec::as_slice))
+    }
+
     fn preceding(&self, base: usize) -> &[u8] {
         &self.input[base.saturating_sub(2)..base]
     }
@@ -465,7 +488,7 @@ impl Window<'_> {
         base: usize,
         len: usize,
     ) -> Option<std::ops::RangeInclusive<usize>> {
-        if part != 0 {
+        if part != 0 || rule.offset.is_version_info() {
             return Some(0..=len);
         }
         let range = self.context.offset_range(&rule.offset, self.input.len())?;
@@ -487,11 +510,24 @@ impl Window<'_> {
             return Ok(false);
         };
         let mut seen = false;
-        part.hits_for_anchor(bytes, self.preceding(base), anchor, range, |_, _| {
-            seen = true
+        part.hits_for_anchor(bytes, self.preceding(base), anchor, range, |start, _| {
+            seen |= !rule.offset.is_version_info()
+                || self
+                    .version_info
+                    .get()
+                    .is_some_and(|keys| keys.binary_search(&(start + base)).is_ok());
         })?;
         Ok(seen)
     }
+}
+
+pub(super) enum SearchEvent<'a> {
+    Match(BodyMatch),
+    EndWindow {
+        target: Target,
+        bytes: &'a [u8],
+        check: &'a mut dyn FnMut() -> io::Result<()>,
+    },
 }
 
 pub(super) struct SearchIndex(Vec<Root>);
@@ -515,8 +551,25 @@ impl SearchIndex {
         input: &[u8],
         context: &ObjectContext,
         first: bool,
-        mut check: impl FnMut() -> io::Result<()>,
+        check: impl FnMut() -> io::Result<()>,
         emit: &mut impl FnMut(BodyMatch),
+    ) -> io::Result<Option<BodyMatch>> {
+        self.run_events(rules, input, context, first, check, &mut |event| {
+            if let SearchEvent::Match(hit) = event {
+                emit(hit);
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn run_events(
+        &self,
+        rules: &[Rule],
+        input: &[u8],
+        context: &ObjectContext,
+        first: bool,
+        mut check: impl FnMut() -> io::Result<()>,
+        emit: &mut impl FnMut(SearchEvent<'_>) -> io::Result<()>,
     ) -> io::Result<Option<BodyMatch>> {
         let mut roots: Vec<_> = self
             .0
@@ -529,6 +582,7 @@ impl SearchIndex {
         };
         let mut previous = None;
         let mut events = Vec::new();
+        let version_info = std::cell::OnceCell::new();
         let mut base: usize = 0;
         loop {
             let end = base.saturating_add(STOCK_WINDOW).min(input.len());
@@ -540,9 +594,17 @@ impl SearchIndex {
                 input,
                 base,
                 previous,
+                version_info: &version_info,
             };
             for (root, progress) in &mut roots {
-                let hit = root.window(&window, progress, &mut events, &mut check, emit)?;
+                let hit = root.window(&window, progress, &mut events, &mut check, &mut |hit| {
+                    emit(SearchEvent::Match(hit))
+                })?;
+                emit(SearchEvent::EndWindow {
+                    target: root.target,
+                    bytes: window.bytes,
+                    check: &mut check,
+                })?;
                 if first && hit.is_some() {
                     return Ok(hit);
                 }

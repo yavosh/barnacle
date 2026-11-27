@@ -47,6 +47,7 @@ trait ChildSink {
             None => Ok(false),
         }
     }
+    fn normalized_file(&mut self, data: &mut dyn Read) -> io::Result<bool>;
     fn mailbox_letters(&mut self, letters: &mut text::SavedLetters) -> io::Result<Handling>;
     fn read_child(&mut self, data: &mut dyn Read) -> io::Result<Option<Snapshot>>;
     fn visit_snapshot(
@@ -154,10 +155,23 @@ impl Default for Options {
 }
 
 pub struct Layer {
+    /// Stock hides this layer when matching container types.
+    pub normalized: bool,
     pub file_type: &'static str,
     pub target: Target,
     pub name: Option<Box<[u8]>>,
     pub size: usize,
+}
+
+impl Layer {
+    // Remove the current logical object, including any normalized copies of it.
+    fn logical_parents(stack: &[Layer]) -> &[Layer] {
+        let current = stack
+            .iter()
+            .rposition(|layer| !layer.normalized)
+            .unwrap_or(0);
+        &stack[..current]
+    }
 }
 
 pub struct Object<'a> {
@@ -332,7 +346,7 @@ pub fn scan(
         matcher: &mut matcher,
         check: &mut check,
     };
-    walk.visit(bytes, InputKind::File, None)?;
+    walk.visit(bytes, InputKind::File, None, false)?;
     Ok(walk.stopped.unwrap_or_else(|| match walk.first_limit {
         Some(limit) if options.alert_exceeds_max => Verdict::Found(limit.signature()),
         _ => Verdict::Miss,
@@ -347,7 +361,13 @@ impl Traversal<'_> {
         }
     }
 
-    fn visit(&mut self, bytes: &[u8], kind: InputKind, name: Option<&[u8]>) -> io::Result<()> {
+    fn visit(
+        &mut self,
+        bytes: &[u8],
+        kind: InputKind,
+        name: Option<&[u8]>,
+        normalized: bool,
+    ) -> io::Result<()> {
         self.check()?;
         if bytes.len() <= 5 {
             return Ok(());
@@ -383,6 +403,7 @@ impl Traversal<'_> {
             }
         }
         self.parents.push(Layer {
+            normalized,
             target: file_type.context.target(),
             file_type: file_type.name,
             size: bytes.len(),
@@ -405,7 +426,8 @@ impl Traversal<'_> {
                 normalized: matches!(kind, InputKind::Normalized(_)),
                 body_only: false,
                 logical: LogicalObject {
-                    parent: parents.last().map(|p| p.file_type),
+                    parents: Layer::logical_parents(&self.parents),
+                    recursion_level: parents.len() + self.normalized_depth,
                     file_size: bytes.len(),
                     unmapped_script: false,
                     mapped_source_size: None,
@@ -539,6 +561,7 @@ impl ChildSink for Traversal<'_> {
         self.check()?;
         let context = ObjectContext::typed(Target::Generic, bytes);
         let layer = Layer {
+            normalized: false,
             file_type: "CL_TYPE_ANY",
             target: Target::Generic,
             name: None,
@@ -552,7 +575,8 @@ impl ChildSink for Traversal<'_> {
             normalized: false,
             body_only: false,
             logical: LogicalObject {
-                parent: self.parents.last().map(|p| p.file_type),
+                parents: &self.parents,
+                recursion_level: self.parents.len() + self.normalized_depth,
                 file_size: bytes.len(),
                 unmapped_script: false,
                 mapped_source_size: None,
@@ -594,7 +618,7 @@ impl ChildSink for Traversal<'_> {
         if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
             return Ok(false);
         }
-        self.visit(bytes, InputKind::Partition, name)?;
+        self.visit(bytes, InputKind::Partition, name, false)?;
         Ok(self.stopped.is_some())
     }
 
@@ -609,6 +633,7 @@ impl ChildSink for Traversal<'_> {
         // A suffix is another map of the same input. Stock checks its size
         // and pushes its type, then charges only the newly extracted children.
         self.parents.push(Layer {
+            normalized: false,
             file_type: kind,
             target: if kind == "CL_TYPE_MSEXE" {
                 Target::Pe
@@ -646,7 +671,7 @@ impl ChildSink for Traversal<'_> {
             let Some(body) = letters.read(self)? else {
                 return Ok(Handling::Incomplete);
             };
-            self.visit(body.as_ref(), InputKind::MailboxLetter, None)?;
+            self.visit(body.as_ref(), InputKind::MailboxLetter, None, false)?;
             let verdict = self.stopped.take().unwrap_or(Verdict::Miss);
             match verdict {
                 Verdict::Miss => (),
@@ -684,7 +709,14 @@ impl ChildSink for Traversal<'_> {
         name: Option<&[u8]>,
     ) -> io::Result<bool> {
         let kind = target.map_or(InputKind::File, InputKind::Normalized);
-        snapshot.with_bytes(|bytes| self.visit(bytes, kind, name))?;
+        snapshot.with_bytes(|bytes| self.visit(bytes, kind, name, target.is_some()))?;
+        Ok(self.stopped.is_some())
+    }
+
+    fn normalized_file(&mut self, data: &mut dyn Read) -> io::Result<bool> {
+        if let Some(snapshot) = self.read_child(data)? {
+            snapshot.with_bytes(|bytes| self.visit(bytes, InputKind::File, None, true))?;
+        }
         Ok(self.stopped.is_some())
     }
 
@@ -709,7 +741,7 @@ impl ChildSink for Traversal<'_> {
             self.skip_declared_size(limit.saturating_add(1));
             return Ok(false);
         }
-        self.visit(bytes, InputKind::File, name)?;
+        self.visit(bytes, InputKind::File, name, false)?;
         Ok(self.stopped.is_some())
     }
 
@@ -737,6 +769,7 @@ impl ChildSink for Traversal<'_> {
             .expect("view has an owning object");
         let context = ObjectContext::typed(Target::Ascii, bytes);
         let layer = Layer {
+            normalized: true,
             target: Target::Ascii,
             file_type: "CL_TYPE_TEXT_ASCII",
             size: bytes.len(),
@@ -750,7 +783,8 @@ impl ChildSink for Traversal<'_> {
             normalized: true,
             body_only: !mapped,
             logical: LogicalObject {
-                parent: parents.last().map(|p| p.file_type),
+                parents: Layer::logical_parents(&self.parents),
+                recursion_level: parents.len() + self.normalized_depth + usize::from(mapped),
                 file_size: if mapped { bytes.len() } else { owner.size },
                 unmapped_script: !mapped,
                 mapped_source_size: mapped.then_some(owner.size),

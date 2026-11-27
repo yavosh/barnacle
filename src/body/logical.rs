@@ -1,9 +1,11 @@
 //! Evaluate logical signatures against the evidence from one stock scan object.
+use super::byte_compare::ByteCompare;
 use super::logic_expression::Expression;
 use super::logical_pcre::{PcreLimits, RegexChild};
-use super::search::STOCK_WINDOW;
+use super::search::{STOCK_WINDOW, SearchEvent};
 use super::{ObjectContext, Offset, Pattern, Rule, SearchIndex, Target, invalid, level};
 use crate::IgnoreSet;
+use crate::objects::Layer;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -14,9 +16,12 @@ const MAX_LINE: usize = 32768;
 const MAX_CHILDREN: usize = 64;
 
 /// File-map and container information used by the pinned logical matcher.
+#[derive(Clone, Copy)]
 pub struct LogicalObject<'a> {
-    /// Immediate container after skipping normalized layers.
-    pub parent: Option<&'a str>,
+    /// Ancestors of the owning object, from outermost to innermost.
+    pub parents: &'a [Layer],
+    /// Physical recursion depth, including normalized layers.
+    pub recursion_level: usize,
     /// Active file map length. An unmapped view uses the owning map.
     pub file_size: usize,
     /// An in-memory script view has no generic relative-offset table.
@@ -27,44 +32,61 @@ pub struct LogicalObject<'a> {
 
 struct Conditions {
     target: Target,
-    container: Option<&'static str>,
-    file: Option<Box<FileConditions>>,
+    attributes: Option<Box<ObjectConditions>>,
 }
 
 #[derive(Default)]
-struct FileConditions {
+struct ObjectConditions {
+    container: Option<&'static str>,
+    intermediates: Box<[&'static str]>,
     size: Option<RangeInclusive<u32>>,
     entry_point: Option<RangeInclusive<u32>>,
     sections: Option<RangeInclusive<u32>>,
 }
 
-impl FileConditions {
+impl ObjectConditions {
     fn matches(range: &Option<RangeInclusive<u32>>, actual: Option<usize>) -> bool {
         range.as_ref().is_none_or(|range| {
             actual.is_some_and(|n| u32::try_from(n).is_ok_and(|n| range.contains(&n)))
         })
     }
 
-    fn accepts(&self, context: &ObjectContext, size: usize) -> bool {
+    fn accepts(&self, context: &ObjectContext, object: &LogicalObject<'_>) -> bool {
+        let mut ancestors = object
+            .parents
+            .iter()
+            .rev()
+            .filter(|p| !p.normalized)
+            .map(|p| p.file_type);
+        if self
+            .container
+            .is_some_and(|kind| ancestors.clone().next().unwrap_or("CL_TYPE_ANY") != kind)
+            || self.intermediates.len() > object.recursion_level
+        {
+            return false;
+        }
+        // Stock counts ANY toward the minimum depth, without consuming a typed ancestor.
+        for &kind in self.intermediates.iter().rev() {
+            if kind != "CL_TYPE_ANY" && ancestors.next() != Some(kind) {
+                return false;
+            }
+        }
         let (entry, sections) = context
             .executable_metadata()
             .map_or((None, None), |(entry, sections)| {
                 (Some(entry), Some(sections))
             });
-        Self::matches(&self.size, Some(size))
+        Self::matches(&self.size, Some(object.file_size))
             && Self::matches(&self.entry_point, entry)
             && Self::matches(&self.sections, sections)
     }
 }
 
 impl Conditions {
-    fn accepts(&self, context: &ObjectContext, size: usize, parent: Option<&str>) -> bool {
-        self.container
-            .is_none_or(|kind| parent.unwrap_or("CL_TYPE_ANY") == kind)
-            && self
-                .file
-                .as_ref()
-                .is_none_or(|file| file.accepts(context, size))
+    fn accepts(&self, context: &ObjectContext, object: &LogicalObject<'_>) -> bool {
+        self.attributes
+            .as_ref()
+            .is_none_or(|a| a.accepts(context, object))
     }
 }
 
@@ -88,17 +110,19 @@ struct Builder {
     expressions: Vec<Expression>,
     expression_ids: HashMap<usize, HashMap<Box<str>, usize>>,
     zero_matches: Vec<u32>,
+    byte_compares: HashMap<Target, Vec<(u32, ByteCompare)>>,
     regexes: HashMap<u32, Box<[RegexChild]>>,
     zero_triggers: Vec<u32>,
 }
 
-/// Logical matcher for extended-pattern and PCRE subsignatures.
+/// Logical matcher for extended patterns, byte comparisons, and PCRE subsignatures.
 pub struct LogicalIndex {
     records: Vec<LogicalRule>,
     children: Vec<Rule>,
     bindings: Vec<ChildBinding>,
     expressions: Vec<Expression>,
     zero_matches: Vec<u32>,
+    byte_compares: HashMap<Target, Vec<(u32, ByteCompare)>>,
     regexes: HashMap<u32, Box<[RegexChild]>>,
     zero_triggers: Vec<u32>,
     pcre_limits: PcreLimits,
@@ -159,6 +183,7 @@ impl LogicalIndex {
             bindings: builder.bindings,
             expressions: builder.expressions,
             zero_matches: builder.zero_matches,
+            byte_compares: builder.byte_compares,
             regexes: builder.regexes,
             zero_triggers: builder.zero_triggers,
             pcre_limits: PcreLimits::default(),
@@ -197,24 +222,49 @@ impl LogicalIndex {
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
         let mut evidence: HashMap<u32, Evidence> = HashMap::new();
-        self.search.run(
+        self.search.run_events(
             &self.children,
             bytes,
             context,
             false,
             &mut check,
-            &mut |hit| {
+            &mut |event| {
+                let hit = match event {
+                    SearchEvent::Match(hit) => hit,
+                    SearchEvent::EndWindow {
+                        target,
+                        bytes,
+                        check,
+                    } => {
+                        if let Some(compares) = self.byte_compares.get(&target) {
+                            for (i, (owner, compare)) in compares.iter().enumerate() {
+                                if i % 256 == 0 {
+                                    check()?;
+                                }
+                                let Some(e) = evidence.get_mut(owner) else {
+                                    continue;
+                                };
+                                if e.counts
+                                    .get(compare.trigger)
+                                    .is_some_and(|&count| count != 0)
+                                    && compare.matches(bytes, e.last[compare.trigger])
+                                {
+                                    e.counts[compare.slot] = e.counts[compare.slot].wrapping_add(1);
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                };
                 let child = hit.rule_id as usize;
                 let binding = &self.bindings[child];
                 let record = &self.records[binding.owner as usize];
-                if !record
-                    .conditions
-                    .accepts(context, object.file_size, object.parent)
+                if !record.conditions.accepts(context, &object)
                     || object.unmapped_script
                         && record.conditions.target == Target::Generic
                         && self.children[child].offset.is_relative()
                 {
-                    return;
+                    return Ok(());
                 }
                 let slot = usize::from(binding.slot);
                 let e = evidence.entry(binding.owner).or_insert_with(|| Evidence {
@@ -231,22 +281,22 @@ impl LogicalIndex {
                     e.counts[slot] = e.counts[slot].wrapping_add(1);
                     e.last[slot] = hit.start;
                 }
+                Ok(())
             },
         )?;
         self.scan_regexes(bytes, context, &object, &mut evidence, &mut check)?;
-        let first = self.evaluate(
-            context,
-            object.parent,
-            object.file_size,
-            &evidence,
-            &mut check,
-        )?;
+        let first = self.evaluate(context, &object, &evidence, &mut check)?;
         if first.is_none()
             && let Some(size) = object.mapped_source_size
         {
             // cli_scanscript restores the source map after scanning the mapped view,
             // then checks the caller's initially empty logical counters.
-            return self.evaluate(context, object.parent, size, &HashMap::new(), &mut check);
+            let restored = LogicalObject {
+                file_size: size,
+                recursion_level: object.recursion_level.saturating_sub(1),
+                ..object
+            };
+            return self.evaluate(context, &restored, &HashMap::new(), &mut check);
         }
         Ok(first)
     }
@@ -271,9 +321,7 @@ impl LogicalIndex {
                 return Ok(());
             };
             let conditions = &self.records[id as usize].conditions;
-            if context.accepts(conditions.target)
-                && conditions.accepts(context, object.file_size, object.parent)
-            {
+            if context.accepts(conditions.target) && conditions.accepts(context, object) {
                 for child in children {
                     check()?;
                     if child.trigger.matches(counts) {
@@ -306,8 +354,7 @@ impl LogicalIndex {
     fn evaluate(
         &self,
         context: &ObjectContext,
-        parent: Option<&str>,
-        file_size: usize,
+        object: &LogicalObject<'_>,
         evidence: &HashMap<u32, Evidence>,
         check: &mut impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
@@ -329,7 +376,7 @@ impl LogicalIndex {
             let key = (rule.conditions.target == Target::Generic, id);
             if winner.is_some_and(|earlier| earlier <= key)
                 || !context.accepts(rule.conditions.target)
-                || !rule.conditions.accepts(context, file_size, parent)
+                || !rule.conditions.accepts(context, object)
             {
                 continue;
             }
@@ -415,6 +462,14 @@ impl Builder {
                 regexes.push(RegexChild::parse(field, conditions.target, i).map_err(located)?);
                 continue;
             }
+            if field.contains('#') && field.starts_with(|c: char| c.is_ascii_digit()) {
+                let compare = ByteCompare::parse(field, i).map_err(located)?;
+                self.byte_compares
+                    .entry(conditions.target)
+                    .or_default()
+                    .push((id, compare));
+                continue;
+            }
             let variants = parse_child(field, conditions.target).map_err(located)?;
             for rule in variants.into_iter().flatten() {
                 if self.children.len() >= u32::MAX as usize {
@@ -457,8 +512,9 @@ fn range(text: &str) -> io::Result<RangeInclusive<u32>> {
 fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
     let mut engine = None;
     let mut target = None;
-    let mut file = FileConditions::default();
+    let mut file = ObjectConditions::default();
     let mut container = None;
+    let mut intermediates = None;
     for (i, field) in title.split(',').enumerate() {
         let (key, value) = field
             .split_once(':')
@@ -474,13 +530,15 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
             "EntryPoint" => file.entry_point = Some(range(value)?),
             "NumberOfSections" => file.sections = Some(range(value)?),
             "Container" => container = Some(value),
+            "Intermediates" => intermediates = Some(value),
             _ if engine.as_ref().is_some_and(|r| !r.contains(&flevel)) => return Ok(None),
             _ => return Err(invalid(format!("unsupported logical target field {key}"))),
         }
     }
     let executable = file.entry_point.is_some() || file.sections.is_some();
-    let file = (file.size.is_some() || executable).then(|| Box::new(file));
-    if (file.is_some() || container.is_some()) && engine.as_ref().is_none_or(|r| *r.start() < 51) {
+    let constrained =
+        file.size.is_some() || executable || container.is_some() || intermediates.is_some();
+    if constrained && engine.as_ref().is_none_or(|r| *r.start() < 51) {
         return Err(invalid(
             "logical target attributes require an Engine minimum of at least 51",
         ));
@@ -495,21 +553,28 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
             "EntryPoint and NumberOfSections require an executable Target",
         ));
     }
-    let container = container
-        .map(|value| {
-            CONTAINERS
-                .iter()
-                .copied()
-                .find(|&c| c == value)
-                .ok_or_else(|| invalid(format!("unsupported Container type {value}")))
-        })
-        .transpose()?;
-    let conditions = Conditions {
-        target,
-        container,
-        file,
+    let file_type = |value: &str, field: &str| {
+        CONTAINERS
+            .iter()
+            .copied()
+            .find(|&kind| kind == value)
+            .ok_or_else(|| invalid(format!("unsupported {field} type {value}")))
     };
-    Ok(Some(conditions))
+    file.container = container
+        .map(|value| file_type(value, "Container"))
+        .transpose()?;
+    if let Some(value) = intermediates {
+        // The pinned parser reads at most 16 tokens from an Intermediates field.
+        file.intermediates = value
+            .split('>')
+            .take(16)
+            .map(|kind| file_type(kind, "Intermediates"))
+            .collect::<io::Result<_>>()?;
+    }
+    Ok(Some(Conditions {
+        target,
+        attributes: constrained.then(|| Box::new(file)),
+    }))
 }
 
 #[derive(Default)]
@@ -541,9 +606,7 @@ fn parse_child(field: &str, target: Target) -> io::Result<[Option<Rule>; 2]> {
         return Err(invalid("unsupported macro subsignature"));
     }
     if field.contains('#') {
-        return Err(invalid(
-            "unsupported byte-compare or fuzzy hash subsignature",
-        ));
+        return Err(invalid("unsupported fuzzy hash subsignature"));
     }
     let (field, modifiers) = match field.split_once("::") {
         // Stock uses the unmodified pattern when a second modifier delimiter is present.
@@ -705,7 +768,8 @@ mod tests {
                     bytes,
                     &ObjectContext::typed(target, bytes),
                     LogicalObject {
-                        parent: None,
+                        parents: &[],
+                        recursion_level: 0,
                         file_size: bytes.len(),
                         unmapped_script: false,
                         mapped_source_size: None,
@@ -733,12 +797,20 @@ mod tests {
             (Some("CL_TYPE_ZIP"), 20, Some("Member")),
             (Some("CL_TYPE_GZ"), 20, None),
         ] {
+            let layers = parent.map(|file_type| Layer {
+                file_type,
+                target: Target::Generic,
+                size,
+                name: None,
+                normalized: false,
+            });
             assert_eq!(
                 index.first_match_checked(
                     bytes,
                     &context,
                     LogicalObject {
-                        parent,
+                        parents: layers.as_slice(),
+                        recursion_level: layers.as_slice().len(),
                         file_size: size,
                         unmapped_script: false,
                         mapped_source_size: None,
