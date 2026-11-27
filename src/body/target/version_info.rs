@@ -2,11 +2,11 @@
 use super::executable::Section;
 use std::io;
 
-fn word(bytes: &[u8], at: usize) -> Option<usize> {
+pub(super) fn word(bytes: &[u8], at: usize) -> Option<usize> {
     Some(u16::from_le_bytes(*bytes.get(at..)?.first_chunk()?) as usize)
 }
 
-fn dword(bytes: &[u8], at: usize) -> Option<usize> {
+pub(super) fn dword(bytes: &[u8], at: usize) -> Option<usize> {
     Some(u32::from_le_bytes(*bytes.get(at..)?.first_chunk()?) as usize)
 }
 
@@ -14,7 +14,7 @@ fn aligned(n: usize) -> usize {
     (n + 3) & !3
 }
 
-struct Map<'a> {
+pub(super) struct Map<'a> {
     section_headers: &'a [[u8; 40]],
     sections: &'a [Section],
     alignment: usize,
@@ -22,7 +22,7 @@ struct Map<'a> {
 }
 
 impl Map<'_> {
-    fn offset(&self, rva: usize) -> Option<usize> {
+    pub(super) fn offset(&self, rva: usize) -> Option<usize> {
         if rva < self.headers_end {
             return Some(rva);
         }
@@ -39,7 +39,10 @@ impl Map<'_> {
     }
 }
 
-fn directory<'a>(bytes: &'a [u8], sections: &'a [Section]) -> Option<(Map<'a>, &'a [u8])> {
+pub(super) fn directory<'a>(
+    bytes: &'a [u8],
+    sections: &'a [Section],
+) -> Option<(Map<'a>, &'a [u8])> {
     let header = bytes.get(dword(bytes, 60)?..)?;
     let (opt, table) = header.get(24..)?.split_at_checked(word(header, 20)?)?;
     let dirs = match word(opt, 0)? {
@@ -75,7 +78,7 @@ fn directory<'a>(bytes: &'a [u8], sections: &'a [Section]) -> Option<(Map<'a>, &
     Some((map, tail.get(..length.min(tail.len()))?))
 }
 
-fn entries(tree: &[u8], at: usize) -> Option<&[[u8; 8]]> {
+pub(super) fn entries(tree: &[u8], at: usize) -> Option<&[[u8; 8]]> {
     let directory = tree.get(at..)?;
     let count = word(directory, 12)? + word(directory, 14)?;
     Some(directory.get(16..)?.get(..count * 8)?.as_chunks::<8>().0)
@@ -83,7 +86,7 @@ fn entries(tree: &[u8], at: usize) -> Option<&[[u8; 8]]> {
 
 const BRANCH: usize = 1 << 31;
 
-fn child_directory<'a>(tree: &'a [u8], entry: &[u8; 8]) -> Option<&'a [[u8; 8]]> {
+pub(super) fn child_directory<'a>(tree: &'a [u8], entry: &[u8; 8]) -> Option<&'a [[u8; 8]]> {
     let offset = dword(entry, 4)?;
     (offset & BRANCH != 0).then(|| entries(tree, offset ^ BRANCH))?
 }

@@ -1,5 +1,6 @@
 //! Evaluate logical signatures against the evidence from one stock scan object.
 use super::byte_compare::ByteCompare;
+use super::icon_db::IconDatabase;
 use super::image_fuzzy;
 use super::logic_expression::Expression;
 use super::logical_pcre::{PcreLimits, RegexChild};
@@ -47,8 +48,8 @@ pub enum HandlerType {
 
 /// Eligible type changes in scan order, followed by the first ordinary finding.
 pub struct LogicalMatches<'a> {
-    pub handlers: Vec<(&'a str, HandlerType)>,
-    pub finding: Option<&'a str>,
+    pub handlers: Vec<(Result<Option<&'a str>, String>, HandlerType)>,
+    pub finding: Result<Option<&'a str>, String>,
 }
 
 #[derive(Default)]
@@ -59,6 +60,7 @@ struct ObjectConditions {
     entry_point: Option<RangeInclusive<u32>>,
     sections: Option<RangeInclusive<u32>>,
     handler: Option<HandlerType>,
+    icon_groups: Option<Box<[Option<Box<str>>; 2]>>,
 }
 
 impl ObjectConditions {
@@ -146,6 +148,8 @@ pub struct LogicalIndex {
     zero_triggers: Vec<u32>,
     pcre_limits: PcreLimits,
     image_fuzzy_enabled: bool,
+    icons: IconDatabase,
+    max_icons: usize,
     search: SearchIndex,
 }
 
@@ -206,6 +210,8 @@ impl LogicalIndex {
             byte_compares: builder.byte_compares,
             images: builder.images,
             image_fuzzy_enabled: true,
+            icons: IconDatabase::default(),
+            max_icons: 100,
             regexes: builder.regexes,
             zero_triggers: builder.zero_triggers,
             pcre_limits: PcreLimits::default(),
@@ -223,6 +229,19 @@ impl LogicalIndex {
     pub fn with_image_fuzzy_hash(mut self, enabled: bool) -> Self {
         self.image_fuzzy_enabled = enabled;
         self
+    }
+
+    /// Attach the generation's icon signatures and PE icon limit.
+    pub fn with_icons(
+        mut self,
+        paths: &[&Path],
+        ignores: &IgnoreSet,
+        max_icons: usize,
+        open: impl FnMut(&Path) -> io::Result<File>,
+    ) -> io::Result<Self> {
+        self.icons = IconDatabase::load(paths, ignores, open)?;
+        self.max_icons = max_icons;
+        Ok(self)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -249,9 +268,9 @@ impl LogicalIndex {
         object: LogicalObject<'_>,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
-        Ok(self
-            .matches_checked(bytes, context, object, false, check)?
-            .finding)
+        self.matches_checked(bytes, context, object, false, check)?
+            .finding
+            .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))
     }
 
     /// Evaluate logical signatures and retain handler actions when rescans are enabled.
@@ -350,13 +369,14 @@ impl LogicalIndex {
         }
         self.scan_regexes(bytes, context, &object, &mut evidence, &mut check)?;
         let mut matches = self.evaluate(
+            bytes,
             context,
             &object,
             &evidence,
             rescan && !object.unmapped_script,
             &mut check,
         )?;
-        if matches.finding.is_none()
+        if matches.finding == Ok(None)
             && let Some(size) = object.mapped_source_size
         {
             // cli_scanscript restores the source map after scanning the mapped view,
@@ -367,7 +387,14 @@ impl LogicalIndex {
                 ..object
             };
             matches.finding = self
-                .evaluate(context, &restored, &HashMap::new(), false, &mut check)?
+                .evaluate(
+                    bytes,
+                    context,
+                    &restored,
+                    &HashMap::new(),
+                    false,
+                    &mut check,
+                )?
                 .finding;
         }
         Ok(matches)
@@ -425,6 +452,7 @@ impl LogicalIndex {
 
     fn evaluate(
         &self,
+        bytes: &[u8],
         context: &ObjectContext,
         object: &LogicalObject<'_>,
         evidence: &HashMap<u32, Evidence>,
@@ -435,7 +463,7 @@ impl LogicalIndex {
         // The specific target precedes generic. Only touched records and those
         // known to pass with all-zero counts can win.
         let mut winner = None;
-        let mut handlers = Vec::new();
+        let mut pending = Vec::new();
         let candidates = evidence.iter().map(|(&id, e)| (id, Some(e))).chain(
             self.zero_matches
                 .iter()
@@ -454,27 +482,68 @@ impl LogicalIndex {
             {
                 continue;
             }
-            if e.is_none_or(|e| self.expressions[rule.expression].matches(&e.counts)) {
-                if rescan
-                    && let Some(handler) =
-                        rule.conditions.attributes.as_ref().and_then(|a| a.handler)
-                {
-                    handlers.push((key, handler));
-                } else {
-                    winner = Some(key);
-                }
+            if e.is_some_and(|e| !self.expressions[rule.expression].matches(&e.counts)) {
+                continue;
+            }
+            if rule
+                .conditions
+                .attributes
+                .as_deref()
+                .is_some_and(|a| a.icon_groups.is_some() || rescan && a.handler.is_some())
+            {
+                pending.push(key);
+            } else {
+                winner = Some(key);
             }
         }
-        handlers.retain(|(key, _)| winner.is_none_or(|earlier| *key < earlier));
-        handlers.sort_unstable_by_key(|&(key, _)| key);
-        let name = |id: u32| self.records[id as usize].name.as_ref();
-        Ok(LogicalMatches {
-            handlers: handlers
-                .into_iter()
-                .map(|((_, id), handler)| (name(id), handler))
-                .collect(),
-            finding: winner.map(|(_, id)| name(id)),
-        })
+        pending.retain(|key| winner.is_none_or(|earlier| *key < earlier));
+        pending.sort_unstable();
+        let mut finding = Ok(winner.map(|(_, id)| self.records[id as usize].name.as_ref()));
+        let mut handlers = Vec::new();
+        let mut icon_samples = None;
+        for (_, id) in pending {
+            let rule = &self.records[id as usize];
+            let attributes = rule
+                .conditions
+                .attributes
+                .as_deref()
+                .expect("pending conditions");
+            let icon_matches = match attributes.icon_groups.as_deref() {
+                None => Ok(true),
+                Some(groups) => {
+                    if context.is_valid_pe()
+                        && let Some(ids) = self
+                            .icons
+                            .select([groups[0].as_deref(), groups[1].as_deref()])
+                    {
+                        let samples = match &mut icon_samples {
+                            Some(samples) => samples,
+                            empty => {
+                                empty.insert(context.icon_metrics(bytes, self.max_icons, check)?)
+                            }
+                        };
+                        if self.icons.matches(ids, &samples.values, check)? {
+                            Ok(true)
+                        } else {
+                            samples
+                                .unsupported
+                                .as_ref()
+                                .map_or(Ok(false), |error| Err(error.clone()))
+                        }
+                    } else {
+                        Ok(false)
+                    }
+                }
+            };
+            let result = icon_matches.map(|matched| matched.then_some(rule.name.as_ref()));
+            if rescan && let Some(handler) = attributes.handler {
+                handlers.push((result, handler));
+            } else if result != Ok(None) {
+                finding = result;
+                break;
+            }
+        }
+        Ok(LogicalMatches { handlers, finding })
     }
 }
 
@@ -614,6 +683,7 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
     let mut container = None;
     let mut intermediates = None;
     let mut handler = None;
+    let mut icon_groups = [None; 2];
     for (i, field) in title.split(',').enumerate() {
         let (key, value) = field
             .split_once(':')
@@ -631,16 +701,20 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
             "Container" => container = Some(value),
             "Intermediates" => intermediates = Some(value),
             "HandlerType" => handler = Some(value),
+            "IconGroup1" => icon_groups[0] = Some(value),
+            "IconGroup2" => icon_groups[1] = Some(value),
             _ if engine.as_ref().is_some_and(|r| !r.contains(&flevel)) => return Ok(None),
             _ => return Err(invalid(format!("unsupported logical target field {key}"))),
         }
     }
     let executable = file.entry_point.is_some() || file.sections.is_some();
+    let uses_icons = icon_groups.iter().any(Option::is_some);
     let constrained = file.size.is_some()
         || executable
         || container.is_some()
         || intermediates.is_some()
-        || handler.is_some();
+        || handler.is_some()
+        || uses_icons;
     if constrained && engine.as_ref().is_none_or(|r| *r.start() < 51) {
         return Err(invalid(
             "logical target attributes require an Engine minimum of at least 51",
@@ -656,6 +730,10 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
             "EntryPoint and NumberOfSections require an executable Target",
         ));
     }
+    if uses_icons && target != Target::Pe {
+        return Err(invalid("icon groups require a PE Target"));
+    }
+    file.icon_groups = uses_icons.then(|| Box::new(icon_groups.map(|group| group.map(Into::into))));
     let file_type = |value: &str, field: &str| {
         CONTAINERS
             .iter()

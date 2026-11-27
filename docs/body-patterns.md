@@ -79,6 +79,14 @@ When stock has no reference digest, including with `DisableCache yes`, it report
 Stock also reports the handler's name when the digest matches the last handler's digest in the scan.
 If a limit denies the rescan, the raw logical pass ends. A later stage can still report a finding.
 
+PE logical rules can require `IconGroup1`, `IconGroup2`, or both.
+When a rule requires both groups, one `.idb` row must satisfy both conditions.
+Group names are case-sensitive. `*` selects any group in that column.
+Barnacle reads grouped bitmap icons only after the rule's content and other metadata match.
+`MaxIconsPE` defaults to 100. Stock treats zero as one and still checks icon groups with `ScanPE no`.
+If an unsupported bitmap layout prevents a decision, Barnacle reports an error for the affected rule.
+[Paired PE icon tests](../tests/logical_pe_icons.rs)
+
 The `VI` offset matches the start of a Unicode key in a PE version resource.
 Body patterns check each part at a key offset. The PCRE matcher uses the entire executable subject.
 
@@ -142,12 +150,7 @@ The test preserved offsets, triggers, and sibling patterns and replaced the rule
 The feed includes generic, executable, document, graphics, mail, and normalized text targets.
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
-A batch compile accepted 312,223 of 312,303 eligible records. The table counts the first rejection per record.
-
-| First rejection | Records |
-| --- | ---: |
-| `IconGroup1` | 52 |
-| `IconGroup2` | 28 |
+An offline run compiled all 312,303 eligible logical records in one index and loaded the 222 pinned icon records.
 
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
 

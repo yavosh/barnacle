@@ -193,8 +193,8 @@ pub enum Verdict {
     Found(String),
     /// Run logical file-type rules before reporting the next ordinary finding.
     Handlers {
-        rules: Vec<(String, HandlerType)>,
-        finding: Option<String>,
+        rules: Vec<(Result<Option<String>, String>, HandlerType)>,
+        finding: Result<Option<String>, String>,
     },
     Miss,
     Incomplete,
@@ -495,6 +495,7 @@ impl Traversal<'_> {
     fn apply_verdict(&mut self, bytes: &[u8], verdict: Verdict) -> io::Result<bool> {
         match verdict {
             Verdict::Handlers { rules, finding } => {
+                let unsupported = |message| io::Error::new(io::ErrorKind::Unsupported, message);
                 let mut md5 = Md5::new();
                 for block in bytes.chunks(64 << 10) {
                     self.check()?;
@@ -503,8 +504,11 @@ impl Traversal<'_> {
                 let hash: [u8; 16] = md5.finalize().into();
                 for (name, kind) in rules {
                     if self.last_handler_hash == hash {
-                        self.stopped = Some(Verdict::Found(name));
-                        return Ok(false);
+                        if let Some(name) = name.map_err(unsupported)? {
+                            self.stopped = Some(Verdict::Found(name));
+                            return Ok(false);
+                        }
+                        continue;
                     }
                     self.last_handler_hash = hash;
                     let limit = (self.parents.len() + self.normalized_depth
@@ -522,7 +526,7 @@ impl Traversal<'_> {
                         return Ok(false);
                     }
                 }
-                self.stopped = finding.map(Verdict::Found);
+                self.stopped = finding.map_err(unsupported)?.map(Verdict::Found);
                 return Ok(true);
             }
             Verdict::Miss => (),

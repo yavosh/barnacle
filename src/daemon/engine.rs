@@ -241,7 +241,8 @@ impl Generation {
             match ext.as_str() {
                 "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
-                "hdb" | "hsb" | "ndb" | "ndu" | "ldb" | "ldu" | "ign" | "ign2" | "fp" | "sfp" => {
+                "hdb" | "hsb" | "ndb" | "ndu" | "ldb" | "ldu" | "ign" | "ign2" | "fp" | "sfp"
+                | "idb" => {
                     let output =
                         local_dir.join(path.file_name().expect("directory entry has a name"));
                     source.copy_to(&output)?;
@@ -253,20 +254,26 @@ impl Generation {
         let mut body_paths = Vec::new();
         let mut logical_paths = Vec::new();
         let mut hash_paths = Vec::new();
+        let mut icon_paths = Vec::new();
         for (path, official) in &paths {
             let group = match extension(path).as_str() {
                 "ndb" | "ndu" => &mut body_paths,
                 "ldb" | "ldu" => &mut logical_paths,
+                "idb" => {
+                    icon_paths.push(path.as_path());
+                    continue;
+                }
                 _ => &mut hash_paths,
             };
             group.push((path.as_path(), *official));
         }
-        let (mut feed, ignores) =
-            if hash_paths.is_empty() && (!body_paths.is_empty() || !logical_paths.is_empty()) {
-                (Feed::default(), IgnoreSet::default())
-            } else {
-                Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
-            };
+        let (mut feed, ignores) = if hash_paths.is_empty()
+            && (!body_paths.is_empty() || !logical_paths.is_empty() || !icon_paths.is_empty())
+        {
+            (Feed::default(), IgnoreSet::default())
+        } else {
+            Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
+        };
         let partial_only = has_cvd || feed.inventory.iter().any(|i| i.outside_matcher > 0);
         let has_hash_rules = !feed.rules.is_empty();
         let needs_hashes = (!partial_only && has_hash_rules) || config.extended_detection_info;
@@ -284,7 +291,8 @@ impl Generation {
         let logical =
             LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?
                 .with_pcre_limits(config.pcre)
-                .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash);
+                .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
+                .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }
@@ -427,13 +435,16 @@ impl Generation {
                             rules: matches
                                 .handlers
                                 .into_iter()
-                                .map(|(name, kind)| (name.to_owned(), kind))
+                                .map(|(name, kind)| {
+                                    (name.map(|name| name.map(str::to_owned)), kind)
+                                })
                                 .collect(),
-                            finding: matches.finding.map(str::to_owned),
+                            finding: matches.finding.map(|name| name.map(str::to_owned)),
                         });
                     }
                     Ok(matches
                         .finding
+                        .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?
                         .map_or(Verdict::Miss, |name| Verdict::Found(name.to_owned())))
                 },
                 || {

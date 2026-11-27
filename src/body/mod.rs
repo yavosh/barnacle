@@ -9,6 +9,7 @@ use pattern::Pattern;
 use search::SearchIndex;
 
 mod byte_compare;
+mod icon_db;
 mod image_fuzzy;
 mod logic_expression;
 mod logical;
@@ -19,6 +20,7 @@ mod search;
 mod target;
 pub use logical::{HandlerType, LogicalIndex, LogicalMatches, LogicalObject};
 pub use logical_pcre::PcreLimits;
+pub(crate) use target::IconMetric;
 pub use target::{ObjectContext, Offset, Target};
 
 const FILEBUFF: usize = 8192;

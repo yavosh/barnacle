@@ -3,6 +3,8 @@ use std::io;
 use std::ops::RangeInclusive;
 
 mod executable;
+mod icons;
+pub(crate) use icons::IconMetric;
 mod version_info;
 use executable::Executable;
 
@@ -170,6 +172,21 @@ pub struct ObjectContext {
 }
 
 impl ObjectContext {
+    pub(crate) fn icon_metrics(
+        &self,
+        bytes: &[u8],
+        max_icons: usize,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<icons::IconSamples> {
+        if self.target == Target::Pe
+            && let Some(exe) = &self.exe
+        {
+            icons::metrics(bytes, &exe.sections, max_icons, check)
+        } else {
+            Ok(icons::IconSamples::default())
+        }
+    }
+
     /// Infer raw targets with unambiguous header markers from the pinned built-in file types.
     /// Target 7 applies to a normalized ASCII object. Raw text only selects generic rules.
     pub fn raw(bytes: &[u8]) -> Self {

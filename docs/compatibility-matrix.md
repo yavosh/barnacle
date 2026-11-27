@@ -84,7 +84,8 @@ Use each profile's recorded database digests when comparing results.
 | Logical patterns, `.ldb` | main, daily | Local patterns, counts, and PCRE use scan-object context. Official feed coverage remains open. [#3](https://github.com/yavosh/barnacle/issues/3) |
 | PE section hashes, `.mdb .msb` | main, daily | Exercise benign sections and signed-file metadata. [#10](https://github.com/yavosh/barnacle/issues/10) |
 | Container metadata and certificates, `.cdb .crb` | main, daily | Exercise nested object metadata and certificate decisions. [#9](https://github.com/yavosh/barnacle/issues/9) · [#10](https://github.com/yavosh/barnacle/issues/10) |
-| PE icons and URL rules, `.idb .pdb .wdb` | daily | Exercise benign local icon and URL fixtures. [#10](https://github.com/yavosh/barnacle/issues/10) |
+| PE icons, `.idb` | daily | Local icon-group rules use PE resources and preserve rule precedence. [PE icon comparisons](../tests/logical_pe_icons.rs) |
+| URL rules, `.pdb .wdb` | daily | Exercise benign URL fixtures. [#10](https://github.com/yavosh/barnacle/issues/10) |
 | File types and dynamic settings, `.ftm .cfg` | daily | Check type reclassification at each layer and feature selection. [#9](https://github.com/yavosh/barnacle/issues/9) · [#10](https://github.com/yavosh/barnacle/issues/10) |
 | Bytecode, `.cbc` | bytecode | Compare supported hooks, execution limits, and detection names. [#4](https://github.com/yavosh/barnacle/issues/4) |
 | Generation metadata, `.info` | main, daily, bytecode | Validate signed archives before activation. Exercise CVD and CLD update behavior. [#11](https://github.com/yavosh/barnacle/issues/11) |
