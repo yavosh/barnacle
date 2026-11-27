@@ -150,3 +150,23 @@ All replies named the same expected signature. The table shows medians from `59d
 
 The exact-body build before modifiers (`89e7140`) reached 48,631 scans/s at 0.137 ms p95.
 Full-feed memory and throughput remain unverified for logical rules. [Raw results](benchmarks/logical-local.csv)
+
+### Supported pinned subset
+
+Both daemons loaded the same 312,081 eligible logical records and one harmless local PCRE rule.
+The workload omitted the 222 records listed above. Both daemons used logical signatures and the pinned ignore lists.
+Each one-CPU, 2 GiB trial used four INSTREAM clients and issued 1,024 scans of a 64 KiB binary.
+A padded fixture used repeated punctuation. A varied fixture replaced that padding with changing bytes.
+Every reply named the local PCRE rule. The table shows medians of three trials.
+
+| Fixture | Scanner | Scans/s | p95 | Peak cgroup memory |
+| --- | --- | ---: | ---: | ---: |
+| Padded | Barnacle before seed change (`10ef879`) | 854 | 18.003 ms | 497.21 MiB |
+| Padded | Barnacle | 3,698 | 1.909 ms | 496.06 MiB |
+| Padded | Stock clamd | 1,090 | 8.023 ms | 722.39 MiB |
+| Varied | Barnacle before seed change (`10ef879`) | 1,897 | 3.698 ms | 497.42 MiB |
+| Varied | Barnacle | 1,804 | 4.269 ms | 496.40 MiB |
+| Varied | Stock clamd | 1,389 | 6.294 ms | 722.46 MiB |
+
+The seed selector now prefers a byte change within the required literal.
+This removed repeated candidate checks on the padded fixture. [Raw results](benchmarks/logical-supported-feed.csv)

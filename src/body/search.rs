@@ -60,14 +60,20 @@ fn seed(part: &Part, freq: &[u32]) -> (Seed, u16) {
         .windows(2)
         .map(|w| u64::from(freq[pair(w)]))
         .sum();
-    let mut minimum = score;
+    // A pair can be rare in the database but repeat across a whole input.
+    // Prefer a seed containing a byte change whenever the anchor permits one.
+    let mut changes = bytes[..len].windows(2).filter(|w| w[0] != w[1]).count();
+    let mut minimum = (changes == 0, score);
     for end in len..bytes.len() {
         let start = end + 1 - len;
         score -= u64::from(freq[pair(&bytes[start - 1..])]);
         score += u64::from(freq[pair(&bytes[end - 1..])]);
-        if score < minimum {
+        changes -= usize::from(bytes[start - 1] != bytes[start]);
+        changes += usize::from(bytes[end - 1] != bytes[end]);
+        let rank = (changes == 0, score);
+        if rank < minimum {
             best = start;
-            minimum = score;
+            minimum = rank;
         }
     }
     let mut key = Seed {
@@ -554,6 +560,19 @@ impl SearchIndex {
 mod tests {
     use super::*;
     use crate::body::{Offset, Pattern};
+
+    #[test]
+    fn seed_prefers_a_byte_change_over_rare_padding() -> io::Result<()> {
+        let mut frequencies = vec![20; 65536];
+        frequencies[pair(b"..")] = 0;
+        let pattern = Pattern::compile("4162636465662e2e2e2e2e2e2e2e")?;
+        let (key, shift) = seed(&pattern.parts()[0], &frequencies);
+        assert_eq!((key.bytes(), shift), (b"f.....".as_slice(), 5));
+        let repeats = Pattern::compile("2e2e2e2e2e2e2e2e")?;
+        let (key, shift) = seed(&repeats.parts()[0], &frequencies);
+        assert_eq!((key.bytes(), shift), (b"......".as_slice(), 0));
+        Ok(())
+    }
 
     fn rule(text: &str, nocase: bool) -> io::Result<Rule> {
         Ok(Rule {
