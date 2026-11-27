@@ -176,7 +176,7 @@ All replies named the same expected signature. The table shows medians from `59d
 | Triggered PCRE | Stock clamd | 2,984 | 2.867 ms | 11.75 MiB |
 
 The exact-body build before modifiers (`89e7140`) reached 48,631 scans/s at 0.137 ms p95.
-Full-feed memory and throughput remain unverified for logical rules. [Raw results](benchmarks/logical-local.csv)
+[Raw results](benchmarks/logical-local.csv)
 
 ### Supported pinned subset
 
@@ -197,3 +197,29 @@ Every reply named the local PCRE rule. The table shows medians of three trials.
 
 The seed selector now prefers a byte change within the required literal.
 This removed repeated candidate checks on the padded fixture. [Raw results](benchmarks/logical-supported-feed.csv)
+
+### Complete logical and icon tables
+
+Both daemons loaded the same 312,303 eligible logical records, 222 icon records, and pinned ignore lists.
+Each workload added one local logical control. The PE workload also added one local icon record.
+The stock loader reported 312,526 signatures for the PCRE profile.
+Each trial ran in a fresh Linux ARM64 container with one CPU, 2 GiB RAM, and no swap.
+Four INSTREAM clients issued 1,024 requests with `DisableCache yes`.
+Every reply named `Workspace.Reference.UNOFFICIAL`.
+
+The padded and varied 64 KiB inputs use a PCRE control. The 5 KiB PE fixture uses a 32-pixel icon and an icon-group control.
+The table shows the median of three trials per workload for `a209637` and Debian clamd `1.4.3+dfsg-1`.
+Throughput and p95 measure client requests after daemon startup. Peak cgroup memory includes startup and charged file-backed pages.
+
+| Fixture | Scanner | Scans/s | p95 | Peak cgroup memory |
+| --- | --- | ---: | ---: | ---: |
+| Padded binary | Barnacle | 3,628.39 | 2.000 ms | 495.07 MiB |
+| Padded binary | Stock clamd | 1,040.18 | 8.638 ms | 723.33 MiB |
+| Varied binary | Barnacle | 1,736.14 | 4.237 ms | 494.56 MiB |
+| Varied binary | Stock clamd | 1,266.91 | 6.954 ms | 722.89 MiB |
+| PE icon | Barnacle | 2,640.63 | 2.864 ms | 493.34 MiB |
+| PE icon | Stock clamd | 80.84 | 59.287 ms | 1,335.94 MiB |
+
+A separate one-trial check used the [Rust PE fixture generator](../tests/common/pe_icons.rs) with the same icon.
+Barnacle reached 2,632 scans/s at 2.675 ms p95. Stock reached 85 scans/s at 56.885 ms p95.
+The benchmark used the default `ScanPE yes` setting. [Raw measurements](benchmarks/logical-full-feed.csv)
