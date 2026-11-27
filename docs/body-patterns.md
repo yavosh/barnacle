@@ -72,6 +72,17 @@ Case folding applies to literal letters. Wide patterns still measure offsets and
 ASCII and wide variants share a logical subsignature ID. Two single-part variants at the same start count once.
 Fullword checks run inside the pattern matcher. For multipart patterns, they check the outer edges.
 
+PCRE subsignatures run after the indexed patterns for the current scan object.
+A trigger can use occurrence counts from earlier patterns and PCRE subsignatures.
+Exact offsets rebase the regex subject. Shifted offsets bound the reported match start. The `e` flag bounds the subject itself.
+Global matching advances after an empty match.
+
+The daemon uses the pinned reference defaults for `PCREMatchLimit` (100,000), `PCRERecMatchLimit` (2,000), and `PCREMaxFileSize` (100 MiB).
+Match and depth limits stop the current regex. The size limit skips PCRE on larger objects.
+Barnacle caps PCRE backtracking heap use at 8 MiB per scan object and reports exhaustion as an error.
+Most regex programs poll for cancellation while matching.
+Programs that exceed PCRE2's compiled size limit with polling enabled retry compilation and poll before and after matching.
+
 On the tested raw objects, stock tries extended body rules, whole-file hashes, and then logical rules.
 A target-specific logical rule wins over a generic rule. Within the selected target, the first matching record wins.
 Logical rules receive each new object's context, including extracted children and normalized views.
@@ -85,7 +96,24 @@ They cover overlap, duplicate subsignatures, count limits, compressed ZIP conten
 cargo test --locked --test logical_signatures -- --include-ignored
 ```
 
-Stock loads 312,303 logical records from `main.ldb` and `daily.ldb` with PUA disabled and the pinned ignore lists.
-Of these, 1,186 use PCRE subsignatures, and 3,724 use group count expressions.
-Unsupported active subsignatures and target attributes fail generation loading with a source location. These include PCRE and fuzzy hashes.
+With PUA disabled, stock loads 312,303 logical records from the pinned `main.ldb` and `daily.ldb`.
+The inventory applies the pinned functionality level and ignore lists.
+It counts 1,459,845 extended patterns, 1,208 PCRE subsignatures, 111 image fuzzy hashes, and one byte comparison.
+PCRE appears in 1,186 records. Group counts appear in 3,724 records.
+Barnacle compiled all 1,186 PCRE-bearing records in one local index on macOS.
+The test preserved offsets, triggers, and sibling patterns and replaced the rule names.
+
+| Target attribute | Records |
+| --- | ---: |
+| `FileSize` | 1,298 |
+| `Container` | 2,234 |
+| `NumberOfSections` | 44 |
+| `HandlerType` | 11 |
+| `Intermediates` | 1 |
+| `IconGroup1` | 52 |
+| `IconGroup2` | 28 |
+
+The feed includes generic, executable, document, graphics, mail, and normalized text targets.
+Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
+Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)

@@ -281,7 +281,8 @@ impl Generation {
         };
         let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
         let logical =
-            LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
+            LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?
+                .with_pcre_limits(config.pcre);
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }

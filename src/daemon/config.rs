@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use barnacle::body::PcreLimits;
 use barnacle::objects::Options;
 use regex::Regex;
 
@@ -21,6 +22,7 @@ pub(super) struct Config {
     pub detect_pua: bool,
     pub stream_max_length: u64,
     pub objects: Options,
+    pub pcre: PcreLimits,
     pub max_scan_time: Duration,
     pub command_read_timeout: Duration,
     pub read_timeout: Duration,
@@ -68,6 +70,7 @@ impl Default for Config {
             detect_pua: false,
             stream_max_length: 100 << 20,
             objects: Options::default(),
+            pcre: PcreLimits::default(),
             max_scan_time: Duration::ZERO,
             command_read_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(120),
@@ -171,6 +174,9 @@ impl Config {
                     _ => self.objects.max_script_normalize = n,
                 }
             }
+            "PCREMaxFileSize" => self.pcre.max_file_size = size(value)?,
+            "PCREMatchLimit" => self.pcre.match_limit = number(value)?,
+            "PCRERecMatchLimit" => self.pcre.depth_limit = number(value)?,
             "MaxScanTime" => self.max_scan_time = Duration::from_millis(number(value)?),
             "StreamMaxLength" => self.stream_max_length = size(value)?,
             "CommandReadTimeout" => self.command_read_timeout = Duration::from_secs(number(value)?),
@@ -328,10 +334,7 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "DisableCertCheck" => boolean(value).ok() == Some(false),
         "BytecodeSecurity" => value == "TrustSigned",
         "MaxZipTypeRcg" => size(value).ok() == Some(1 << 20),
-        "PCREMaxFileSize" => matches!(size(value), Ok(26214400 | 104857600)),
         "MaxIconsPE" => value == "100",
-        "PCREMatchLimit" => value == "10000" || value == "100000",
-        "PCRERecMatchLimit" => value == "5000" || value == "2000",
         "BytecodeTimeout" => value == "60000" || value == "10000",
         _ => false,
     }

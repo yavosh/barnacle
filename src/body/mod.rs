@@ -10,10 +10,13 @@ use search::SearchIndex;
 
 mod logic_expression;
 mod logical;
+mod logical_pcre;
 mod pattern;
+mod pcre;
 mod search;
 mod target;
 pub use logical::{LogicalIndex, LogicalObject};
+pub use logical_pcre::PcreLimits;
 pub use target::{ObjectContext, Offset, Target};
 
 const FILEBUFF: usize = 8192;

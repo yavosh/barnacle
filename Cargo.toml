@@ -34,6 +34,7 @@ deflate64 = "0.1.12"
 aes = "=0.9.4"
 cbc = "=0.2.1"
 lopdf = { version = "=0.47.0", default-features = false }
+pcre2-sys = "=0.2.10"
 
 [dev-dependencies]
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress"] }

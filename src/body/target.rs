@@ -89,6 +89,14 @@ pub struct Offset {
 }
 
 impl Offset {
+    pub(super) fn is_any(&self) -> bool {
+        self.base == Base::Any
+    }
+
+    pub(super) fn has_shift(&self) -> bool {
+        self.shift != 0 || matches!(self.base, Base::EntireSection(_))
+    }
+
     pub(super) fn is_relative(&self) -> bool {
         !matches!(self.base, Base::Any | Base::Absolute)
     }

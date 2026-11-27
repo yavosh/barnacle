@@ -235,19 +235,22 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         "",
         &[(&executable, Some("Typed"))],
     )?;
-    modifiers(|rules, cases| scan(rules, "", "", cases, "ScanHTML no\nScanMail no\n"))
+    modifiers(|rules, cases| scan(rules, "", "", cases, RAW_OPTIONS))?;
+    pcre(|rules, cases, options| scan(rules, "", "", cases, options))
+}
+
+const RAW_OPTIONS: &str = "ScanHTML no\nScanMail no\n";
+
+fn binary(content: &[u8]) -> Vec<u8> {
+    [
+        b"\xff\0\x81\x02\xfd\x04\x80\x06".as_slice(),
+        content,
+        b"\xfe\0\x83\x03\xfc\x05\x82\x07",
+    ]
+    .concat()
 }
 
 fn modifiers(run: impl Fn(&str, &[(&[u8], Option<&str>)]) -> io::Result<()>) -> io::Result<()> {
-    fn binary(content: &[u8]) -> Vec<u8> {
-        [
-            b"\xff\0\x81\x02\xfd\x04\x80\x06".as_slice(),
-            content,
-            b"\xfe\0\x83\x03\xfc\x05\x82\x07",
-        ]
-        .concat()
-    }
-
     fn wide(text: &str) -> Vec<u8> {
         text.encode_utf16().flat_map(u16::to_le_bytes).collect()
     }
@@ -380,6 +383,139 @@ fn modifiers(run: impl Fn(&str, &[(&[u8], Option<&str>)]) -> io::Result<()>) -> 
             (&letter, None),
         ],
     )
+}
+
+fn pcre(run: impl Fn(&str, &[(&[u8], Option<&str>)], &str) -> io::Result<()>) -> io::Result<()> {
+    let chained = logical(
+        "RegexChain",
+        ANY,
+        "2",
+        &format!(r"{LEDGER};0/(?<=--)([A-Z]{{2}})-\1/i;1/credit/"),
+    );
+    run(
+        &chained,
+        &[
+            (&binary(b"ledger --AB-ab credit"), Some("RegexChain")),
+            (&binary(b"ledger --AB-cd credit"), None),
+            (&binary(b"ledger AB-ab credit"), None),
+            (&binary(b"debit --AB-ab credit"), None),
+        ],
+        RAW_OPTIONS,
+    )?;
+    run(
+        &logical("RegexZero", ANY, "1", &format!("{LEDGER};0=0/credit/")),
+        &[
+            (&binary(b"ordinary credit"), Some("RegexZero")),
+            (&binary(b"ledger credit"), None),
+        ],
+        RAW_OPTIONS,
+    )?;
+    for (name, offset, winner) in [
+        ("RegexTextOffset", "7", Some("RegexTextOffset")),
+        ("RegexTextEnd", "EOF-6", Some("RegexTextEnd")),
+        ("RegexUnnormalizedOffset", "8", None),
+    ] {
+        run(
+            &logical(name, ANY, "1", &format!("{LEDGER};{offset}:0/credit/")),
+            &[(b"LEDGER  CREDIT", winner)],
+            "",
+        )?;
+    }
+    run(
+        &logical("RegexUtf", ANY, "1", &format!("{LEDGER};0/(*UTF)credit/")),
+        &[
+            (b"ledger credit", Some("RegexUtf")),
+            (&binary(b"ledger credit"), None),
+        ],
+        RAW_OPTIONS,
+    )?;
+    run(
+        &logical(
+            "RegexEarlierTrigger",
+            ANY,
+            "2",
+            &format!("{LEDGER};{DEBIT};0/credit/"),
+        ),
+        &[
+            (&binary(b"ledger credit"), Some("RegexEarlierTrigger")),
+            (&binary(b"debit credit"), None),
+        ],
+        RAW_OPTIONS,
+    )?;
+    run(
+        &logical(
+            "RegexSemicolon",
+            ANY,
+            "1&2",
+            &format!("{LEDGER};0/credit;note/;{DEBIT}"),
+        ),
+        &[
+            (&binary(b"ledger credit;note debit"), Some("RegexSemicolon")),
+            (&binary(b"ledger credit note debit"), None),
+        ],
+        RAW_OPTIONS,
+    )?;
+    let note = b"LEDGER  CREDIT";
+    let archive = zip::zip(&[("receipt.txt", note)], true, false, false)?;
+    run(
+        &logical(
+            "RegexZip",
+            &format!("{ANY},Container:CL_TYPE_ZIP"),
+            "1",
+            &format!("{LEDGER};EOF-6:0/credit/"),
+        ),
+        &[(note, None), (&archive, Some("RegexZip"))],
+        "",
+    )?;
+    let adjacent = binary(b"creditcredit ledger");
+    let separated = binary(b"credit credit ledger");
+    let shifted = binary(b"-credit ledger");
+    for (name, field, cases) in [
+        (
+            "RegexExact",
+            "8:0/^credit/",
+            [(&adjacent, Some("RegexExact")), (&shifted, None)],
+        ),
+        (
+            "RegexShift",
+            "8,1:0/credit/",
+            [
+                (&adjacent, Some("RegexShift")),
+                (&shifted, Some("RegexShift")),
+            ],
+        ),
+        (
+            "RegexSpan",
+            "8,6:0/credit/e",
+            [(&adjacent, Some("RegexSpan")), (&shifted, None)],
+        ),
+    ] {
+        let cases = cases.map(|(bytes, winner)| (bytes.as_slice(), winner));
+        run(
+            &logical(name, ANY, "1", &format!("{LEDGER};{field}")),
+            &cases,
+            RAW_OPTIONS,
+        )?;
+    }
+    for (name, flags, separated_winner) in [
+        ("RegexGlobal", "g", None),
+        ("RegexRolling", "gr", Some("RegexRolling")),
+    ] {
+        run(
+            &logical(name, ANY, "1=2", &format!("{LEDGER};8:0/credit/{flags}")),
+            &[(&adjacent, Some(name)), (&separated, separated_winner)],
+            RAW_OPTIONS,
+        )?;
+    }
+    run(
+        &logical("RegexCap", ANY, "1", &format!("{LEDGER};8,6:0/credit/e")),
+        &[
+            (&adjacent, Some("RegexCap")),
+            (&binary(b"creditcredit ledger."), None),
+        ],
+        &format!("{RAW_OPTIONS}PCREMaxFileSize {}\n", adjacent.len()),
+    )?;
+    Ok(())
 }
 
 #[test]

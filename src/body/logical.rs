@@ -1,5 +1,6 @@
 //! Evaluate logical signatures against the evidence from one stock scan object.
 use super::logic_expression::Expression;
+use super::logical_pcre::{PcreLimits, RegexChild};
 use super::search::STOCK_WINDOW;
 use super::{ObjectContext, Offset, Pattern, Rule, SearchIndex, Target, invalid, level};
 use crate::IgnoreSet;
@@ -61,15 +62,20 @@ struct Builder {
     expressions: Vec<Expression>,
     expression_ids: HashMap<usize, HashMap<Box<str>, usize>>,
     zero_matches: Vec<u32>,
+    regexes: HashMap<u32, Box<[RegexChild]>>,
+    zero_triggers: Vec<u32>,
 }
 
-/// Logical matcher for extended-pattern subsignatures.
+/// Logical matcher for extended-pattern and PCRE subsignatures.
 pub struct LogicalIndex {
     records: Vec<LogicalRule>,
     children: Vec<Rule>,
     bindings: Vec<ChildBinding>,
     expressions: Vec<Expression>,
     zero_matches: Vec<u32>,
+    regexes: HashMap<u32, Box<[RegexChild]>>,
+    zero_triggers: Vec<u32>,
+    pcre_limits: PcreLimits,
     search: SearchIndex,
 }
 
@@ -127,8 +133,17 @@ impl LogicalIndex {
             bindings: builder.bindings,
             expressions: builder.expressions,
             zero_matches: builder.zero_matches,
+            regexes: builder.regexes,
+            zero_triggers: builder.zero_triggers,
+            pcre_limits: PcreLimits::default(),
             search,
         })
+    }
+
+    /// Use the daemon's PCRE limits for this generation.
+    pub fn with_pcre_limits(mut self, limits: PcreLimits) -> Self {
+        self.pcre_limits = limits;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -190,6 +205,7 @@ impl LogicalIndex {
                 }
             },
         )?;
+        self.scan_regexes(bytes, context, &object, &mut evidence, &mut check)?;
         let first = self.evaluate(
             context,
             object.parent,
@@ -205,6 +221,58 @@ impl LogicalIndex {
             return self.evaluate(context, object.parent, size, &HashMap::new(), &mut check);
         }
         Ok(first)
+    }
+
+    fn scan_regexes(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: &LogicalObject<'_>,
+        evidence: &mut HashMap<u32, Evidence>,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let limits = self.pcre_limits;
+        if self.regexes.is_empty()
+            || limits.max_file_size != 0 && bytes.len() as u64 > limits.max_file_size
+        {
+            return Ok(());
+        }
+        let mut scratch = None;
+        let mut scan = |id: u32, counts: &mut [u32]| -> io::Result<()> {
+            let Some(children) = self.regexes.get(&id) else {
+                return Ok(());
+            };
+            let conditions = &self.records[id as usize].conditions;
+            if context.accepts(conditions.target)
+                && conditions.accepts(object.file_size, object.parent)
+            {
+                for child in children {
+                    check()?;
+                    if child.trigger.matches(counts) {
+                        counts[child.slot] =
+                            child.count(bytes, context, limits, &mut scratch, check)?;
+                    }
+                }
+            }
+            Ok(())
+        };
+        for (&id, e) in evidence.iter_mut() {
+            scan(id, &mut e.counts)?;
+        }
+        for &id in &self.zero_triggers {
+            if let std::collections::hash_map::Entry::Vacant(entry) = evidence.entry(id) {
+                let mut zero = [0; MAX_CHILDREN];
+                let counts = &mut zero[..self.records[id as usize].children];
+                scan(id, counts)?;
+                if counts.iter().any(|&n| n != 0) {
+                    entry.insert(Evidence {
+                        counts: counts.to_vec(),
+                        last: Vec::new(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn evaluate(
@@ -312,9 +380,14 @@ impl Builder {
         };
         let id = u32::try_from(self.records.len())
             .map_err(|_| invalid("too many logical signatures"))?;
+        let mut regexes = Vec::new();
         for (i, field) in fields.enumerate() {
-            let variants = parse_child(field, conditions.target)
-                .map_err(|e| invalid(format!("subsignature {i}: {e}")))?;
+            let located = |e: io::Error| io::Error::new(e.kind(), format!("subsignature {i}: {e}"));
+            if field.contains('/') {
+                regexes.push(RegexChild::parse(field, conditions.target, i).map_err(located)?);
+                continue;
+            }
+            let variants = parse_child(field, conditions.target).map_err(located)?;
             for rule in variants.into_iter().flatten() {
                 if self.children.len() >= u32::MAX as usize {
                     return Err(invalid("too many logical subsignatures"));
@@ -326,7 +399,14 @@ impl Builder {
                 });
             }
         }
-        if self.expressions[expression].matches(&[0; MAX_CHILDREN][..children]) {
+        let zero = &[0; MAX_CHILDREN][..children];
+        if !regexes.is_empty() {
+            if regexes.iter().any(|child| child.trigger.matches(zero)) {
+                self.zero_triggers.push(id);
+            }
+            self.regexes.insert(id, regexes.into_boxed_slice());
+        }
+        if self.expressions[expression].matches(zero) {
             self.zero_matches.push(id);
         }
         self.records.push(LogicalRule {
@@ -420,9 +500,6 @@ impl Modifiers {
 }
 
 fn parse_child(field: &str, target: Target) -> io::Result<[Option<Rule>; 2]> {
-    if field.contains('/') {
-        return Err(invalid("unsupported PCRE subsignature"));
-    }
     if field.starts_with('$') {
         return Err(invalid("unsupported macro subsignature"));
     }
@@ -638,12 +715,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_active_modes_have_located_errors() -> io::Result<()> {
+    fn invalid_or_unsupported_active_rules_have_located_errors() -> io::Result<()> {
         let skipped = "Future;Engine:214-255,Target:0;0;0/read/i\n";
         assert!(load(skipped)?.is_empty());
         for (rule, reason) in [
-            ("Current;Target:0;0;0/read/i", "PCRE"),
-            ("Current;Target:0;0&1;6d61726b;0/read;file/i", "PCRE"),
+            ("Current;Target:0;1;6d61726b;0/read/j", "PCRE option"),
+            (
+                "Current;Target:0;0&1;6d61726b;0/r(ead;file/i",
+                "PCRE2 compile error",
+            ),
             (
                 "Current;Engine:51-255,Target:0,HandlerType:CL_TYPE_MAIL;0;6d61726b",
                 "HandlerType",

@@ -59,6 +59,14 @@ enum Program {
 
 impl Expression {
     pub(super) fn parse(input: &str, children: usize) -> io::Result<Self> {
+        Self::compile(input, children, true)
+    }
+
+    pub(super) fn trigger(input: &str, slot: usize) -> io::Result<Self> {
+        Self::compile(input, slot, false)
+    }
+
+    fn compile(input: &str, children: usize, exact_count: bool) -> io::Result<Self> {
         if !(1..=64).contains(&children) || input.is_empty() || input.len() > MAX_BYTES {
             return Err(invalid("invalid logical expression size or child count"));
         }
@@ -120,7 +128,7 @@ impl Expression {
         if need_operand || !groups.is_empty() {
             return Err(invalid("unfinished logical expression"));
         }
-        if (64 - ids.leading_zeros()) as usize != children {
+        if exact_count && (64 - ids.leading_zeros()) as usize != children {
             return Err(invalid(
                 "logical expression and subsignature count disagree",
             ));
