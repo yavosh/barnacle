@@ -27,18 +27,44 @@ pub struct LogicalObject<'a> {
 
 struct Conditions {
     target: Target,
-    size: Option<RangeInclusive<u32>>,
     container: Option<&'static str>,
+    file: Option<Box<FileConditions>>,
+}
+
+#[derive(Default)]
+struct FileConditions {
+    size: Option<RangeInclusive<u32>>,
+    entry_point: Option<RangeInclusive<u32>>,
+    sections: Option<RangeInclusive<u32>>,
+}
+
+impl FileConditions {
+    fn matches(range: &Option<RangeInclusive<u32>>, actual: Option<usize>) -> bool {
+        range.as_ref().is_none_or(|range| {
+            actual.is_some_and(|n| u32::try_from(n).is_ok_and(|n| range.contains(&n)))
+        })
+    }
+
+    fn accepts(&self, context: &ObjectContext, size: usize) -> bool {
+        let (entry, sections) = context
+            .executable_metadata()
+            .map_or((None, None), |(entry, sections)| {
+                (Some(entry), Some(sections))
+            });
+        Self::matches(&self.size, Some(size))
+            && Self::matches(&self.entry_point, entry)
+            && Self::matches(&self.sections, sections)
+    }
 }
 
 impl Conditions {
-    fn accepts(&self, size: usize, parent: Option<&str>) -> bool {
-        self.size
-            .as_ref()
-            .is_none_or(|range| u32::try_from(size).is_ok_and(|n| range.contains(&n)))
+    fn accepts(&self, context: &ObjectContext, size: usize, parent: Option<&str>) -> bool {
+        self.container
+            .is_none_or(|kind| parent.unwrap_or("CL_TYPE_ANY") == kind)
             && self
-                .container
-                .is_none_or(|kind| parent.unwrap_or("CL_TYPE_ANY") == kind)
+                .file
+                .as_ref()
+                .is_none_or(|file| file.accepts(context, size))
     }
 }
 
@@ -181,7 +207,9 @@ impl LogicalIndex {
                 let child = hit.rule_id as usize;
                 let binding = &self.bindings[child];
                 let record = &self.records[binding.owner as usize];
-                if !record.conditions.accepts(object.file_size, object.parent)
+                if !record
+                    .conditions
+                    .accepts(context, object.file_size, object.parent)
                     || object.unmapped_script
                         && record.conditions.target == Target::Generic
                         && self.children[child].offset.is_relative()
@@ -244,7 +272,7 @@ impl LogicalIndex {
             };
             let conditions = &self.records[id as usize].conditions;
             if context.accepts(conditions.target)
-                && conditions.accepts(object.file_size, object.parent)
+                && conditions.accepts(context, object.file_size, object.parent)
             {
                 for child in children {
                     check()?;
@@ -301,7 +329,7 @@ impl LogicalIndex {
             let key = (rule.conditions.target == Target::Generic, id);
             if winner.is_some_and(|earlier| earlier <= key)
                 || !context.accepts(rule.conditions.target)
-                || !rule.conditions.accepts(file_size, parent)
+                || !rule.conditions.accepts(context, file_size, parent)
             {
                 continue;
             }
@@ -429,7 +457,7 @@ fn range(text: &str) -> io::Result<RangeInclusive<u32>> {
 fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
     let mut engine = None;
     let mut target = None;
-    let mut size = None;
+    let mut file = FileConditions::default();
     let mut container = None;
     for (i, field) in title.split(',').enumerate() {
         let (key, value) = field
@@ -442,15 +470,19 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
                 level(value).map_err(|_| invalid("invalid logical Target number"))?;
                 target = Some(value);
             }
-            "FileSize" => size = Some(range(value)?),
+            "FileSize" => file.size = Some(range(value)?),
+            "EntryPoint" => file.entry_point = Some(range(value)?),
+            "NumberOfSections" => file.sections = Some(range(value)?),
             "Container" => container = Some(value),
             _ if engine.as_ref().is_some_and(|r| !r.contains(&flevel)) => return Ok(None),
             _ => return Err(invalid(format!("unsupported logical target field {key}"))),
         }
     }
-    if (size.is_some() || container.is_some()) && engine.as_ref().is_none_or(|r| *r.start() < 51) {
+    let executable = file.entry_point.is_some() || file.sections.is_some();
+    let file = (file.size.is_some() || executable).then(|| Box::new(file));
+    if (file.is_some() || container.is_some()) && engine.as_ref().is_none_or(|r| *r.start() < 51) {
         return Err(invalid(
-            "FileSize and Container require an Engine minimum of at least 51",
+            "logical target attributes require an Engine minimum of at least 51",
         ));
     }
     if engine.as_ref().is_some_and(|r| !r.contains(&flevel)) {
@@ -458,6 +490,11 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
     }
     let target = target.ok_or_else(|| invalid("missing logical signature Target"))?;
     let target = Target::parse(target)?;
+    if executable && !target.executable() {
+        return Err(invalid(
+            "EntryPoint and NumberOfSections require an executable Target",
+        ));
+    }
     let container = container
         .map(|value| {
             CONTAINERS
@@ -469,8 +506,8 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
         .transpose()?;
     let conditions = Conditions {
         target,
-        size,
         container,
+        file,
     };
     Ok(Some(conditions))
 }
@@ -734,6 +771,14 @@ mod tests {
             ),
             ("Current;Engine:81-255,Target:0;0;6d61726b::x", "modifier"),
             ("Current;Target:0,FileSize:4-4;0;6d61726b", "Engine minimum"),
+            (
+                "Current;Engine:51-255,Target:0,EntryPoint:0-0;0;6d61726b",
+                "executable Target",
+            ),
+            (
+                "Current;Engine:50-255,Target:1,NumberOfSections:1-1;0;6d61726b",
+                "Engine minimum",
+            ),
         ] {
             let error = load(&format!("{skipped}{rule}\n"))
                 .err()

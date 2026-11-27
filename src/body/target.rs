@@ -64,7 +64,7 @@ impl Target {
         }
     }
 
-    fn executable(self) -> bool {
+    pub(super) fn executable(self) -> bool {
         matches!(self, Self::Pe | Self::Elf | Self::MachO)
     }
 }
@@ -211,6 +211,11 @@ impl ObjectContext {
 
     pub(crate) fn has_executable_layout(&self) -> bool {
         self.exe.is_some()
+    }
+
+    pub(super) fn executable_metadata(&self) -> Option<(usize, usize)> {
+        let executable = self.exe.as_ref()?;
+        Some((executable.entry, executable.sections.len()))
     }
 
     pub(crate) fn pe_overlay(&self) -> Option<usize> {

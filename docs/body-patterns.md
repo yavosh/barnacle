@@ -64,7 +64,8 @@ The matcher uses the ClamAV body pattern and extended offset formats.
 ## Local logical signatures
 
 Local `.ldb` rules can combine extended patterns with Boolean expressions, occurrence counts, and distinct subsignature counts.
-The loader applies functionality levels and ignore rules. Supported target attributes include `Target`, `FileSize`, and `Container`.
+The loader applies functionality levels and ignore rules. It supports `Target`, `FileSize`, `Container`, `EntryPoint`, and `NumberOfSections`.
+Executable conditions use the parsed PE, ELF, or Mach-O layout. The entry point is a file offset.
 `Container:CL_TYPE_ANY` selects root objects. A named container selects children with that parent type.
 
 The matcher supports ASCII case folding (`i`), wide bytes (`w`), ASCII with wide bytes (`a`), and fullword boundaries (`f`).
@@ -116,6 +117,20 @@ The test preserved offsets, triggers, and sibling patterns and replaced the rule
 The feed includes generic, executable, document, graphics, mail, and normalized text targets.
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
+A batch compile accepted 312,081 of 312,303 eligible records. The table counts the first rejection per record.
+
+| First rejection | Records |
+| --- | ---: |
+| Image fuzzy hash | 111 |
+| `IconGroup1` | 52 |
+| `IconGroup2` | 28 |
+| `HandlerType` | 11 |
+| PE version-information offset | 10 |
+| Single-branch alternative | 6 |
+| Empty alternative branch | 2 |
+| Byte comparison | 1 |
+| `Intermediates` | 1 |
+
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
 
 ### Local benchmark

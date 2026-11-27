@@ -235,6 +235,50 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         "",
         &[(&executable, Some("Typed"))],
     )?;
+    let mut at_entry = executable.clone();
+    at_entry[168..172].copy_from_slice(&0x1040u32.to_le_bytes());
+    let mut no_layout = executable.clone();
+    no_layout[128..132].fill(0);
+    for (name, condition, zero, mapped) in [
+        (
+            "OneSection",
+            "NumberOfSections:1-1",
+            Some("OneSection"),
+            Some("OneSection"),
+        ),
+        ("TwoSections", "NumberOfSections:2-2", None, None),
+        ("ZeroEntry", "EntryPoint:0-0", Some("ZeroEntry"), None),
+        (
+            "EntryOffset",
+            "EntryPoint:576-576",
+            None,
+            Some("EntryOffset"),
+        ),
+        ("EntryAddress", "EntryPoint:4160-4160", None, None),
+        (
+            "Layout",
+            "EntryPoint:576-576,NumberOfSections:1-1",
+            None,
+            Some("Layout"),
+        ),
+    ] {
+        run(
+            &logical(
+                name,
+                &format!("Engine:51-255,Target:1,{condition}"),
+                "0",
+                CREDIT,
+            ),
+            "",
+            "",
+            &[
+                (&executable, zero),
+                (&at_entry, mapped),
+                (&no_layout, None),
+                (NOTE, None),
+            ],
+        )?;
+    }
     modifiers(|rules, cases| scan(rules, "", "", cases, RAW_OPTIONS))?;
     pcre(|rules, cases, options| scan(rules, "", "", cases, options))
 }
