@@ -1,5 +1,6 @@
 //! Evaluate logical signatures against the evidence from one stock scan object.
 use super::byte_compare::ByteCompare;
+use super::image_fuzzy;
 use super::logic_expression::Expression;
 use super::logical_pcre::{PcreLimits, RegexChild};
 use super::search::{STOCK_WINDOW, SearchEvent};
@@ -111,11 +112,12 @@ struct Builder {
     expression_ids: HashMap<usize, HashMap<Box<str>, usize>>,
     zero_matches: Vec<u32>,
     byte_compares: HashMap<Target, Vec<(u32, ByteCompare)>>,
+    images: HashMap<u64, Vec<ChildBinding>>,
     regexes: HashMap<u32, Box<[RegexChild]>>,
     zero_triggers: Vec<u32>,
 }
 
-/// Logical matcher for extended patterns, byte comparisons, and PCRE subsignatures.
+/// Logical matcher for extended patterns, byte comparisons, image hashes, and PCRE.
 pub struct LogicalIndex {
     records: Vec<LogicalRule>,
     children: Vec<Rule>,
@@ -123,9 +125,11 @@ pub struct LogicalIndex {
     expressions: Vec<Expression>,
     zero_matches: Vec<u32>,
     byte_compares: HashMap<Target, Vec<(u32, ByteCompare)>>,
+    images: HashMap<u64, Vec<ChildBinding>>,
     regexes: HashMap<u32, Box<[RegexChild]>>,
     zero_triggers: Vec<u32>,
     pcre_limits: PcreLimits,
+    image_fuzzy_enabled: bool,
     search: SearchIndex,
 }
 
@@ -184,6 +188,8 @@ impl LogicalIndex {
             expressions: builder.expressions,
             zero_matches: builder.zero_matches,
             byte_compares: builder.byte_compares,
+            images: builder.images,
+            image_fuzzy_enabled: true,
             regexes: builder.regexes,
             zero_triggers: builder.zero_triggers,
             pcre_limits: PcreLimits::default(),
@@ -194,6 +200,12 @@ impl LogicalIndex {
     /// Use the daemon's PCRE limits for this generation.
     pub fn with_pcre_limits(mut self, limits: PcreLimits) -> Self {
         self.pcre_limits = limits;
+        self
+    }
+
+    /// Use the daemon's image fuzzy hash scan policy for this generation.
+    pub fn with_image_fuzzy_hash(mut self, enabled: bool) -> Self {
+        self.image_fuzzy_enabled = enabled;
         self
     }
 
@@ -284,6 +296,28 @@ impl LogicalIndex {
                 Ok(())
             },
         )?;
+        if self.image_fuzzy_enabled
+            && context.target() == Target::Graphics
+            && !self.images.is_empty()
+            && let Some(hash) = image_fuzzy::hash(bytes, &mut check)?
+            && let Some(bindings) = self.images.get(&hash)
+        {
+            for (i, binding) in bindings.iter().enumerate() {
+                if i % 256 == 0 {
+                    check()?;
+                }
+                let record = &self.records[binding.owner as usize];
+                if context.accepts(record.conditions.target)
+                    && record.conditions.accepts(context, &object)
+                {
+                    let entry = evidence.entry(binding.owner).or_insert_with(|| Evidence {
+                        counts: vec![0; record.children],
+                        last: vec![0; record.children],
+                    });
+                    entry.counts[usize::from(binding.slot)] = 1;
+                }
+            }
+        }
         self.scan_regexes(bytes, context, &object, &mut evidence, &mut check)?;
         let first = self.evaluate(context, &object, &evidence, &mut check)?;
         if first.is_none()
@@ -460,6 +494,14 @@ impl Builder {
             let located = |e: io::Error| io::Error::new(e.kind(), format!("subsignature {i}: {e}"));
             if field.contains('/') {
                 regexes.push(RegexChild::parse(field, conditions.target, i).map_err(located)?);
+                continue;
+            }
+            if field.starts_with("fuzzy_img#") {
+                let hash = image_fuzzy::parse(field).map_err(located)?;
+                self.images.entry(hash).or_default().push(ChildBinding {
+                    owner: id,
+                    slot: i as u8,
+                });
                 continue;
             }
             if field.contains('#') && field.starts_with(|c: char| c.is_ascii_digit()) {

@@ -282,7 +282,8 @@ impl Generation {
         let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
         let logical =
             LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?
-                .with_pcre_limits(config.pcre);
+                .with_pcre_limits(config.pcre)
+                .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash);
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }

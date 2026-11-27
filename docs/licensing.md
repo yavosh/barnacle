@@ -30,6 +30,8 @@ Every package in `Cargo.lock` offers a permissive license. The licenses include 
 Barnacle statically links PCRE2 10.46 through `pcre2-sys` 0.2.10.
 The bindings use MIT. PCRE2 uses BSD-3-Clause with the PCRE2 exception. [Third-party notices](../THIRD-PARTY-NOTICES.md#pcre2-regular-expressions)
 
+Image fuzzy hashing uses `image` 0.25.10 and `rustdct` 0.7.1 under their MIT terms. [Third-party notices](../THIRD-PARTY-NOTICES.md#image-fuzzy-hashes)
+
 A binary release must include the license text and copyright notices of each dependency compiled into it. This includes the `NOTICE` files of Apache-2.0 packages. Check the licenses again whenever `Cargo.lock` changes:
 
 ```sh

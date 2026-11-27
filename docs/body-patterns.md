@@ -84,6 +84,13 @@ Patterns support single-arm groups and trailing empty arms after preceding atoms
 Byte comparisons read binary integers or numeric text at a signed offset from a matched body pattern.
 They use the latest match offset and run at the end of each scan window, before PCRE.
 
+Image fuzzy rules compare an eight-byte hash for PNG, JPEG, GIF, and TIFF.
+Barnacle computes the hash once for each eligible image and uses exact matches.
+Both `ScanImage` and `ScanImageFuzzyHash` must be enabled.
+A fuzzy hash can trigger PCRE. The two options default to enabled.
+Barnacle checks decoded pixel buffers and resizing against a 64 MiB budget.
+The Rust reference tests matched 17 stock hashes, including transparent and 16-bit fixtures.
+
 PCRE subsignatures run after the indexed patterns for the current scan object.
 A trigger can use occurrence counts from earlier patterns and PCRE subsignatures.
 Exact offsets rebase the regex subject. Shifted offsets bound the reported match start. The `e` flag bounds the subject itself.
@@ -128,11 +135,10 @@ The test preserved offsets, triggers, and sibling patterns and replaced the rule
 The feed includes generic, executable, document, graphics, mail, and normalized text targets.
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
-A batch compile accepted 312,101 of 312,303 eligible records. The table counts the first rejection per record.
+A batch compile accepted 312,212 of 312,303 eligible records. The table counts the first rejection per record.
 
 | First rejection | Records |
 | --- | ---: |
-| Image fuzzy hash | 111 |
 | `IconGroup1` | 52 |
 | `IconGroup2` | 28 |
 | `HandlerType` | 11 |

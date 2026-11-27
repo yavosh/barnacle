@@ -9,6 +9,7 @@ use pattern::Pattern;
 use search::SearchIndex;
 
 mod byte_compare;
+mod image_fuzzy;
 mod logic_expression;
 mod logical;
 mod logical_pcre;
