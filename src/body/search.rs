@@ -108,7 +108,18 @@ struct Seeds {
 }
 
 impl Seeds {
-    fn build(mut entries: Vec<(Seed, Site)>, sites: &mut Vec<Site>) -> io::Result<Self> {
+    fn build(
+        mut entries: Vec<(Seed, Site)>,
+        sites: &mut Vec<Site>,
+        nocase: bool,
+    ) -> io::Result<Self> {
+        if nocase {
+            // One pattern ID serves all spellings. The automaton sends both
+            // ASCII cases to the same state without duplicating whole seeds.
+            for (key, _) in &mut entries {
+                key.bytes.make_ascii_lowercase();
+            }
+        }
         entries.sort_unstable_by_key(|(key, _)| *key);
         let mut offsets = Vec::new();
         let mut keys = Vec::new();
@@ -126,6 +137,7 @@ impl Seeds {
         // on the pinned feed while preserving the same matching automaton.
         let anchors = AhoCorasick::builder()
             .dense_depth(1)
+            .ascii_case_insensitive(nocase)
             .kind(Some(AhoCorasickKind::ContiguousNFA))
             .build(keys.iter().map(Seed::bytes))
             .map_err(io::Error::other)?;
@@ -146,6 +158,7 @@ struct Progress {
 struct Root {
     target: Target,
     primary: Seeds,
+    secondary: Option<Seeds>,
     deferred: Option<Seeds>,
     deferred_rules: HashSet<u32>,
     groups: Vec<Group>,
@@ -164,7 +177,9 @@ impl Root {
             }
         }
         let mut entries = Vec::new();
+        let mut folded = Vec::new();
         let mut later = Vec::new();
+        let mut fold_deferred = false;
         let mut deferred_rules = HashSet::new();
         let mut groups: Vec<Group> = Vec::new();
         let mut group_ids = HashMap::new();
@@ -197,9 +212,14 @@ impl Root {
                 };
                 // A run of identical bytes can report a candidate at every byte of
                 // padding. A later part is irrelevant until a first part has matched.
+                let needs_folding =
+                    part.nocase() && key.bytes().iter().any(u8::is_ascii_alphabetic);
                 let dest = if i != 0 && key.bytes().iter().all(|&b| b == key.bytes[0]) {
                     deferred_rules.insert(id);
+                    fold_deferred |= needs_folding;
                     &mut later
+                } else if needs_folding {
+                    &mut folded
                 } else {
                     &mut entries
                 };
@@ -216,16 +236,29 @@ impl Root {
         }
         drop(group_ids);
         drop(freq);
-        let mut sites = Vec::with_capacity(entries.len() + later.len());
-        let primary = Seeds::build(entries, &mut sites)?;
+        let mut sites = Vec::with_capacity(entries.len() + folded.len() + later.len());
+        let (primary, secondary) = if entries.is_empty() {
+            (Seeds::build(folded, &mut sites, true)?, None)
+        } else {
+            let primary = Seeds::build(entries, &mut sites, false)?;
+            let secondary = if folded.is_empty() {
+                None
+            } else {
+                Some(Seeds::build(folded, &mut sites, true)?)
+            };
+            (primary, secondary)
+        };
         let deferred = if later.is_empty() {
             None
         } else {
-            Some(Seeds::build(later, &mut sites)?)
+            // Exact and insensitive repeated-byte candidates share the deferred pass.
+            // Their complete programs still verify case against the original bytes.
+            Some(Seeds::build(later, &mut sites, fold_deferred)?)
         };
         Ok(Self {
             target,
             primary,
+            secondary,
             deferred,
             deferred_rules,
             groups,
@@ -250,6 +283,7 @@ impl Root {
         if before >= after {
             return Ok(true);
         }
+        let preceding = object.preceding(object.base);
         let mut calls = 0;
         for hit in seeds
             .anchors
@@ -278,40 +312,46 @@ impl Root {
                 else {
                     continue;
                 };
-                part.hits_for_anchor(object.bytes, anchor_start, range, |start, end| {
-                    let order = if let Some(prefix) = rule.bm_prefix {
-                        // Equal static buckets in 1.4.3 insert a new record at the head.
-                        Order {
-                            ac: false,
-                            trigger: start + usize::from(prefix) + 3,
-                            depth: Reverse(0),
-                            head_part: 0,
-                            group_size: Reverse(0),
-                            head_rule: u32::MAX - site.rule,
-                            part: 0,
-                            member: 0,
-                        }
-                    } else {
-                        let g = &self.groups[site.group as usize];
-                        Order {
-                            ac: true,
-                            trigger,
-                            depth: Reverse(depth),
-                            head_part: g.head_part,
-                            group_size: Reverse(g.count),
-                            head_rule: g.head_rule,
-                            part: part_number(rule, site.part as usize),
-                            member: site.rule,
-                        }
-                    };
-                    events.push(Event {
-                        site: i,
-                        start: start + object.base,
-                        end: end + object.base,
-                        trigger: trigger + object.base,
-                        order,
-                    });
-                })?;
+                part.hits_for_anchor(
+                    object.bytes,
+                    preceding,
+                    anchor_start,
+                    range,
+                    |start, end| {
+                        let order = if let Some(prefix) = rule.bm_prefix {
+                            // Equal static buckets in 1.4.3 insert a new record at the head.
+                            Order {
+                                ac: false,
+                                trigger: start + usize::from(prefix) + 3,
+                                depth: Reverse(0),
+                                head_part: 0,
+                                group_size: Reverse(0),
+                                head_rule: u32::MAX - site.rule,
+                                part: 0,
+                                member: 0,
+                            }
+                        } else {
+                            let g = &self.groups[site.group as usize];
+                            Order {
+                                ac: true,
+                                trigger,
+                                depth: Reverse(depth),
+                                head_part: g.head_part,
+                                group_size: Reverse(g.count),
+                                head_rule: g.head_rule,
+                                part: part_number(rule, site.part as usize),
+                                member: site.rule,
+                            }
+                        };
+                        events.push(Event {
+                            site: i,
+                            start: start + object.base,
+                            end: end + object.base,
+                            trigger: trigger + object.base,
+                            order,
+                        });
+                    },
+                )?;
                 if events.len() >= EVENT_LIMIT && block.len() > 1 {
                     return Ok(false);
                 }
@@ -335,7 +375,12 @@ impl Root {
             let mut stop = (start + BLOCK).min(object.bytes.len() + 1);
             loop {
                 events.clear();
-                if self.collect(&self.primary, start..stop, object, events, check)? {
+                let mut complete =
+                    self.collect(&self.primary, start..stop, object, events, check)?;
+                if complete && let Some(secondary) = &self.secondary {
+                    complete = self.collect(secondary, start..stop, object, events, check)?;
+                }
+                if complete {
                     let Some(deferred) = &self.deferred else {
                         break;
                     };
@@ -397,12 +442,16 @@ struct Window<'a> {
     rules: &'a [Rule],
     context: &'a ObjectContext,
     bytes: &'a [u8],
-    total_size: usize,
+    input: &'a [u8],
     base: usize,
     previous: Option<(usize, &'a [u8])>,
 }
 
 impl Window<'_> {
+    fn preceding(&self, base: usize) -> &[u8] {
+        &self.input[base.saturating_sub(2)..base]
+    }
+
     fn range(
         &self,
         rule: &Rule,
@@ -413,7 +462,7 @@ impl Window<'_> {
         if part != 0 {
             return Some(0..=len);
         }
-        let range = self.context.offset_range(&rule.offset, self.total_size)?;
+        let range = self.context.offset_range(&rule.offset, self.input.len())?;
         Some(range.start().saturating_sub(base)..=range.end().checked_sub(base)?.min(len))
     }
 
@@ -432,7 +481,9 @@ impl Window<'_> {
             return Ok(false);
         };
         let mut seen = false;
-        part.hits_for_anchor(bytes, anchor, range, |_, _| seen = true)?;
+        part.hits_for_anchor(bytes, self.preceding(base), anchor, range, |_, _| {
+            seen = true
+        })?;
         Ok(seen)
     }
 }
@@ -480,7 +531,7 @@ impl SearchIndex {
                 rules,
                 context,
                 bytes: &input[base..end],
-                total_size: input.len(),
+                input,
                 base,
                 previous,
             };
@@ -496,5 +547,85 @@ impl SearchIndex {
             previous = Some((base, &input[base..end]));
             base = next;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::{Offset, Pattern};
+
+    fn rule(text: &str, nocase: bool) -> io::Result<Rule> {
+        Ok(Rule {
+            name: "".into(),
+            target: Target::Generic,
+            offset: Offset::parse("*", Target::Generic)?,
+            pattern: Pattern::compile_modified(text, false, nocase, false)?,
+            bm_prefix: None,
+        })
+    }
+
+    #[test]
+    fn exact_and_folded_seeds_share_ordered_multipart_evidence() -> io::Result<()> {
+        // Both multipart records activate at Head. Only the folded record accepts
+        // the final mixed-case run, which straddles a stock window boundary.
+        let mut rules = Vec::new();
+        for (text, nocase) in [
+            ("48656164*41414141", false),
+            ("68456144*61616161", true),
+            ("4e6f7465", false),
+            ("6e4f7445", true),
+            ("31323334", true),
+        ] {
+            rules.push(rule(text, nocase)?);
+        }
+        let idx = SearchIndex::build(&rules)?;
+        let mut bytes = vec![b'.'; STOCK_WINDOW + 12];
+        bytes[8150..8154].copy_from_slice(b"Head");
+        bytes[BLOCK - 1..BLOCK + 3].copy_from_slice(b"nOtE");
+        bytes[STOCK_WINDOW - 2..STOCK_WINDOW + 2].copy_from_slice(b"aAaA");
+        bytes[STOCK_WINDOW + 5..STOCK_WINDOW + 9].copy_from_slice(b"1234");
+        let mut hits = Vec::new();
+        idx.run(
+            &rules,
+            &bytes,
+            &ObjectContext::raw(&bytes),
+            false,
+            || Ok(()),
+            &mut |hit| hits.push((hit.rule_id, hit.start, hit.end)),
+        )?;
+        hits.sort_unstable();
+        assert_eq!(
+            hits,
+            [
+                (1, 8150, STOCK_WINDOW + 2),
+                (3, BLOCK - 1, BLOCK + 3),
+                (4, STOCK_WINDOW + 5, STOCK_WINDOW + 9),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn splitting_dense_mixed_blocks_keeps_each_occurrence() -> io::Result<()> {
+        let rules = [
+            rule("414141", false)?,
+            rule("616161", true)?,
+            rule("414141", true)?,
+        ];
+        let idx = SearchIndex::build(&rules)?;
+        // Three overlapping programs exceed EVENT_LIMIT in an unsplit block.
+        let bytes = vec![b'A'; BLOCK + 100];
+        let mut counts = [0; 3];
+        idx.run(
+            &rules,
+            &bytes,
+            &ObjectContext::raw(&bytes),
+            false,
+            || Ok(()),
+            &mut |hit| counts[hit.rule_id as usize] += 1,
+        )?;
+        assert_eq!(counts, [bytes.len() - 2; 3]);
+        Ok(())
     }
 }

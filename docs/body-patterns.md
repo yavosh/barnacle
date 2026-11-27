@@ -67,6 +67,11 @@ Local `.ldb` rules can combine extended patterns with Boolean expressions, occur
 The loader applies functionality levels and ignore rules. Supported target attributes include `Target`, `FileSize`, and `Container`.
 `Container:CL_TYPE_ANY` selects root objects. A named container selects children with that parent type.
 
+The matcher supports ASCII case folding (`i`), wide bytes (`w`), ASCII with wide bytes (`a`), and fullword boundaries (`f`).
+Case folding applies to literal letters. Wide patterns still measure offsets and brace gaps in bytes.
+ASCII and wide variants share a logical subsignature ID. Two single-part variants at the same start count once.
+Fullword checks run inside the pattern matcher. For multipart patterns, they check the outer edges.
+
 On the tested raw objects, stock tries extended body rules, whole-file hashes, and then logical rules.
 A target-specific logical rule wins over a generic rule. Within the selected target, the first matching record wins.
 Logical rules receive each new object's context, including extracted children and normalized views.
@@ -82,5 +87,5 @@ cargo test --locked --test logical_signatures -- --include-ignored
 
 Stock loads 312,303 logical records from `main.ldb` and `daily.ldb` with PUA disabled and the pinned ignore lists.
 Of these, 1,186 use PCRE subsignatures, and 3,724 use group count expressions.
-Local records using PCRE, subsignature modifiers, or other unsupported attributes fail generation loading with a source location.
+Unsupported active subsignatures and target attributes fail generation loading with a source location. These include PCRE and fuzzy hashes.
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)

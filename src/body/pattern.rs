@@ -67,8 +67,19 @@ impl Byte {
         })
     }
 
-    fn matches(self, actual: u8) -> bool {
-        actual & self.mask == self.value
+    fn fold(mut self, nocase: bool) -> Self {
+        if nocase && self.mask == u8::MAX {
+            self.value.make_ascii_lowercase();
+        }
+        self
+    }
+
+    fn matches(self, actual: u8, nocase: bool) -> bool {
+        if nocase && self.mask == u8::MAX {
+            self.value.eq_ignore_ascii_case(&actual)
+        } else {
+            actual & self.mask == self.value
+        }
     }
 }
 
@@ -94,7 +105,14 @@ impl Atom {
     }
 
     // Input coordinates mark gaps between bytes, allowing identical forward and backward checks.
-    fn step(&self, data: &[u8], pos: usize, reverse: bool, mut success: impl FnMut(usize)) {
+    fn step(
+        &self,
+        data: &[u8],
+        pos: usize,
+        reverse: bool,
+        nocase: bool,
+        mut success: impl FnMut(usize),
+    ) {
         let span = |n| {
             if reverse {
                 let start = pos.checked_sub(n)?;
@@ -107,14 +125,14 @@ impl Atom {
         match self {
             Self::Literal(bytes) => {
                 if let Some((s, next)) = span(bytes.len())
-                    && s == bytes.as_ref()
+                    && literal_matches(s, bytes, nocase)
                 {
                     success(next);
                 }
             }
             Self::Byte(byte) => {
                 if let Some((s, next)) = span(1)
-                    && byte.matches(s[0])
+                    && byte.matches(s[0], nocase)
                 {
                     success(next);
                 }
@@ -127,7 +145,10 @@ impl Atom {
             Self::Choice { options, negative } => {
                 for option in options {
                     if let Some((s, next)) = span(option.len())
-                        && option.iter().zip(s).all(|(b, &actual)| b.matches(actual))
+                        && option
+                            .iter()
+                            .zip(s)
+                            .all(|(b, &actual)| b.matches(actual, nocase))
                     {
                         if *negative {
                             return;
@@ -151,20 +172,20 @@ struct Flank {
 }
 
 impl Flank {
-    fn parse(byte: &str, range: &str) -> io::Result<Self> {
+    fn parse(byte: &str, range: &str, nocase: bool) -> io::Result<Self> {
         let (min, max) = range.split_once('-').unwrap_or((range, range));
         let (min, max) = (number(min)? as usize, number(max)? as usize);
         if min > max || max > 32 {
             return Err(invalid("bracket distances must be ordered and at most 32"));
         }
         Ok(Self {
-            byte: Byte::parse(byte.as_bytes())?,
+            byte: Byte::parse(byte.as_bytes())?.fold(nocase),
             min,
             max,
         })
     }
 
-    fn matches(&self, input: &[u8], pos: usize, left: bool) -> bool {
+    fn matches(&self, input: &[u8], pos: usize, left: bool, nocase: bool) -> bool {
         // A full wildcard in the flank occupies the reference engine's "ignore" slot.
         if self.byte.mask == 0 {
             return true;
@@ -176,24 +197,64 @@ impl Flank {
                 pos.checked_add(gap)
             };
             at.and_then(|i| input.get(i))
-                .is_some_and(|&b| self.byte.matches(b))
+                .is_some_and(|&b| self.byte.matches(b, nocase))
         })
     }
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
 enum Body {
-    Literal { bytes: Box<[u8]>, anchor: usize },
+    Literal {
+        bytes: Box<[u8]>,
+        anchor: u16,
+        flags: Flags,
+    },
     Program(Box<Program>),
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct Program {
+    flags: Flags,
     atoms: Box<[Atom]>,
     anchor: usize,
     span: usize,
     left: Option<Flank>,
     right: Option<Flank>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum WordWidth {
+    Ascii,
+    Wide,
+}
+
+impl WordWidth {
+    fn left(self, input: &[u8], preceding: &[u8], start: usize) -> bool {
+        let mut before = input[..start].iter().rev().chain(preceding.iter().rev());
+        let high = before.next();
+        match self {
+            Self::Ascii => high.is_none_or(|byte| !byte.is_ascii_alphanumeric()),
+            Self::Wide => match (before.next(), high) {
+                (Some(low), Some(high)) => *high != 0 || !low.is_ascii_alphanumeric(),
+                _ => true,
+            },
+        }
+    }
+
+    fn right(self, input: &[u8], end: usize) -> bool {
+        match (self, &input[end..]) {
+            (_, []) => true,
+            (Self::Wide, [low, high, ..]) => *high != 0 || !low.is_ascii_alphanumeric(),
+            (_, [next, ..]) => !next.is_ascii_alphanumeric(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Flags {
+    nocase: bool,
+    left_word: Option<WordWidth>,
+    right_word: Option<WordWidth>,
 }
 
 #[derive(Debug)]
@@ -210,9 +271,38 @@ pub(super) enum Pattern {
 
 impl Pattern {
     pub(super) fn compile(text: &str) -> io::Result<Self> {
+        Self::compile_modified(text, false, false, false)
+    }
+
+    pub(super) fn compile_modified(
+        text: &str,
+        wide: bool,
+        nocase: bool,
+        fullword: bool,
+    ) -> io::Result<Self> {
         if text.is_empty() || !text.is_ascii() {
             return Err(invalid("expected a nonempty ASCII hex pattern"));
         }
+        if (wide || nocase || fullword) && text.contains("!(") {
+            return Err(invalid(
+                "negated alternatives with modifiers are unsupported",
+            ));
+        }
+        let word = fullword.then_some(if wide {
+            WordWidth::Wide
+        } else {
+            WordWidth::Ascii
+        });
+        let modified;
+        let text = if wide {
+            modified = wide_pattern(text)?;
+            &modified
+        } else if fullword && text.contains('[') {
+            modified = text.replace('[', "{").replace(']', "}");
+            &modified
+        } else {
+            text
+        };
         // The reference expands leading exact brace counts below 128 into byte wildcards.
         // Once it reaches a multipart range, subsequent braces separate indexed parts.
         let mut parts = Vec::new();
@@ -247,7 +337,12 @@ impl Pattern {
                         if group {
                             return Err(invalid("multipart range inside an alternative"));
                         }
-                        parts.push(Part::compile(&text[start..i], gap)?);
+                        let flags = Flags {
+                            nocase,
+                            left_word: if parts.is_empty() { word } else { None },
+                            right_word: None,
+                        };
+                        parts.push(Part::compile(&text[start..i], gap, flags)?);
                         start = next;
                         gap = new_gap;
                     }
@@ -261,7 +356,12 @@ impl Pattern {
         if group {
             return Err(invalid("unclosed alternative"));
         }
-        let last = Part::compile(&text[start..], gap)?;
+        let flags = Flags {
+            nocase,
+            left_word: if parts.is_empty() { word } else { None },
+            right_word: word,
+        };
+        let last = Part::compile(&text[start..], gap, flags)?;
         if parts.is_empty() {
             return Ok(Self::Single(last));
         }
@@ -278,6 +378,56 @@ impl Pattern {
             Self::Multipart(parts) => parts,
         }
     }
+}
+
+// Expand byte tokens only. Stock retains brace distances as raw byte counts.
+// Widened bracket flanks contain two bytes, so the brackets become ordinary
+// gaps and both flanks are included in the reported match coordinates.
+fn wide_pattern(mut text: &str) -> io::Result<String> {
+    let mut result = String::with_capacity(text.len());
+    while let Some(&first) = text.as_bytes().first() {
+        match first {
+            b'{' | b'[' => {
+                let close = if first == b'{' { '}' } else { ']' };
+                let (distance, rest) = text[1..]
+                    .split_once(close)
+                    .ok_or_else(|| invalid("unclosed wide pattern distance"))?;
+                result.push('{');
+                result.push_str(distance);
+                result.push('}');
+                text = rest;
+            }
+            b'*' | b'!' | b'(' | b')' | b'|' => {
+                result.push(char::from(first));
+                text = &text[1..];
+            }
+            _ => {
+                let pair = text
+                    .get(..2)
+                    .ok_or_else(|| invalid("truncated wide byte pattern"))?;
+                Byte::parse(pair.as_bytes())?;
+                result.push_str(pair);
+                result.push_str("00");
+                text = &text[2..];
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn literal_matches(actual: &[u8], pattern: &[u8], nocase: bool) -> bool {
+    if nocase {
+        actual.eq_ignore_ascii_case(pattern)
+    } else {
+        actual == pattern
+    }
+}
+
+fn starts_with(input: &[u8], at: usize, pattern: &[u8], nocase: bool) -> bool {
+    input
+        .get(at..)
+        .and_then(|tail| tail.get(..pattern.len()))
+        .is_some_and(|s| literal_matches(s, pattern, nocase))
 }
 
 // Stock indexes up to three static bytes and prefers a prefix without two leading zeroes.
@@ -324,7 +474,7 @@ fn anchor_position(atoms: &[Atom]) -> io::Result<(usize, usize)> {
     }
 }
 
-fn parse_atoms(mut text: &str) -> io::Result<Vec<Atom>> {
+fn parse_atoms(mut text: &str, nocase: bool) -> io::Result<Vec<Atom>> {
     let mut atoms = Vec::new();
     let mut literal = Vec::new();
     while !text.is_empty() {
@@ -373,7 +523,7 @@ fn parse_atoms(mut text: &str) -> io::Result<Vec<Atom>> {
                             let pair = raw
                                 .get(..2)
                                 .ok_or_else(|| invalid("invalid alternative byte"))?;
-                            bytes.push(Byte::parse(pair.as_bytes())?);
+                            bytes.push(Byte::parse(pair.as_bytes())?.fold(nocase));
                             raw = &raw[2..];
                         }
                     }
@@ -405,7 +555,7 @@ fn parse_atoms(mut text: &str) -> io::Result<Vec<Atom>> {
                 let pair = text
                     .get(..2)
                     .ok_or_else(|| invalid("truncated byte pattern"))?;
-                let b = Byte::parse(pair.as_bytes())?;
+                let b = Byte::parse(pair.as_bytes())?.fold(nocase);
                 text = &text[2..];
                 if b.mask == 255 {
                     literal.push(b.value);
@@ -438,24 +588,24 @@ fn parse_atoms(mut text: &str) -> io::Result<Vec<Atom>> {
 }
 
 impl Part {
-    fn compile(mut text: &str, gap: Gap) -> io::Result<Self> {
+    fn compile(mut text: &str, gap: Gap, flags: Flags) -> io::Result<Self> {
         let mut left = None;
         let mut right = None;
         if text.as_bytes().get(2) == Some(&b'[') {
             let (range, rest) = text[3..]
                 .split_once(']')
                 .ok_or_else(|| invalid("unclosed left bracket"))?;
-            left = Some(Flank::parse(&text[..2], range)?);
+            left = Some(Flank::parse(&text[..2], range, flags.nocase)?);
             text = rest;
         }
         if let Some((core, rest)) = text.split_once('[') {
             let (range, byte) = rest
                 .split_once(']')
                 .ok_or_else(|| invalid("unclosed right bracket"))?;
-            right = Some(Flank::parse(byte, range)?);
+            right = Some(Flank::parse(byte, range, flags.nocase)?);
             text = core;
         }
-        let mut atoms = parse_atoms(text)?;
+        let mut atoms = parse_atoms(text, flags.nocase)?;
         let (mut anchor, shift) = anchor_position(&atoms)?;
         let span = atoms.iter().map(Atom::max_len).sum::<usize>();
         if span > u16::MAX.into() {
@@ -470,7 +620,8 @@ impl Part {
                 gap,
                 body: Body::Literal {
                     bytes,
-                    anchor: shift,
+                    anchor: shift as u16,
+                    flags,
                 },
             });
         }
@@ -484,6 +635,7 @@ impl Part {
             atoms.insert(anchor, tail);
         }
         let body = Body::Program(Box::new(Program {
+            flags,
             atoms: atoms.into_boxed_slice(),
             anchor,
             span,
@@ -491,6 +643,13 @@ impl Part {
             right,
         }));
         Ok(Self { gap, body })
+    }
+
+    pub(super) fn nocase(&self) -> bool {
+        match &self.body {
+            Body::Literal { flags, .. } => flags.nocase,
+            Body::Program(p) => p.flags.nocase,
+        }
     }
 
     pub(super) fn literal(&self) -> Option<&[u8]> {
@@ -506,7 +665,7 @@ impl Part {
 
     pub(super) fn anchor(&self) -> &[u8] {
         match &self.body {
-            Body::Literal { bytes, anchor } => &bytes[*anchor..],
+            Body::Literal { bytes, anchor, .. } => &bytes[usize::from(*anchor)..],
             Body::Program(p) => match &p.atoms[p.anchor] {
                 Atom::Literal(s) => s,
                 _ => unreachable!(),
@@ -528,43 +687,66 @@ impl Part {
     pub(super) fn hits_for_anchor(
         &self,
         input: &[u8],
+        preceding: &[u8],
         anchor_start: usize,
         range: RangeInclusive<usize>,
         mut emit: impl FnMut(usize, usize),
     ) -> io::Result<()> {
         match &self.body {
-            Body::Literal { bytes, anchor } => {
-                if let Some(start) = anchor_start.checked_sub(*anchor)
+            Body::Literal {
+                bytes,
+                anchor,
+                flags,
+            } => {
+                if let Some(start) = anchor_start.checked_sub(usize::from(*anchor))
                     && range.contains(&start)
-                    && input.get(start..).is_some_and(|s| s.starts_with(bytes))
+                    && starts_with(input, start, bytes, flags.nocase)
+                    && flags
+                        .left_word
+                        .is_none_or(|w| w.left(input, preceding, start))
+                    && flags
+                        .right_word
+                        .is_none_or(|w| w.right(input, start + bytes.len()))
                 {
                     emit(start, start + bytes.len());
                 }
             }
             Body::Program(p) => {
                 let anchor = self.anchor();
-                if !input
-                    .get(anchor_start..)
-                    .is_some_and(|s| s.starts_with(anchor))
-                {
+                if !starts_with(input, anchor_start, anchor, p.flags.nocase) {
                     return Ok(());
                 }
-                let left = side(input, anchor_start, p.atoms[..p.anchor].iter().rev(), true)
-                    .select(|s| {
-                        range.contains(&s)
-                            && p.left.as_ref().is_none_or(|f| f.matches(input, s, true))
-                    });
-                if let Some(start) = left {
+                let left = side(
+                    input,
+                    anchor_start,
+                    p.atoms[..p.anchor].iter().rev(),
+                    true,
+                    p.flags.nocase,
+                )
+                .select(|s| {
+                    range.contains(&s)
+                        && p.left
+                            .as_ref()
+                            .is_none_or(|f| f.matches(input, s, true, p.flags.nocase))
+                });
+                // Stock commits to a backward alternative before testing its word boundary.
+                if let Some(start) = left
+                    && p.flags
+                        .left_word
+                        .is_none_or(|w| w.left(input, preceding, start))
+                {
                     let right = side(
                         input,
                         anchor_start + anchor.len(),
                         p.atoms[p.anchor + 1..].iter(),
                         false,
+                        p.flags.nocase,
                     )
                     .select(|end| {
-                        p.right
-                            .as_ref()
-                            .is_none_or(|f| f.matches(input, end, false))
+                        p.flags.right_word.is_none_or(|w| w.right(input, end))
+                            && p.right
+                                .as_ref()
+                                .is_none_or(|f| f.matches(input, end, false, p.flags.nocase))
                     });
                     if let Some(end) = right {
                         emit(start, end);
@@ -622,16 +804,17 @@ fn side<'a>(
     cursor: usize,
     atoms: impl Iterator<Item = &'a Atom>,
     reverse: bool,
+    nocase: bool,
 ) -> Positions {
     let mut active = Positions::One(cursor);
     for atom in atoms {
         let mut next = Positions::Empty;
         match active {
             Positions::Empty => break,
-            Positions::One(n) => atom.step(input, n, reverse, |p| next.push(p)),
+            Positions::One(n) => atom.step(input, n, reverse, nocase, |p| next.push(p)),
             Positions::Several { values, .. } => {
                 for n in values {
-                    atom.step(input, n, reverse, |p| next.push(p));
+                    atom.step(input, n, reverse, nocase, |p| next.push(p));
                 }
             }
         }
@@ -718,10 +901,115 @@ mod tests {
         let part = &pattern.parts()[0];
         let mut hits = Vec::new();
         for pos in 0..data.len() {
-            part.hits_for_anchor(data, pos, range.clone(), |a, b| hits.push((a, b)))
+            part.hits_for_anchor(data, &[], pos, range.clone(), |a, b| hits.push((a, b)))
                 .unwrap();
         }
         hits
+    }
+
+    fn modified_hits(
+        pattern: &Pattern,
+        part: usize,
+        data: &[u8],
+        preceding: &[u8],
+    ) -> Vec<(usize, usize)> {
+        let mut hits = Vec::new();
+        for pos in 0..data.len() {
+            pattern.parts()[part]
+                .hits_for_anchor(data, preceding, pos, 0..=data.len(), |start, end| {
+                    hits.push((start, end))
+                })
+                .unwrap();
+        }
+        hits
+    }
+
+    #[test]
+    fn nocase_folds_ascii_literals_and_alternatives_but_preserves_masks() {
+        let p = Pattern::compile_modified("4142(63|78)44?5", false, true, false).unwrap();
+        assert!(p.parts()[0].nocase());
+        assert_eq!(p.parts()[0].anchor(), b"ab");
+        assert_eq!(modified_hits(&p, 0, b"ABcDe abXDE", &[]), [(0, 5), (6, 11)]);
+        let mask = Pattern::compile_modified("41626?64", false, true, false).unwrap();
+        assert_eq!(modified_hits(&mask, 0, b"ABcD ABCD", &[]), [(0, 4)]);
+        let high = Pattern::compile_modified("c06162", false, true, false).unwrap();
+        assert_eq!(modified_hits(&high, 0, b"\xc0AB \xe0ab", &[]), [(0, 3)]);
+        assert!(Pattern::compile_modified("6162!(63|78)6465", false, true, false).is_err());
+    }
+
+    #[test]
+    fn wide_bytes_and_raw_gaps_keep_distinct_widths() {
+        for (hex, yes, no) in [
+            ("61??63", b"a\0X\0c\0".as_slice(), b"a\0XYc\0".as_slice()),
+            ("61{1}63", b"a\0Xc\0", b"a\0X\0c\0"),
+            ("61(62|78)63", b"a\0x\0c\0", b"a\0xXc\0"),
+            ("61(62{1}|78)63", b"a\0b\0Xc\0", b"a\0b\0X\0c\0"),
+            ("61[1]63", b"a\0Xc\0", b"a\0X\0c\0"),
+        ] {
+            let p = Pattern::compile_modified(hex, true, false, false).unwrap();
+            assert_eq!(modified_hits(&p, 0, yes, &[]), [(0, yes.len())], "{hex}");
+            assert!(modified_hits(&p, 0, no, &[]).is_empty(), "{hex}");
+        }
+        let p = Pattern::compile_modified("61{1-2}63", true, false, false).unwrap();
+        assert_eq!(p.parts().len(), 2);
+        let mut state = MatchState::default();
+        assert_eq!(state.advance(&p, 0, 0, 2), None);
+        assert_eq!(state.advance(&p, 1, 5, 7), None);
+        assert_eq!(state.advance(&p, 1, 4, 6), Some((0, 6)));
+    }
+
+    #[test]
+    fn fullword_brackets_and_alternatives_use_reference_span() {
+        for (hex, data, expected) in [
+            ("61[1]626364", b" aXbcd ".as_slice(), Some((1, 6))),
+            ("616263(64|6465)", b" abcde ", Some((1, 6))),
+            ("(64|6564)616263", b" edabc ", None),
+            ("(6564|64)616263", b" edabc ", Some((1, 6))),
+        ] {
+            let p = Pattern::compile_modified(hex, false, false, true).unwrap();
+            assert_eq!(
+                modified_hits(&p, 0, data, &[]),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{hex}"
+            );
+        }
+        for (hex, text, expected) in [
+            ("637265646974(20|2078)", "credit x ", Some((0, 16))),
+            ("(20|7820)637265646974", "x credit", None),
+            ("(7820|20)637265646974", "x credit", Some((0, 16))),
+        ] {
+            let wide = text
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let p = Pattern::compile_modified(hex, true, false, true).unwrap();
+            assert_eq!(
+                modified_hits(&p, 0, &wide, &[]),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{hex}"
+            );
+        }
+        assert!(Pattern::compile_modified("61[1-2]626364", false, false, true).is_err());
+        let p = Pattern::compile_modified("48454144*5441494c", false, false, true).unwrap();
+        let data = b"xHEAD  HEAD TAIL .";
+        assert_eq!(modified_hits(&p, 0, data, &[]), [(7, 11)]);
+        assert_eq!(modified_hits(&p, 1, data, &[]), [(12, 16)]);
+    }
+
+    #[test]
+    fn word_boundaries_use_preceding_bytes() {
+        let ascii = Pattern::compile_modified("6162", false, false, true).unwrap();
+        assert_eq!(modified_hits(&ascii, 0, b"ab_", &[]), [(0, 2)]);
+        assert!(modified_hits(&ascii, 0, b"ab_", b"xx").is_empty());
+        assert_eq!(modified_hits(&ascii, 0, b".ab", b"xx"), [(1, 3)]);
+        let wide = Pattern::compile_modified("6162", true, false, true).unwrap();
+        assert_eq!(modified_hits(&wide, 0, b"Xa\0b\0", &[]), [(1, 5)]);
+        assert_eq!(modified_hits(&wide, 0, b"Xa\0b\0", b"xx"), [(1, 5)]);
+        assert_eq!(modified_hits(&wide, 0, b"\0a\0b\0", b"x."), [(1, 5)]);
+        assert!(modified_hits(&wide, 0, b"\0a\0b\0", b".x").is_empty());
+        assert!(modified_hits(&wide, 0, b".\0a\0b\0Q", b"xx").is_empty());
+        assert_eq!(modified_hits(&wide, 0, b".\0a\0b\0Q!", b"xx"), [(2, 6)]);
+        assert!(modified_hits(&wide, 0, b"X\0a\0b\0", &[]).is_empty());
     }
 
     #[test]

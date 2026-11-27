@@ -25,16 +25,19 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
     let socket = temporary.path().join("socket");
     let config = temporary.path().join("clamd.conf");
     fs::create_dir(&db)?;
-    fs::write(
-        &config,
-        format!(
-            "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nDisableCache yes\nSelfCheck 0\n",
-            db.display(),
-            socket.display()
-        ),
-    )?;
-
-    let run = |rules: &str, body: &str, hashes: &str, cases: &[(&[u8], Option<&str>)]| {
+    let scan = |rules: &str,
+                body: &str,
+                hashes: &str,
+                cases: &[(&[u8], Option<&str>)],
+                options: &str| {
+        fs::write(
+            &config,
+            format!(
+                "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nDisableCache yes\nSelfCheck 0\n{options}",
+                db.display(),
+                socket.display()
+            ),
+        )?;
         fs::write(db.join("local.ldb"), rules)?;
         if !body.is_empty() {
             fs::write(db.join("local.ndb"), body)?;
@@ -64,6 +67,10 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
             fs::remove_file(db.join("local.hdb"))?;
         }
         io::Result::Ok(())
+    };
+
+    let run = |rules: &str, body: &str, hashes: &str, cases: &[(&[u8], Option<&str>)]| {
+        scan(rules, body, hashes, cases, "")
     };
 
     let notes = format!("{CREDIT};{DEBIT};{LEDGER}");
@@ -227,6 +234,151 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         "",
         "",
         &[(&executable, Some("Typed"))],
+    )?;
+    modifiers(|rules, cases| scan(rules, "", "", cases, "ScanHTML no\nScanMail no\n"))
+}
+
+fn modifiers(run: impl Fn(&str, &[(&[u8], Option<&str>)]) -> io::Result<()>) -> io::Result<()> {
+    fn binary(content: &[u8]) -> Vec<u8> {
+        [
+            b"\xff\0\x81\x02\xfd\x04\x80\x06".as_slice(),
+            content,
+            b"\xfe\0\x83\x03\xfc\x05\x82\x07",
+        ]
+        .concat()
+    }
+
+    fn wide(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    let ascii = binary(b"credit");
+    let uppercase = binary(b"CREDIT");
+    let utf16 = binary(&wide("credit"));
+    let utf16_uppercase = binary(&wide("CREDIT"));
+    let both = binary(&[b"credit ".as_slice(), &wide("credit")].concat());
+
+    for (flags, ascii_winner, uppercase_winner, wide_winner, wide_upper_winner) in [
+        ("a", Some("Modifier"), None, None, None),
+        ("i", Some("Modifier"), Some("Modifier"), None, None),
+        ("w", None, None, Some("Modifier"), None),
+        ("wa", Some("Modifier"), None, Some("Modifier"), None),
+        ("wii", None, None, Some("Modifier"), Some("Modifier")),
+    ] {
+        run(
+            &logical("Modifier", ANY, "0", &format!("{CREDIT}::{flags}")),
+            &[
+                (&ascii, ascii_winner),
+                (&uppercase, uppercase_winner),
+                (&utf16, wide_winner),
+                (&utf16_uppercase, wide_upper_winner),
+            ],
+        )?;
+    }
+    run(
+        &logical("Count", ANY, "0=2", &format!("{CREDIT}::wa")),
+        &[(&ascii, None), (&utf16, None), (&both, Some("Count"))],
+    )?;
+    run(
+        &logical("Word", ANY, "0", &format!("{CREDIT}::waf")),
+        &[
+            (&binary(b"_credit_"), Some("Word")),
+            (&binary(b"1credit2"), None),
+            (&binary(&wide("_credit_")), Some("Word")),
+            (&binary(&wide("xcredity")), None),
+        ],
+    )?;
+    run(
+        &logical("Offset", ANY, "0", &format!("9:{CREDIT}::w")),
+        &[
+            (
+                &binary(&[b"x".as_slice(), &wide("credit")].concat()),
+                Some("Offset"),
+            ),
+            (&utf16, None),
+        ],
+    )?;
+    run(
+        &logical("End", ANY, "0", &format!("EOF-20:{CREDIT}::w")),
+        &[(&utf16, Some("End")), (&ascii, None)],
+    )?;
+
+    let raw_gap = binary(&[wide("cre").as_slice(), b"X", &wide("it")].concat());
+    let code_unit_gap = binary(&wide("creXit"));
+    run(
+        &logical("Gap", ANY, "0", "637265{1}6974::w"),
+        &[(&raw_gap, Some("Gap")), (&code_unit_gap, None)],
+    )?;
+    run(
+        &logical("WideWildcard", ANY, "0", "637265??6974::w"),
+        &[(&raw_gap, None), (&code_unit_gap, Some("WideWildcard"))],
+    )?;
+    run(
+        &logical("Nibble", ANY, "0", "6372656?6974::iw"),
+        &[(&utf16, Some("Nibble")), (&utf16_uppercase, None)],
+    )?;
+    run(
+        &logical("NoEngine", "Target:0", "0", &format!("{CREDIT}::i")),
+        &[(&uppercase, Some("NoEngine"))],
+    )?;
+    let matching_both_widths = binary(b"a\0\0\0 b\0\0\0");
+    run(
+        &logical("OneStart", ANY, "0=1", "6100::wa"),
+        &[(&matching_both_widths, Some("OneStart"))],
+    )?;
+    run(
+        &logical("TwoCompletions", ANY, "0=2", "6100*6200::wa"),
+        &[(&matching_both_widths, Some("TwoCompletions"))],
+    )?;
+    run(
+        &logical("Multipart", ANY, "0", "48454144*5441494c::f"),
+        &[
+            (&binary(b"xHEAD  HEAD TAIL ."), Some("Multipart")),
+            (&binary(b"xHEAD TAIL ."), None),
+        ],
+    )?;
+    run(
+        &(logical("LeftFirst", ANY, "0", &format!("(20|7820){CREDIT}::f"))
+            + &logical("LeftSecond", ANY, "0", &format!("(7820|20){CREDIT}::f"))
+            + &logical("Right", ANY, "0", &format!("{CREDIT}(20|2078)::f"))),
+        &[
+            (&binary(b"x credit"), Some("LeftSecond")),
+            (&binary(b"credit x "), Some("Right")),
+        ],
+    )?;
+    run(
+        &(logical("BracketCore", ANY, "0", "10:61[1]626364[1]65::f")
+            + &logical("BracketStart", ANY, "0", "8:61[1]626364[1]65::f")),
+        &[(&binary(b"aXbcdYe"), Some("BracketStart"))],
+    )?;
+    run(
+        &logical("RepeatedModifiers", ANY, "0", &format!("{CREDIT}::i::w")),
+        &[
+            (&binary(b" credit "), Some("RepeatedModifiers")),
+            (&binary(b" CREDIT "), None),
+            (&binary(&wide("credit")), None),
+        ],
+    )?;
+    let mut window_edge = binary(&vec![b' '; 131_073]);
+    window_edge[131_068..131_073].copy_from_slice(b"noteQ");
+    run(
+        &logical("WindowEnd", ANY, "0", "6e6f7465::f"),
+        &[(&window_edge, Some("WindowEnd"))],
+    )?;
+    let mut overlap = binary(&vec![b'.'; 131_088]);
+    let word = wide("credit");
+    overlap[131_061..131_061 + word.len()].copy_from_slice(&word);
+    let mut punctuation = overlap.clone();
+    punctuation[131_059..131_061].copy_from_slice(b".\0");
+    let mut letter = overlap.clone();
+    letter[131_059..131_061].copy_from_slice(b"x\0");
+    run(
+        &logical("WideWindow", ANY, "0", &format!("{CREDIT}::wf")),
+        &[
+            (&overlap, Some("WideWindow")),
+            (&punctuation, Some("WideWindow")),
+            (&letter, None),
+        ],
     )
 }
 

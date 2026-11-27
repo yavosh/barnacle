@@ -45,15 +45,19 @@ struct LogicalRule {
     name: Box<str>,
     conditions: Conditions,
     expression: usize,
-    first_child: usize,
     children: usize,
+}
+
+struct ChildBinding {
+    owner: u32,
+    slot: u8,
 }
 
 #[derive(Default)]
 struct Builder {
     records: Vec<LogicalRule>,
     children: Vec<Rule>,
-    owners: Vec<u32>,
+    bindings: Vec<ChildBinding>,
     expressions: Vec<Expression>,
     expression_ids: HashMap<usize, HashMap<Box<str>, usize>>,
     zero_matches: Vec<u32>,
@@ -63,7 +67,7 @@ struct Builder {
 pub struct LogicalIndex {
     records: Vec<LogicalRule>,
     children: Vec<Rule>,
-    owners: Vec<u32>,
+    bindings: Vec<ChildBinding>,
     expressions: Vec<Expression>,
     zero_matches: Vec<u32>,
     search: SearchIndex,
@@ -120,7 +124,7 @@ impl LogicalIndex {
         Ok(Self {
             records: builder.records,
             children: builder.children,
-            owners: builder.owners,
+            bindings: builder.bindings,
             expressions: builder.expressions,
             zero_matches: builder.zero_matches,
             search,
@@ -160,8 +164,8 @@ impl LogicalIndex {
             &mut check,
             &mut |hit| {
                 let child = hit.rule_id as usize;
-                let owner = self.owners[child];
-                let record = &self.records[owner as usize];
+                let binding = &self.bindings[child];
+                let record = &self.records[binding.owner as usize];
                 if !record.conditions.accepts(object.file_size, object.parent)
                     || object.unmapped_script
                         && record.conditions.target == Target::Generic
@@ -169,8 +173,8 @@ impl LogicalIndex {
                 {
                     return;
                 }
-                let slot = child - record.first_child;
-                let e = evidence.entry(owner).or_insert_with(|| Evidence {
+                let slot = usize::from(binding.slot);
+                let e = evidence.entry(binding.owner).or_insert_with(|| Evidence {
                     counts: vec![0; record.children],
                     last: vec![0; record.children],
                 });
@@ -308,19 +312,19 @@ impl Builder {
         };
         let id = u32::try_from(self.records.len())
             .map_err(|_| invalid("too many logical signatures"))?;
-        let first_child = self.children.len();
-        u32::try_from(
-            first_child
-                .checked_add(children)
-                .ok_or_else(|| invalid("too many logical subsignatures"))?,
-        )
-        .map_err(|_| invalid("too many logical subsignatures"))?;
         for (i, field) in fields.enumerate() {
-            self.children.push(
-                parse_child(field, conditions.target)
-                    .map_err(|e| invalid(format!("subsignature {i}: {e}")))?,
-            );
-            self.owners.push(id);
+            let variants = parse_child(field, conditions.target)
+                .map_err(|e| invalid(format!("subsignature {i}: {e}")))?;
+            for rule in variants.into_iter().flatten() {
+                if self.children.len() >= u32::MAX as usize {
+                    return Err(invalid("too many logical subsignatures"));
+                }
+                self.children.push(rule);
+                self.bindings.push(ChildBinding {
+                    owner: id,
+                    slot: i as u8,
+                });
+            }
         }
         if self.expressions[expression].matches(&[0; MAX_CHILDREN][..children]) {
             self.zero_matches.push(id);
@@ -329,7 +333,6 @@ impl Builder {
             name,
             conditions,
             expression,
-            first_child,
             children,
         });
         Ok(())
@@ -384,14 +387,39 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
                 .ok_or_else(|| invalid(format!("unsupported Container type {value}")))
         })
         .transpose()?;
-    Ok(Some(Conditions {
+    let conditions = Conditions {
         target,
         size,
         container,
-    }))
+    };
+    Ok(Some(conditions))
 }
 
-fn parse_child(field: &str, target: Target) -> io::Result<Rule> {
+#[derive(Default)]
+struct Modifiers {
+    ascii: bool,
+    wide: bool,
+    nocase: bool,
+    fullword: bool,
+}
+
+impl Modifiers {
+    fn parse(text: &str) -> io::Result<Self> {
+        let mut flags = Self::default();
+        for flag in text.bytes() {
+            match flag {
+                b'a' => flags.ascii = true,
+                b'w' => flags.wide = true,
+                b'i' => flags.nocase = true,
+                b'f' => flags.fullword = true,
+                _ => return Err(invalid("unsupported subsignature modifier")),
+            }
+        }
+        Ok(flags)
+    }
+}
+
+fn parse_child(field: &str, target: Target) -> io::Result<[Option<Rule>; 2]> {
     if field.contains('/') {
         return Err(invalid("unsupported PCRE subsignature"));
     }
@@ -403,27 +431,42 @@ fn parse_child(field: &str, target: Target) -> io::Result<Rule> {
             "unsupported byte-compare or fuzzy hash subsignature",
         ));
     }
+    let (field, modifiers) = match field.split_once("::") {
+        // Stock uses the unmodified pattern when a second modifier delimiter is present.
+        Some((field, flags)) if flags.contains("::") => (field, Modifiers::default()),
+        Some((field, flags)) => {
+            if field.contains("!(") {
+                return Err(invalid("modifiers on negated alternatives are unsupported"));
+            }
+            (field, Modifiers::parse(flags)?)
+        }
+        None => (field, Modifiers::default()),
+    };
     let (position, body) = field.split_once(':').unwrap_or(("*", field));
-    if body.contains(':') {
-        return Err(invalid("unsupported subsignature modifiers"));
-    }
     let offset = Offset::parse(position, target)?;
-    let pattern = Pattern::compile(body)?;
-    if pattern
-        .parts()
-        .iter()
-        .any(|part| part.max_span() >= STOCK_WINDOW)
-    {
-        return Err(invalid("subsignature exceeds the reference scan window"));
+    let mut variants = [None, None];
+    for (i, wide) in [false, true].into_iter().enumerate() {
+        if (wide && !modifiers.wide) || (!wide && modifiers.wide && !modifiers.ascii) {
+            continue;
+        }
+        let pattern = Pattern::compile_modified(body, wide, modifiers.nocase, modifiers.fullword)?;
+        if pattern
+            .parts()
+            .iter()
+            .any(|part| part.max_span() >= STOCK_WINDOW)
+        {
+            return Err(invalid("subsignature exceeds the reference scan window"));
+        }
+        // Stock compiles ordinary logical subsignatures in its AC root, including literals.
+        variants[i] = Some(Rule {
+            name: "".into(),
+            target,
+            offset,
+            pattern,
+            bm_prefix: None,
+        });
     }
-    // Stock compiles ordinary logical subsignatures in its AC root, including literals.
-    Ok(Rule {
-        name: "".into(),
-        target,
-        offset,
-        pattern,
-        bm_prefix: None,
-    })
+    Ok(variants)
 }
 
 // Names accepted by cli_ftcode in the pinned engine.
@@ -605,7 +648,11 @@ mod tests {
                 "Current;Engine:51-255,Target:0,HandlerType:CL_TYPE_MAIL;0;6d61726b",
                 "HandlerType",
             ),
-            ("Current;Target:0;0;6d61726b::i", "modifiers"),
+            (
+                "Current;Target:0;0;616263!(64|65)666768::a",
+                "negated alternatives",
+            ),
+            ("Current;Engine:81-255,Target:0;0;6d61726b::x", "modifier"),
             ("Current;Target:0,FileSize:4-4;0;6d61726b", "Engine minimum"),
         ] {
             let error = load(&format!("{skipped}{rule}\n"))
