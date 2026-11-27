@@ -7,7 +7,10 @@ mod pe;
 mod zip;
 
 use client::{Daemon, stream_frame, unix_request};
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 const ANY: &str = "Engine:81-255,Target:0";
 const CREDIT: &str = "637265646974";
@@ -564,13 +567,25 @@ fn pcre(run: impl Fn(&str, &[(&[u8], Option<&str>)], &str) -> io::Result<()>) ->
 
 #[test]
 fn local_logical_signatures() -> io::Result<()> {
-    compare(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+    compare(&barnacle_binary(), false)
 }
 
 #[test]
 #[ignore = "requires pinned Debian clamd"]
 fn stock_logical_signatures() -> io::Result<()> {
-    compare(Path::new("/usr/sbin/clamd"), true)
+    compare(&reference_clamd(), true)
+}
+
+fn barnacle_binary() -> PathBuf {
+    std::env::var_os("BARNACLE_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_barnacle").into())
+        .into()
+}
+
+fn reference_clamd() -> PathBuf {
+    std::env::var_os("BARNACLE_REFERENCE_CLAMD")
+        .unwrap_or_else(|| "/usr/sbin/clamd".into())
+        .into()
 }
 
 fn compare_handlers(executable: &Path, stock: bool) -> io::Result<()> {
@@ -700,18 +715,36 @@ fn compare_handlers(executable: &Path, stock: bool) -> io::Result<()> {
     let zip_rules = hint("ZIP", true) + &member;
     run(&zip_rules, "", &archive, Some("Member"))?;
     run(&zip_rules, "ScanArchive no\n", &archive, None)?;
+
+    let aliases = b"[aliases]\nreport=credit ledger\n";
+    let typed = logical(
+        "AliasParent",
+        "Engine:51-255,Target:5,Container:CL_TYPE_POSIX_TAR",
+        "0",
+        CREDIT,
+    );
+    let alias_rules = hint("GRAPHICS", true) + &typed;
+    run(&alias_rules, "", aliases, Some("AliasParent"))?;
+    run(
+        &alias_rules,
+        "ScanArchive no\n",
+        aliases,
+        Some("AliasParent"),
+    )?;
+    run(&alias_rules, "DisableCache yes\n", aliases, Some("Hint"))?;
+    let mut long_aliases = aliases.to_vec();
+    long_aliases.extend(b"; invoice report settings\n".repeat(40));
+    run(&alias_rules, "", &long_aliases, Some("AliasParent"))?;
     Ok(())
 }
 
 #[test]
 fn local_logical_handlers() -> io::Result<()> {
-    compare_handlers(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+    compare_handlers(&barnacle_binary(), false)
 }
 
 #[test]
 #[ignore = "requires pinned clamd 1.4.3"]
 fn stock_logical_handlers() -> io::Result<()> {
-    let reference =
-        std::env::var_os("BARNACLE_REFERENCE_CLAMD").unwrap_or_else(|| "/usr/sbin/clamd".into());
-    compare_handlers(Path::new(&reference), true)
+    compare_handlers(&reference_clamd(), true)
 }

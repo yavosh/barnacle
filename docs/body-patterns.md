@@ -78,6 +78,7 @@ The child retains the original type as a parent and counts against scan limits.
 When stock has no reference digest, including with `DisableCache yes`, it reports the handler's name.
 Stock also reports the handler's name when the digest matches the last handler's digest in the scan.
 If a limit denies the rescan, the raw logical pass ends. A later stage can still report a finding.
+For an aliases configuration in the ASCII text class, the rescan retains stock's `CL_TYPE_POSIX_TAR` parent type.
 
 PE logical rules can require `IconGroup1`, `IconGroup2`, or both.
 When a rule requires both groups, one `.idb` row must satisfy both conditions.

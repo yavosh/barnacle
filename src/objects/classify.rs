@@ -119,6 +119,10 @@ impl FileType {
             }
             return Ok(Self::generic(bytes, name, Parser::Archive));
         }
+        if bytes.starts_with(b"[aliases]") && text::file_type(bytes) == "CL_TYPE_TEXT_ASCII" {
+            // The pinned engine retains the POSIX TAR type for this legacy text header.
+            return Ok(Self::generic(bytes, "CL_TYPE_POSIX_TAR", Parser::Raw));
+        }
         if bytes.starts_with(b"{\\rt") {
             return Ok(Self::generic(bytes, "CL_TYPE_RTF", Parser::Rtf));
         }
