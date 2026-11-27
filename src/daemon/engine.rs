@@ -727,6 +727,10 @@ mod tests {
             "local.ndb",
             "MixedBody:0:*:6c6f63616c206d697865642067656e65726174696f6e\n",
         );
+        f.write(
+            "local.ldb",
+            "MixedLogical;Target:0;0;6c6f63616c206c6f676963616c20736e617073686f742072656365697074\n",
+        );
         let db = Generation::load(&f.config).unwrap();
         assert!(db.version().starts_with("ClamAV 1.4.3/28187/"));
         let local = hash_reader(&bytes[..])
@@ -742,6 +746,31 @@ mod tests {
                 .unwrap(),
             Some("MixedBody.UNOFFICIAL")
         );
+        // The pinned archives contain 312,303 eligible logical records.
+        assert_eq!(db.logical.rule_count(), 312_304);
+        assert_eq!(db.logical.icon_rule_count(), 222);
+        let logical_control = b"local logical snapshot receipt";
+        assert_eq!(
+            db.logical
+                .first_match_checked(
+                    logical_control,
+                    &ObjectContext::raw(logical_control),
+                    barnacle::body::LogicalObject {
+                        parents: &[],
+                        recursion_level: 0,
+                        file_size: logical_control.len(),
+                        unmapped_script: false,
+                        mapped_source_size: None,
+                    },
+                    || Ok(()),
+                )
+                .unwrap(),
+            Some("MixedLogical.UNOFFICIAL")
+        );
+        assert!(matches!(
+            db.scan_checked(&logical_control[..], || Ok(())).unwrap(),
+            ScanResult::Incomplete
+        ));
         assert!(db.scan(&bytes[..]).unwrap().is_none());
     }
 }

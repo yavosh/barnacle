@@ -19,6 +19,10 @@ struct Reference {
 }
 
 impl IconDatabase {
+    pub(super) fn rule_count(&self) -> usize {
+        self.rows.len()
+    }
+
     pub(super) fn load(
         paths: &[&Path],
         ignores: &IgnoreSet,

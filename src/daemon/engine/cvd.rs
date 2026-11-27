@@ -67,7 +67,19 @@ pub(super) fn extract(
             || path.components().count() != 1
             || !matches!(
                 path.extension().and_then(|s| s.to_str()),
-                Some("hdb" | "hsb" | "ndb" | "ign" | "ign2" | "fp" | "sfp" | "hdu" | "hsu")
+                Some(
+                    "hdb"
+                        | "hsb"
+                        | "ndb"
+                        | "ldb"
+                        | "idb"
+                        | "ign"
+                        | "ign2"
+                        | "fp"
+                        | "sfp"
+                        | "hdu"
+                        | "hsu"
+                )
             )
         {
             continue;

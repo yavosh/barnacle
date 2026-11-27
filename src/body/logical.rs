@@ -248,6 +248,16 @@ impl LogicalIndex {
         self.records.is_empty()
     }
 
+    /// Count logical records after functionality level and ignore filtering.
+    pub fn rule_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Count icon signatures in the active icon table.
+    pub fn icon_rule_count(&self) -> usize {
+        self.icons.rule_count()
+    }
+
     pub fn needs_normalized_script(&self) -> bool {
         self.records
             .iter()

@@ -150,7 +150,12 @@ The test preserved offsets, triggers, and sibling patterns and replaced the rule
 The feed includes generic, executable, document, graphics, mail, and normalized text targets.
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
-An offline run compiled all 312,303 eligible logical records in one index and loaded the 222 pinned icon records.
+The generation loader verifies the pinned CVD digests before reading the logical and icon members.
+The verified snapshot test loads all 312,303 eligible logical records and 222 icon records into one generation.
+The loaded logical index and pinned clamd both name the local control `MixedLogical.UNOFFICIAL`.
+
+One Linux ARM64 run with one CPU, 2 GiB RAM, and no swap measured 599 MiB at readiness and 718 MiB peak during startup.
+A serial reload peaked at 1,231 MiB. The cgroup measurements include file-backed pages.
 
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
 
