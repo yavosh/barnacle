@@ -21,7 +21,11 @@ pub(super) fn hash(
     };
     if !matches!(
         format,
-        ImageFormat::Gif | ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Tiff
+        ImageFormat::Bmp
+            | ImageFormat::Gif
+            | ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::Tiff
     ) {
         return Ok(None);
     }

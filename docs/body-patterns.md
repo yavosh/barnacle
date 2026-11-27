@@ -100,7 +100,7 @@ Patterns support single-arm groups and trailing empty arms after preceding atoms
 Byte comparisons read binary integers or numeric text at a signed offset from a matched body pattern.
 They use the latest match offset and run at the end of each scan window, before PCRE.
 
-Image fuzzy rules compare an eight-byte hash for PNG, JPEG, GIF, and TIFF.
+Image fuzzy rules compare an eight-byte hash for BMP, GIF, JPEG, PNG, and TIFF.
 Barnacle computes the hash once for each eligible image and uses exact matches.
 Both `ScanImage` and `ScanImageFuzzyHash` must be enabled.
 A fuzzy hash can trigger PCRE. The two options default to enabled.

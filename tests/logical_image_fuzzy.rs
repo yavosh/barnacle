@@ -84,6 +84,12 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
     let jpg = encode(&mosaic, ImageFormat::Jpeg)?;
     let gif = encode(&mosaic, ImageFormat::Gif)?;
     let tiff = encode(&mosaic, ImageFormat::Tiff)?;
+    let bmp = encode(&mosaic, ImageFormat::Bmp)?;
+    let bmp_rgba = encode(
+        &DynamicImage::ImageRgba8(mosaic.to_rgba8()),
+        ImageFormat::Bmp,
+    )?;
+    let gray_bmp = encode(&DynamicImage::new_rgb8(32, 32), ImageFormat::Bmp)?;
     let gray = encode(&DynamicImage::new_luma8(32, 32), ImageFormat::Png)?;
     let rule = format!("fuzzy_img#{HASH}#0");
     run(
@@ -96,10 +102,19 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
             (&jpg, true),
             (&gif, true),
             (&tiff, true),
+            (&bmp, true),
+            (&bmp_rgba, true),
+            (&gray_bmp, false),
             (&gray, false),
         ],
     )?;
-    run("5", "0&1", &format!("{rule};{rule}"), "", &[(&png, true)])?;
+    run(
+        "5",
+        "0&1",
+        &format!("{rule};{rule}"),
+        "",
+        &[(&png, true), (&bmp, true)],
+    )?;
     run(
         "0",
         "1",
@@ -107,15 +122,33 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         "",
         &[(&png, true), (&jpg, false)],
     )?;
-    run("0", "0", &rule, "ScanImageFuzzyHash no\n", &[(&png, false)])?;
-    run("0", "0", &rule, "ScanImage no\n", &[(&png, false)])?;
+    run(
+        "0",
+        "0",
+        &rule,
+        "ScanImageFuzzyHash no\n",
+        &[(&png, false), (&bmp, false)],
+    )?;
+    run(
+        "0",
+        "0",
+        &rule,
+        "ScanImage no\n",
+        &[(&png, false), (&bmp, false)],
+    )?;
     let archive = zip::zip(&[("tile.png", &png)], true, false, false)?;
+    let bmp_archive = zip::zip(&[("tile.bmp", &bmp)], true, false, false)?;
     run(
         "0,Container:CL_TYPE_ZIP",
         "0",
         &rule,
         "",
-        &[(&png, false), (&archive, true)],
+        &[
+            (&png, false),
+            (&archive, true),
+            (&bmp, false),
+            (&bmp_archive, true),
+        ],
     )?;
     run(
         "0",

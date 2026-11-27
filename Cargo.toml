@@ -35,7 +35,7 @@ aes = "=0.9.4"
 cbc = "=0.2.1"
 lopdf = { version = "=0.47.0", default-features = false }
 pcre2-sys = "=0.2.10"
-image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "tiff"] }
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff"] }
 rustdct = "=0.7.1"
 
 [dev-dependencies]
