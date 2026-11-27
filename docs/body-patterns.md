@@ -117,3 +117,21 @@ The feed includes generic, executable, document, graphics, mail, and normalized 
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
+
+### Local benchmark
+
+One Linux ARM64 CPU, 2 GiB, four INSTREAM clients, and the cache disabled.
+Each of three runs issued 16,384 scans against a 64 KiB fixture and 1,025 local rules.
+All replies named the same expected signature. The table shows medians from `59d09eb` and Debian clamd `1.4.3+dfsg-1`.
+
+| Rules | Scanner | Scans/s | p95 | Peak cgroup memory |
+| --- | --- | ---: | ---: | ---: |
+| Exact body | Barnacle | 48,567 | 0.136 ms | 4.52 MiB |
+| Exact body | Stock clamd | 5,486 | 1.464 ms | 6.68 MiB |
+| Case-insensitive logical | Barnacle | 46,307 | 0.145 ms | 3.95 MiB |
+| Case-insensitive logical | Stock clamd | 3,387 | 2.471 ms | 11.63 MiB |
+| Triggered PCRE | Barnacle | 45,580 | 0.150 ms | 4.59 MiB |
+| Triggered PCRE | Stock clamd | 2,984 | 2.867 ms | 11.75 MiB |
+
+The exact-body build before modifiers (`89e7140`) reached 48,631 scans/s at 0.137 ms p95.
+Full-feed memory and throughput remain unverified for logical rules. [Raw results](benchmarks/logical-local.csv)
