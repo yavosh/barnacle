@@ -249,6 +249,10 @@ pub(super) fn after_raw(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Ha
     if !plain(bytes) || parser(bytes).is_some() {
         return Ok(Handling::Unrecognized);
     }
+    script(bytes, sink)
+}
+
+pub(super) fn script(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     Ok(
         if bytes.len() as u64 <= sink.text_limits().2 && sink.script_view(bytes)? {
             Handling::Stopped

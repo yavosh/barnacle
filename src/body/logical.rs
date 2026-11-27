@@ -36,6 +36,21 @@ struct Conditions {
     attributes: Option<Box<ObjectConditions>>,
 }
 
+/// File types that a logical signature may request for a child scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandlerType {
+    Graphics,
+    Pdf,
+    Script,
+    Zip,
+}
+
+/// Eligible type changes in scan order, followed by the first ordinary finding.
+pub struct LogicalMatches<'a> {
+    pub handlers: Vec<(&'a str, HandlerType)>,
+    pub finding: Option<&'a str>,
+}
+
 #[derive(Default)]
 struct ObjectConditions {
     container: Option<&'static str>,
@@ -43,6 +58,7 @@ struct ObjectConditions {
     size: Option<RangeInclusive<u32>>,
     entry_point: Option<RangeInclusive<u32>>,
     sections: Option<RangeInclusive<u32>>,
+    handler: Option<HandlerType>,
 }
 
 impl ObjectConditions {
@@ -225,14 +241,28 @@ impl LogicalIndex {
             .any(|r| r.target == Target::Ascii && r.offset.is_relative())
     }
 
-    /// Return the first eligible logical signature for this object.
+    /// Return the first eligible logical signature without a reference digest.
     pub fn first_match_checked(
         &self,
         bytes: &[u8],
         context: &ObjectContext,
         object: LogicalObject<'_>,
-        mut check: impl FnMut() -> io::Result<()>,
+        check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
+        Ok(self
+            .matches_checked(bytes, context, object, false, check)?
+            .finding)
+    }
+
+    /// Evaluate logical signatures and retain handler actions when rescans are enabled.
+    pub fn matches_checked(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: LogicalObject<'_>,
+        rescan: bool,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<LogicalMatches<'_>> {
         let mut evidence: HashMap<u32, Evidence> = HashMap::new();
         self.search.run_events(
             &self.children,
@@ -319,8 +349,14 @@ impl LogicalIndex {
             }
         }
         self.scan_regexes(bytes, context, &object, &mut evidence, &mut check)?;
-        let first = self.evaluate(context, &object, &evidence, &mut check)?;
-        if first.is_none()
+        let mut matches = self.evaluate(
+            context,
+            &object,
+            &evidence,
+            rescan && !object.unmapped_script,
+            &mut check,
+        )?;
+        if matches.finding.is_none()
             && let Some(size) = object.mapped_source_size
         {
             // cli_scanscript restores the source map after scanning the mapped view,
@@ -330,9 +366,11 @@ impl LogicalIndex {
                 recursion_level: object.recursion_level.saturating_sub(1),
                 ..object
             };
-            return self.evaluate(context, &restored, &HashMap::new(), &mut check);
+            matches.finding = self
+                .evaluate(context, &restored, &HashMap::new(), false, &mut check)?
+                .finding;
         }
-        Ok(first)
+        Ok(matches)
     }
 
     fn scan_regexes(
@@ -390,12 +428,14 @@ impl LogicalIndex {
         context: &ObjectContext,
         object: &LogicalObject<'_>,
         evidence: &HashMap<u32, Evidence>,
+        rescan: bool,
         check: &mut impl FnMut() -> io::Result<()>,
-    ) -> io::Result<Option<&str>> {
+    ) -> io::Result<LogicalMatches<'_>> {
         // Each target's logical table is evaluated in load order after scanning.
         // The specific target precedes generic. Only touched records and those
         // known to pass with all-zero counts can win.
         let mut winner = None;
+        let mut handlers = Vec::new();
         let candidates = evidence.iter().map(|(&id, e)| (id, Some(e))).chain(
             self.zero_matches
                 .iter()
@@ -415,10 +455,26 @@ impl LogicalIndex {
                 continue;
             }
             if e.is_none_or(|e| self.expressions[rule.expression].matches(&e.counts)) {
-                winner = Some(key);
+                if rescan
+                    && let Some(handler) =
+                        rule.conditions.attributes.as_ref().and_then(|a| a.handler)
+                {
+                    handlers.push((key, handler));
+                } else {
+                    winner = Some(key);
+                }
             }
         }
-        Ok(winner.map(|(_, id)| self.records[id as usize].name.as_ref()))
+        handlers.retain(|(key, _)| winner.is_none_or(|earlier| *key < earlier));
+        handlers.sort_unstable_by_key(|&(key, _)| key);
+        let name = |id: u32| self.records[id as usize].name.as_ref();
+        Ok(LogicalMatches {
+            handlers: handlers
+                .into_iter()
+                .map(|((_, id), handler)| (name(id), handler))
+                .collect(),
+            finding: winner.map(|(_, id)| name(id)),
+        })
     }
 }
 
@@ -557,6 +613,7 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
     let mut file = ObjectConditions::default();
     let mut container = None;
     let mut intermediates = None;
+    let mut handler = None;
     for (i, field) in title.split(',').enumerate() {
         let (key, value) = field
             .split_once(':')
@@ -573,13 +630,17 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
             "NumberOfSections" => file.sections = Some(range(value)?),
             "Container" => container = Some(value),
             "Intermediates" => intermediates = Some(value),
+            "HandlerType" => handler = Some(value),
             _ if engine.as_ref().is_some_and(|r| !r.contains(&flevel)) => return Ok(None),
             _ => return Err(invalid(format!("unsupported logical target field {key}"))),
         }
     }
     let executable = file.entry_point.is_some() || file.sections.is_some();
-    let constrained =
-        file.size.is_some() || executable || container.is_some() || intermediates.is_some();
+    let constrained = file.size.is_some()
+        || executable
+        || container.is_some()
+        || intermediates.is_some()
+        || handler.is_some();
     if constrained && engine.as_ref().is_none_or(|r| *r.start() < 51) {
         return Err(invalid(
             "logical target attributes require an Engine minimum of at least 51",
@@ -605,6 +666,14 @@ fn parse_title(title: &str, flevel: u32) -> io::Result<Option<Conditions>> {
     file.container = container
         .map(|value| file_type(value, "Container"))
         .transpose()?;
+    file.handler = match handler {
+        None => None,
+        Some("CL_TYPE_GRAPHICS") => Some(HandlerType::Graphics),
+        Some("CL_TYPE_PDF") => Some(HandlerType::Pdf),
+        Some("CL_TYPE_SCRIPT") => Some(HandlerType::Script),
+        Some("CL_TYPE_ZIP") => Some(HandlerType::Zip),
+        Some(value) => return Err(invalid(format!("unsupported HandlerType type {value}"))),
+    };
     if let Some(value) = intermediates {
         // The pinned parser reads at most 16 tokens from an Intermediates field.
         file.intermediates = value

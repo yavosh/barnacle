@@ -365,7 +365,7 @@ pub(in crate::objects) fn single(bytes: &[u8], sink: &mut dyn ChildSink) -> io::
     }
 }
 
-pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+pub(in crate::objects) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     if let Some(Directory {
         offset: directory_offset,
         count,

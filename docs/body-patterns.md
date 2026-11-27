@@ -72,6 +72,13 @@ Executable conditions use the parsed PE, ELF, or Mach-O layout. The entry point 
 Normalized layers count toward depth. Named types select non-normalized ancestors.
 `CL_TYPE_ANY` adds one required level. Named types consume one visible ancestor each.
 
+Barnacle supports the pinned feed's graphics, PDF, script, and ZIP `HandlerType` rules.
+A matching handler can scan the same bytes as a typed child before later logical rules run.
+The child retains the original type as a parent and counts against scan limits.
+When stock has no reference digest, including with `DisableCache yes`, it reports the handler's name.
+Stock also reports the handler's name when the digest matches the last handler's digest in the scan.
+If a limit denies the rescan, the raw logical pass ends. A later stage can still report a finding.
+
 The `VI` offset matches the start of a Unicode key in a PE version resource.
 Body patterns check each part at a key offset. The PCRE matcher uses the entire executable subject.
 
@@ -135,13 +142,12 @@ The test preserved offsets, triggers, and sibling patterns and replaced the rule
 The feed includes generic, executable, document, graphics, mail, and normalized text targets.
 Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
 Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
-A batch compile accepted 312,212 of 312,303 eligible records. The table counts the first rejection per record.
+A batch compile accepted 312,223 of 312,303 eligible records. The table counts the first rejection per record.
 
 | First rejection | Records |
 | --- | ---: |
 | `IconGroup1` | 52 |
 | `IconGroup2` | 28 |
-| `HandlerType` | 11 |
 
 Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
 

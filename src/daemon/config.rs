@@ -24,6 +24,7 @@ pub(super) struct Config {
     pub objects: Options,
     pub pcre: PcreLimits,
     pub scan_image_fuzzy_hash: bool,
+    pub disable_cache: bool,
     pub max_scan_time: Duration,
     pub command_read_timeout: Duration,
     pub read_timeout: Duration,
@@ -73,6 +74,7 @@ impl Default for Config {
             objects: Options::default(),
             pcre: PcreLimits::default(),
             scan_image_fuzzy_hash: true,
+            disable_cache: false,
             max_scan_time: Duration::ZERO,
             command_read_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(120),
@@ -237,9 +239,7 @@ impl Config {
                     return Err(invalid(format!("unsupported option {key}")));
                 }
             }
-            "DisableCache" => {
-                boolean(value)?;
-            } // Every scan runs against its pinned generation.
+            "DisableCache" => self.disable_cache = boolean(value)?,
             "Example" => {
                 return Err(invalid(
                     "edit the example configuration before starting clamd",

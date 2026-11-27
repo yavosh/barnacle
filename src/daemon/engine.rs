@@ -175,6 +175,7 @@ pub(super) struct Generation {
     version: String,
     scan_limit: u64,
     objects: Options,
+    disable_cache: bool,
     scan_time: Duration,
     partial_only: bool,
     needs_hashes: bool,
@@ -305,6 +306,7 @@ impl Generation {
             temporary_directory: config.temporary_directory.clone(),
             scan_limit,
             objects,
+            disable_cache: config.disable_cache,
             scan_time: config.max_scan_time,
             partial_only,
             needs_hashes,
@@ -413,15 +415,26 @@ impl Generation {
                             return Ok(Verdict::Found(name));
                         }
                     }
-                    if let Some(name) = self.logical.first_match_checked(
+                    let matches = self.logical.matches_checked(
                         obj.bytes,
                         obj.context,
                         obj.logical,
+                        !self.disable_cache && obj.logical_rescan,
                         &mut *check,
-                    )? {
-                        return Ok(Verdict::Found(name.to_owned()));
+                    )?;
+                    if !matches.handlers.is_empty() {
+                        return Ok(Verdict::Handlers {
+                            rules: matches
+                                .handlers
+                                .into_iter()
+                                .map(|(name, kind)| (name.to_owned(), kind))
+                                .collect(),
+                            finding: matches.finding.map(str::to_owned),
+                        });
                     }
-                    Ok(Verdict::Miss)
+                    Ok(matches
+                        .finding
+                        .map_or(Verdict::Miss, |name| Verdict::Found(name.to_owned())))
                 },
                 || {
                     (input.check)()?;
@@ -438,7 +451,9 @@ impl Generation {
         }
         Ok(match verdict? {
             Verdict::Found(name) => ScanResult::Found(Detection { name, hashes }),
-            Verdict::Incomplete | Verdict::Miss => ScanResult::Incomplete,
+            Verdict::Incomplete | Verdict::Miss | Verdict::Handlers { .. } => {
+                ScanResult::Incomplete
+            }
             Verdict::Skipped => ScanResult::Skipped,
         })
     }

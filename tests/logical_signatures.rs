@@ -572,3 +572,146 @@ fn local_logical_signatures() -> io::Result<()> {
 fn stock_logical_signatures() -> io::Result<()> {
     compare(Path::new("/usr/sbin/clamd"), true)
 }
+
+fn compare_handlers(executable: &Path, stock: bool) -> io::Result<()> {
+    let temporary = tempfile::tempdir_in("/tmp")?;
+    let db = temporary.path().join("db");
+    let socket = temporary.path().join("socket");
+    let config = temporary.path().join("clamd.conf");
+    fs::create_dir(&db)?;
+    let run = |rules: &str, options: &str, bytes: &[u8], winner: Option<&str>| {
+        fs::write(db.join("local.ldb"), rules)?;
+        fs::write(
+            &config,
+            format!(
+                "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nSelfCheck 0\n{options}",
+                db.display(),
+                socket.display()
+            ),
+        )?;
+        let _daemon = Daemon::start(executable, &config, &socket)?;
+        let expected = match winner {
+            Some(name) if name.starts_with("Heuristics.") => format!("stream: {name} FOUND\0"),
+            Some(name) => format!("stream: Logic.{name}.UNOFFICIAL FOUND\0"),
+            None if stock => "stream: OK\0".into(),
+            None => "stream: Incomplete scan: unsupported detection coverage. ERROR\0".into(),
+        };
+        assert_eq!(
+            unix_request(&socket, &stream_frame(bytes)?)?,
+            expected,
+            "{rules:?} with {options:?} on {} bytes",
+            bytes.len()
+        );
+        io::Result::Ok(())
+    };
+    let hint = |kind: &str, root: bool| {
+        let scope = if root { ",Container:CL_TYPE_ANY" } else { "" };
+        logical(
+            "Hint",
+            &format!("Engine:51-255,Target:0,HandlerType:CL_TYPE_{kind}{scope}"),
+            "0",
+            CREDIT,
+        )
+    };
+    let ordinary = logical("Ordinary", ANY, "0", CREDIT);
+    for (kind, target, parser_off) in [
+        ("PDF", 10, "ScanPDF no\n"),
+        ("GRAPHICS", 5, "ScanImage no\n"),
+    ] {
+        let typed = logical(
+            "Typed",
+            &format!("Engine:51-255,Target:{target},Container:CL_TYPE_TEXT_ASCII"),
+            "0",
+            CREDIT,
+        );
+        let rules = typed.clone() + &hint(kind, true) + &ordinary;
+        run(&rules, "", NOTE, Some("Typed"))?;
+        run(&rules, "DisableCache yes\n", NOTE, Some("Hint"))?;
+        run(&rules, parser_off, NOTE, Some("Typed"))?;
+        run(
+            &(typed.clone() + &ordinary + &hint(kind, true)),
+            "",
+            NOTE,
+            Some("Ordinary"),
+        )?;
+        let bounded = typed + &hint(kind, true);
+        run(&bounded, "MaxRecursion 1\nScanHTML no\n", NOTE, None)?;
+        run(&bounded, "MaxRecursion 1\n", NOTE, Some("Hint"))?;
+    }
+    run(&hint("GRAPHICS", true), "ScanHTML no\n", NOTE, None)?;
+    run(&hint("GRAPHICS", false), "", NOTE, Some("Hint"))?;
+    let binary = b"\0\x01\0\x02 ordinary credit ledger\x01";
+    let binary_hint = hint("GRAPHICS", true);
+    run(&binary_hint, "", binary, Some("Hint"))?;
+    let other = logical("Other", "Engine:51-255,Target:14", "0", CREDIT);
+    run(&(binary_hint + &other), "", binary, Some("Other"))?;
+    let first = hint("GRAPHICS", true);
+    let second = first.replacen("Logic.Hint", "Logic.Second", 1);
+    run(&(first.clone() + &second), "", NOTE, Some("Second"))?;
+    let blocked = first + &second + &ordinary;
+    for (limit, value) in [
+        ("MaxRecursion", 1),
+        ("MaxFiles", 1),
+        ("MaxScanSize", NOTE.len()),
+    ] {
+        run(
+            &blocked,
+            &format!("{limit} {value}\nScanHTML no\n"),
+            NOTE,
+            None,
+        )?;
+        run(
+            &blocked,
+            &format!("{limit} {value}\nScanHTML no\nAlertExceedsMax yes\n"),
+            NOTE,
+            Some(&format!("Heuristics.Limits.Exceeded.{limit}")),
+        )?;
+    }
+    run(
+        &blocked,
+        "MaxRecursion 1\nAlertExceedsMax yes\n",
+        NOTE,
+        Some("Hint"),
+    )?;
+
+    let source = b"ordinary credit RECEIPTLEDGER note";
+    let script = logical(
+        "Normalized",
+        "Engine:51-255,Target:7,Container:CL_TYPE_TEXT_ASCII",
+        "0",
+        "726563656970746c6564676572",
+    );
+    let script_rules = hint("SCRIPT", true) + &script;
+    run(&script_rules, "ScanHTML no\n", source, Some("Normalized"))?;
+    run(
+        &script_rules,
+        "ScanHTML no\nDisableCache yes\n",
+        source,
+        Some("Hint"),
+    )?;
+
+    let archive = zip::zip(&[("credit.txt", b"receipt ledger")], true, false, false)?;
+    let member = logical(
+        "Member",
+        "Engine:51-255,Target:0,Intermediates:CL_TYPE_ZIP>CL_TYPE_ZIP",
+        "0",
+        LEDGER,
+    );
+    let zip_rules = hint("ZIP", true) + &member;
+    run(&zip_rules, "", &archive, Some("Member"))?;
+    run(&zip_rules, "ScanArchive no\n", &archive, None)?;
+    Ok(())
+}
+
+#[test]
+fn local_logical_handlers() -> io::Result<()> {
+    compare_handlers(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+#[ignore = "requires pinned clamd 1.4.3"]
+fn stock_logical_handlers() -> io::Result<()> {
+    let reference =
+        std::env::var_os("BARNACLE_REFERENCE_CLAMD").unwrap_or_else(|| "/usr/sbin/clamd".into());
+    compare_handlers(Path::new(&reference), true)
+}

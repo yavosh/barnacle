@@ -17,7 +17,7 @@ mod pattern;
 mod pcre;
 mod search;
 mod target;
-pub use logical::{LogicalIndex, LogicalObject};
+pub use logical::{HandlerType, LogicalIndex, LogicalMatches, LogicalObject};
 pub use logical_pcre::PcreLimits;
 pub use target::{ObjectContext, Offset, Target};
 
