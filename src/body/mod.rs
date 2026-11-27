@@ -8,9 +8,12 @@ use crate::IgnoreSet;
 use pattern::Pattern;
 use search::SearchIndex;
 
+mod logic_expression;
+mod logical;
 mod pattern;
 mod search;
 mod target;
+pub use logical::{LogicalIndex, LogicalObject};
 pub use target::{ObjectContext, Offset, Target};
 
 const FILEBUFF: usize = 8192;

@@ -3,7 +3,7 @@ mod cvd;
 mod raw;
 
 use super::Config;
-use barnacle::body::BodyIndex;
+use barnacle::body::{BodyIndex, LogicalIndex};
 use barnacle::index::{self, Index};
 use barnacle::objects::{self, Limit, Options, Snapshot, Verdict};
 use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
@@ -170,6 +170,7 @@ pub(super) struct Generation {
     sources: Vec<Source>,
     index: Index,
     body: BodyIndex,
+    logical: LogicalIndex,
     temporary_directory: PathBuf,
     version: String,
     scan_limit: u64,
@@ -239,7 +240,7 @@ impl Generation {
             match ext.as_str() {
                 "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
-                "hdb" | "hsb" | "ndb" | "ndu" | "ign" | "ign2" | "fp" | "sfp" => {
+                "hdb" | "hsb" | "ndb" | "ndu" | "ldb" | "ldu" | "ign" | "ign2" | "fp" | "sfp" => {
                     let output =
                         local_dir.join(path.file_name().expect("directory entry has a name"));
                     source.copy_to(&output)?;
@@ -248,15 +249,23 @@ impl Generation {
                 _ => return Err(invalid(format!("unsupported database: {}", path.display()))),
             }
         }
-        let (body_paths, hash_paths): (Vec<_>, Vec<_>) = paths
-            .iter()
-            .map(|(p, official)| (p.as_path(), *official))
-            .partition(|(p, _)| matches!(extension(p).as_str(), "ndb" | "ndu"));
-        let (mut feed, ignores) = if hash_paths.is_empty() && !body_paths.is_empty() {
-            (Feed::default(), IgnoreSet::default())
-        } else {
-            Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
-        };
+        let mut body_paths = Vec::new();
+        let mut logical_paths = Vec::new();
+        let mut hash_paths = Vec::new();
+        for (path, official) in &paths {
+            let group = match extension(path).as_str() {
+                "ndb" | "ndu" => &mut body_paths,
+                "ldb" | "ldu" => &mut logical_paths,
+                _ => &mut hash_paths,
+            };
+            group.push((path.as_path(), *official));
+        }
+        let (mut feed, ignores) =
+            if hash_paths.is_empty() && (!body_paths.is_empty() || !logical_paths.is_empty()) {
+                (Feed::default(), IgnoreSet::default())
+            } else {
+                Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
+            };
         let partial_only = has_cvd || feed.inventory.iter().any(|i| i.outside_matcher > 0);
         let has_hash_rules = !feed.rules.is_empty();
         let needs_hashes = (!partial_only && has_hash_rules) || config.extended_detection_info;
@@ -264,13 +273,15 @@ impl Generation {
         index::build(&db, &mut feed.rules)?;
         drop(feed);
         let index = Index::open_pread(&db)?;
-        // Each body source is a private copy in this generation's temporary directory.
-        // Release its pages when parsing finishes, before building the search automata.
-        let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, |path| {
+        // Unlink each private rule source after opening it so its pages can be released.
+        let open_snapshot = |path: &Path| {
             let file = File::open(path)?;
             fs::remove_file(path)?;
             Ok(file)
-        })?;
+        };
+        let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
+        let logical =
+            LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }
@@ -280,12 +291,15 @@ impl Generation {
             .min()
             .unwrap_or(u64::MAX);
         let mut objects = config.objects.clone();
-        objects.scan_normalized_script = body.needs_normalized_script();
-        objects.map_normalized_script = body.needs_normalized_script_map();
+        objects.scan_normalized_script =
+            body.needs_normalized_script() || logical.needs_normalized_script();
+        objects.map_normalized_script =
+            body.needs_normalized_script_map() || logical.needs_normalized_script_map();
         Ok(Self {
             sources: inputs,
             index,
             body,
+            logical,
             temporary_directory: config.temporary_directory.clone(),
             scan_limit,
             objects,
@@ -396,6 +410,14 @@ impl Generation {
                         if let Some(name) = found {
                             return Ok(Verdict::Found(name));
                         }
+                    }
+                    if let Some(name) = self.logical.first_match_checked(
+                        obj.bytes,
+                        obj.context,
+                        obj.logical,
+                        &mut *check,
+                    )? {
+                        return Ok(Verdict::Found(name.to_owned()));
                     }
                     Ok(Verdict::Miss)
                 },

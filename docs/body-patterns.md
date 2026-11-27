@@ -60,3 +60,27 @@ BARNACLE_CVD_DIR="$snapshot_dir" cargo test --release --locked --all-targets -- 
 
 The matcher uses the ClamAV body pattern and extended offset formats.
 [Body signature format](https://docs.clamav.net/manual/Signatures/BodySignatureFormat.html) · [Extended signatures](https://docs.clamav.net/manual/Signatures/ExtendedSignatures.html)
+
+## Local logical signatures
+
+Local `.ldb` rules can combine extended patterns with Boolean expressions, occurrence counts, and distinct subsignature counts.
+The loader applies functionality levels and ignore rules. Supported target attributes include `Target`, `FileSize`, and `Container`.
+`Container:CL_TYPE_ANY` selects root objects. A named container selects children with that parent type.
+
+On the tested raw objects, stock tries extended body rules, whole-file hashes, and then logical rules.
+A target-specific logical rule wins over a generic rule. Within the selected target, the first matching record wins.
+Logical rules receive each new object's context, including extracted children and normalized views.
+In an unmapped script view, absolute offsets use normalized bytes and `FileSize` uses the source length.
+Mapped script views use the normalized length and inherit the source's container.
+
+The Rust tests compare exact named results on local rules with pinned Debian clamd 1.4.3+dfsg-1.
+They cover overlap, duplicate subsignatures, count limits, compressed ZIP contents, normalized text, and competing matches.
+
+```sh
+cargo test --locked --test logical_signatures -- --include-ignored
+```
+
+Stock loads 312,303 logical records from `main.ldb` and `daily.ldb` with PUA disabled and the pinned ignore lists.
+Of these, 1,186 use PCRE subsignatures, and 3,724 use group count expressions.
+Local records using PCRE, subsignature modifiers, or other unsupported attributes fail generation loading with a source location.
+Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)

@@ -1,5 +1,5 @@
 //! Object traversal for one scan against one immutable database generation.
-use crate::body::{ObjectContext, Target};
+use crate::body::{LogicalObject, ObjectContext, Target};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -167,6 +167,7 @@ pub struct Object<'a> {
     pub layer: &'a Layer,
     pub normalized: bool,
     pub body_only: bool,
+    pub logical: LogicalObject<'a>,
     pub handled_format: bool,
 }
 
@@ -403,6 +404,12 @@ impl Traversal<'_> {
                 parents,
                 normalized: matches!(kind, InputKind::Normalized(_)),
                 body_only: false,
+                logical: LogicalObject {
+                    parent: parents.last().map(|p| p.file_type),
+                    file_size: bytes.len(),
+                    unmapped_script: false,
+                    mapped_source_size: None,
+                },
                 handled_format: handling == Handling::Complete,
             };
             let verdict = (self.matcher)(object, self.check)?;
@@ -544,6 +551,12 @@ impl ChildSink for Traversal<'_> {
             layer: &layer,
             normalized: false,
             body_only: false,
+            logical: LogicalObject {
+                parent: self.parents.last().map(|p| p.file_type),
+                file_size: bytes.len(),
+                unmapped_script: false,
+                mapped_source_size: None,
+            },
             handled_format: true,
         };
         let verdict = (self.matcher)(object, self.check)?;
@@ -736,6 +749,12 @@ impl ChildSink for Traversal<'_> {
             parents: if mapped { &self.parents } else { parents },
             normalized: true,
             body_only: !mapped,
+            logical: LogicalObject {
+                parent: parents.last().map(|p| p.file_type),
+                file_size: if mapped { bytes.len() } else { owner.size },
+                unmapped_script: !mapped,
+                mapped_source_size: mapped.then_some(owner.size),
+            },
             handled_format: true,
         };
         let verdict = (self.matcher)(object, self.check)?;
