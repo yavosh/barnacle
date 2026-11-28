@@ -1300,3 +1300,81 @@ fn stock_bytecode_write() -> io::Result<()> {
     verify_stock()?;
     compare_bytecode_write(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }
+
+fn compare_environment(executable: &Path, miss: &str) -> io::Result<()> {
+    let mut probes = vec![
+        (0, 0, 0xa5, false),
+        (485, 485, 0xa5, false),
+        (486, 486, 0xa5, false),
+        (492, 492, 0xa5, false),
+        (493, 0, 0xa5, false),
+        (493, 485, 0xa5, false),
+        (492, 484, 0x37, true),
+    ];
+    let arch = if cfg!(target_arch = "x86_64") {
+        Some(2)
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(arch) = arch {
+        probes.extend([(486, 485, arch, false), (492, 485, arch, false)]);
+    }
+    for (len, offset, expected, overwrite) in probes {
+        run_program(
+            executable,
+            &scalar::environment(len, offset, expected, overwrite),
+            "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n",
+            &[(b"ordinary receipt for office supplies", true)],
+            miss,
+        )?;
+    }
+    for debug in [false, true] {
+        let flag = if debug { "yes" } else { "no" };
+        run_program(
+            executable,
+            &scalar::environment_diagnostics(debug),
+            &format!("BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\nDebug {flag}\n"),
+            &[(b"receipt for office supplies", true)],
+            miss,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn barnacle_bytecode_environment() -> io::Result<()> {
+    compare_environment(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)?;
+    for (program, debug) in [
+        (scalar::environment(492, 484, 0, false), false),
+        // With debug enabled, the final nonl call reads the complete two-byte span.
+        (scalar::environment_diagnostics(false), true),
+    ] {
+        let compiled = barnacle::bytecode::Program::compile(
+            program.as_bytes(),
+            u64::from(barnacle::PINNED_FLEVEL),
+        )?
+        .unwrap();
+        let error = compiled
+            .run(
+                b"receipt",
+                &[0; 64],
+                &[1],
+                debug,
+                std::time::Duration::from_secs(1),
+                || Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("environment field"));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_bytecode_environment() -> io::Result<()> {
+    verify_stock()?;
+    compare_environment(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}

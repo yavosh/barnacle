@@ -16,12 +16,16 @@ const RUNTIME_ERROR: u64 = 42;
 const DEBUG_START: u64 = 54;
 const DEBUG_BYTES: u64 = 55;
 pub(super) const MATCH_ICON: u64 = 89;
+pub(super) const GET_ENVIRONMENT: u64 = 72;
+const ENVIRONMENT_SIZE: usize = 492;
+const ARCH_OFFSET: usize = 485;
 const NUMBER_WINDOW: usize = 16;
 const POLL_BYTES: usize = 256 * 1024;
 
 pub(super) fn declaration(id: u64) -> Option<(&'static [u8], &'static [u64])> {
     Some(match id {
         WRITE => (b"write\0", &[I32, BYTE_POINTER, I32]),
+        GET_ENVIRONMENT => (b"get_environment\0", &[]),
         DEBUG_STRING => (b"debug_print_str\0", &[I32, BYTE_POINTER, I32]),
         DEBUG_UINT => (b"debug_print_uint\0", &[I32, I32]),
         MATCH_ICON => (b"matchicon\0", &[I32, BYTE_POINTER, I32, BYTE_POINTER, I32]),
@@ -35,6 +39,18 @@ pub(super) fn declaration(id: u64) -> Option<(&'static [u8], &'static [u64])> {
 }
 
 pub(super) const DISASM: u64 = 8;
+
+pub(super) fn environment_prototype(args: &[u64], types: &[Type]) -> bool {
+    let [I32, dest, I32] = *args else {
+        return false;
+    };
+    let Some(Type::Pointer(record)) = user_type(types, dest) else {
+        return false;
+    };
+    matches!(user_type(types, *record), Some(Type::Struct { packed: false, fields })
+        if fields.len() == 23 && fields[..7] == [I32; 7] && fields[14..] == [8; 9]
+        && fields[7..14].iter().all(|id| matches!(user_type(types, *id), Some(Type::Bytes(65)))))
+}
 
 pub(super) fn disasm_prototype(args: &[u64], types: &[Type]) -> bool {
     let [I32, dest, I32] = *args else {
@@ -107,6 +123,7 @@ impl PeField {
 #[derive(Debug)]
 pub(super) enum Operation {
     Disasm(Address),
+    Environment(Address, Value),
     Number(Value),
     Write(Address, Value),
     PeField(PeField),
@@ -134,6 +151,10 @@ pub(super) fn decode(
         }
         (WRITE, 2) => Operation::Write(
             Address::decode(line, slots, globals, false)?,
+            line.scalar(slots, Width::WORD)?,
+        ),
+        (GET_ENVIRONMENT, 2) => Operation::Environment(
+            Address::decode(line, slots, globals, true)?,
             line.scalar(slots, Width::WORD)?,
         ),
         (READ_NUMBER, 1) => Operation::Number(line.scalar(slots, Width::WORD)?),
@@ -175,6 +196,32 @@ impl Operation {
         check: &mut impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<u64>> {
         let result = match self {
+            Self::Environment(dest, length) => {
+                let len = length.get(frame) as u32 as usize;
+                if memory::outcome(dest.check_host_span(frame, len))?.is_none() {
+                    return Ok(None);
+                }
+                if len > ENVIRONMENT_SIZE {
+                    return Ok(Some(u32::MAX.into()));
+                }
+                if len != 0 {
+                    memory::outcome(dest.mark_environment(frame, len))?;
+                    // Stock 1.4.3 maps amd64 to x86_64. Debian arm64 reports arch_unknown.
+                    let arch = if cfg!(target_arch = "x86_64") {
+                        Some(2)
+                    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                        Some(0)
+                    } else {
+                        None
+                    };
+                    if len > ARCH_OFFSET
+                        && let Some(arch) = arch
+                    {
+                        memory::outcome(dest.write_at(frame, ARCH_OFFSET, &[arch]))?;
+                    }
+                }
+                0
+            }
             Self::Write(address, length) => {
                 let length = length.get(frame) as u32;
                 if (length as i32) < 0 {
@@ -305,9 +352,9 @@ impl Operation {
             Self::DebugInt(_) => 0,
             Self::DebugText(address, len, mode) => {
                 let len = len.get(frame) as usize;
-                let Some(bytes) = memory::outcome(address.read(frame, len))? else {
+                if memory::outcome(address.check_host_span(frame, len))?.is_none() {
                     return Ok(None);
-                };
+                }
                 if len == 0 && !matches!(mode, TextMode::Line) {
                     return Ok(Some(u32::MAX.into()));
                 }
@@ -316,17 +363,24 @@ impl Operation {
                 }
                 let mut output = io::stderr().lock();
                 if matches!(mode, TextMode::Bytes) {
-                    return Ok(Some(output.write(bytes).unwrap_or(0) as u64));
-                }
-                let bytes = if matches!(mode, TextMode::Line) {
-                    let Some(available) = memory::outcome(address.remaining(frame))? else {
+                    let Some(bytes) = memory::outcome(address.read(frame, len))? else {
                         return Ok(None);
                     };
-                    let end = memchr::memchr(0, available)
-                        .ok_or_else(|| unsupported("unterminated diagnostic string"))?;
-                    &available[..end]
+                    return Ok(Some(output.write(bytes).unwrap_or(0) as u64));
+                }
+                let Some(known) = memory::outcome(address.remaining(frame))? else {
+                    return Ok(None);
+                };
+                let limit = if matches!(mode, TextMode::Start) {
+                    len
                 } else {
-                    &bytes[..memchr::memchr(0, bytes).unwrap_or(bytes.len())]
+                    usize::MAX
+                };
+                let known = &known[..known.len().min(limit)];
+                let bytes = match memchr::memchr(0, known) {
+                    Some(end) => &known[..end],
+                    None if known.len() == limit => known,
+                    None => return Err(unsupported("unterminated or unmodeled diagnostic string")),
                 };
                 let _ = output.write_all(b"barnacle: bytecode debug: ");
                 let _ = output.write_all(bytes);

@@ -1468,3 +1468,111 @@ pub fn pe_metadata(target: u8) -> String {
     )
     .replacen("Target:0;", &format!("Target:{target};"), 1)
 }
+
+pub fn environment(len: u32, offset: u32, expected: u8, overwrite: bool) -> String {
+    let mut probe = vec![
+        op(
+            0,
+            0,
+            40,
+            &[number(0), immediate(0xa5, 1), immediate(496, 8)],
+        ),
+        op(65, 7, 36, &[number(76), number(0), immediate(0, 4)]),
+        call(1, 72, &[number(7), immediate(u64::from(len), 4)]),
+        op(
+            65,
+            2,
+            35,
+            &[number(65), number(7), immediate(u64::from(offset), 4)],
+        ),
+    ];
+    if overwrite {
+        probe.push(op(8, 0, 38, &[immediate(0x37, 1), number(2)]));
+    }
+    let result = if len > 492 { u32::MAX } else { 0 };
+    probe.extend([
+        op(8, 3, 39, &[number(2)]),
+        op(
+            1,
+            4,
+            21,
+            &[number(32), number(1), immediate(u64::from(result), 4)],
+        ),
+        op(
+            1,
+            5,
+            21,
+            &[number(8), number(3), immediate(u64::from(expected), 1)],
+        ),
+        op(1, 4, 11, &[number(4), number(5)]),
+        branch(4, 1, 2),
+    ]);
+    environment_image(probe, &[])
+}
+
+pub fn environment_diagnostics(debug: bool) -> String {
+    // Byte zero is the known terminator. The next byte belongs to the environment.
+    let mut probe = vec![
+        op(65, 7, 36, &[number(76), number(0), immediate(0, 4)]),
+        call(1, 72, &[number(7), immediate(492, 4)]),
+        op(8, 0, 38, &[immediate(0, 1), number(7)]),
+    ];
+    let mut calls = vec![
+        (DEBUG_STRING, 2, 0),
+        (DEBUG_START, 2, 0),
+        (DEBUG_STRING, 0, 0),
+        (DEBUG_START, 0, u32::MAX),
+        (DEBUG_BYTES, 0, u32::MAX),
+    ];
+    if !debug {
+        calls.push((DEBUG_BYTES, 2, 0));
+    }
+    for (i, (id, len, result)) in calls.into_iter().enumerate() {
+        probe.push(call(1, id, &[number(7), immediate(len, 4)]));
+        probe.push(op(
+            1,
+            if i == 0 { 4 } else { 5 },
+            21,
+            &[number(32), number(1), immediate(u64::from(result), 4)],
+        ));
+        if i != 0 {
+            probe.push(op(1, 4, 11, &[number(4), number(5)]));
+        }
+    }
+    probe.push(branch(4, 1, 2));
+    environment_image(
+        probe,
+        &[
+            (DEBUG_STRING, 69, "debug_print_str"),
+            (DEBUG_START, 69, "debug_print_str_start"),
+            (DEBUG_BYTES, 69, "debug_print_str_nonl"),
+        ],
+    )
+}
+
+fn environment_image(probe: Vec<String>, diagnostics: &[(u64, u64, &str)]) -> String {
+    let mut record = fixed(3, 1) + &number(23);
+    for field in [32; 7].into_iter().chain([71; 7]).chain([8; 9]) {
+        record += &number(field);
+    }
+    let mut apis = vec![(SET_NAME, 69, "setvirusname")];
+    apis.extend_from_slice(diagnostics);
+    apis.push((72, 74, "get_environment"));
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(65, 8),
+            record,
+            fixed(5, 1) + &number(72),
+            callable(&[32, 73, 32]),
+            array(496, 8),
+            fixed(5, 1) + &number(75),
+        ],
+        &apis,
+        name_globals(0, 3, 70),
+        &[ADDRESSABLE | 75, 32, 65, 8, 1, 1, 32, 65],
+        &[probe, vec![report(6), ret()], vec![ret()]],
+    )
+}

@@ -98,6 +98,8 @@ struct Storage<'a> {
     slots: &'a [Slot],
     registers: Option<Vec<u64>>,
     bytes: Vec<u8>,
+    // Allocated only for frames containing a partial copy of cli_environment.
+    unknown_environment: Option<Box<[bool]>>,
 }
 
 impl<'a> Storage<'a> {
@@ -107,6 +109,7 @@ impl<'a> Storage<'a> {
             base,
             slots,
             registers: (!addressable).then(|| vec![0; slots.len()]),
+            unknown_environment: None,
             bytes: if addressable {
                 vec![0; slots.last().map_or(0, Slot::end)]
             } else {
@@ -120,6 +123,12 @@ impl<'a> Storage<'a> {
             .get(id.checked_sub(self.base)? as usize)
             .copied()
             .filter(|s| s.addressable)
+    }
+
+    fn mark_known(&mut self, range: Range<usize>) {
+        if let Some(mask) = &mut self.unknown_environment {
+            mask[range].fill(false);
+        }
     }
 
     // The compiler emits scalar reads and writes only for integer or pointer slots.
@@ -267,7 +276,15 @@ impl<'a> Frame<'a> {
             return Ok(&h.bytes[range]);
         }
         let (storage, slot) = self.stack_object(id)?;
-        Ok(&storage.bytes[slot.object()][range])
+        let range = slot.start + range.start..slot.start + range.end;
+        if storage
+            .unknown_environment
+            .as_ref()
+            .is_some_and(|mask| mask[range.clone()].contains(&true))
+        {
+            return Err(MemoryFault::Environment);
+        }
+        Ok(&storage.bytes[range])
     }
 
     fn transfer(
@@ -287,6 +304,7 @@ impl<'a> Frame<'a> {
         }
         for storage in std::iter::once(&mut self.current).chain(self.parents.iter_mut().rev()) {
             if let (Some(s), Some(d)) = (storage.slot(src), storage.slot(dest)) {
+                storage.mark_known(d.start + to.start..d.start + to.end);
                 storage
                     .bytes
                     .copy_within(s.start + from.start..s.start + from.end, d.start + to.start);
@@ -319,7 +337,9 @@ impl<'a> Frame<'a> {
             .chain(self.parents.iter_mut().rev())
             .find_map(|f| {
                 let slot = f.slot(id)?;
-                Some(&mut f.bytes[slot.object()][range.clone()])
+                let range = slot.start + range.start..slot.start + range.end;
+                f.mark_known(range.clone());
+                Some(&mut f.bytes[range])
             })
             .ok_or(MemoryFault::Bounds)
     }
@@ -331,6 +351,8 @@ pub(super) enum MemoryFault {
     Bounds,
     OverlappingCopy,
     Uninitialized,
+    Environment,
+    EnvironmentDestination,
 }
 
 pub(super) fn outcome<T>(result: Result<T, MemoryFault>) -> io::Result<Option<T>> {
@@ -339,6 +361,10 @@ pub(super) fn outcome<T>(result: Result<T, MemoryFault>) -> io::Result<Option<T>
         Err(MemoryFault::Null) => Ok(None),
         Err(MemoryFault::OverlappingCopy) => Err(unsupported("overlapping MEMCPY ranges")),
         Err(MemoryFault::Uninitialized) => Err(unsupported("read from unwritten heap storage")),
+        Err(MemoryFault::Environment) => Err(unsupported("read of an unmodeled environment field")),
+        Err(MemoryFault::EnvironmentDestination) => Err(unsupported(
+            "environment destination outside a stack aggregate",
+        )),
         Err(MemoryFault::Bounds) => Err(unsupported("memory span outside its modeled object")),
     }
 }
@@ -432,7 +458,15 @@ impl Address {
                         .count();
                     return Ok(&heap.bytes[start.start..start.start + available]);
                 }
-                frame.read(id, start.start..frame.object_len(id)?)
+                let (storage, slot) = frame.stack_object(id)?;
+                let range = slot.start + start.start..slot.end();
+                let bytes = &storage.bytes[range.clone()];
+                let end = storage
+                    .unknown_environment
+                    .as_ref()
+                    .and_then(|mask| mask[range].iter().position(|&unknown| unknown))
+                    .unwrap_or(bytes.len());
+                Ok(&bytes[..end])
             }
         }
     }
@@ -455,6 +489,28 @@ impl Address {
 
     pub(super) fn write(&self, frame: &mut Frame<'_>, bytes: &[u8]) -> Result<(), MemoryFault> {
         self.write_at(frame, 0, bytes)
+    }
+
+    pub(super) fn mark_environment(
+        &self,
+        frame: &mut Frame<'_>,
+        len: usize,
+    ) -> Result<(), MemoryFault> {
+        let (id, range) = self.span(frame, len)?;
+        for storage in std::iter::once(&mut frame.current).chain(frame.parents.iter_mut().rev()) {
+            if let Some(slot) = storage.slot(id) {
+                // Scalar locals also have direct register reads which bypass byte access.
+                if slot.width.is_some() {
+                    break;
+                }
+                let mask = storage
+                    .unknown_environment
+                    .get_or_insert_with(|| vec![false; storage.bytes.len()].into_boxed_slice());
+                mask[slot.start + range.start..slot.start + range.end].fill(true);
+                return Ok(());
+            }
+        }
+        Err(MemoryFault::EnvironmentDestination)
     }
 
     pub(super) fn write_at(
@@ -620,6 +676,42 @@ pub(super) fn gep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_bytes_stay_guarded_across_calls_and_transfers() -> io::Result<()> {
+        let types = [Type::Bytes(8)];
+        let caller = [
+            Slot::new(69, true, 0, &types)?,
+            Slot::new(65, false, 8, &types)?,
+        ];
+        let child = [Slot::new(65, false, 0, &[])?];
+        let mut frame = Frame::new(&caller);
+        let pointer = MemoryOp::Gep(Address::Object(0), Value::Constant(1), 1)
+            .eval(&mut frame, &[])
+            .unwrap();
+        frame.set(1, pointer);
+        frame.enter(&child, &[Value::Local(1)])?;
+        Address::Pointer(0).mark_environment(&mut frame, 5).unwrap();
+        assert_eq!(
+            Address::Pointer(0).read(&frame, 1),
+            Err(MemoryFault::Environment)
+        );
+        Address::Pointer(0).write_at(&mut frame, 1, b"A").unwrap();
+        frame.leave();
+        let id = frame.current.base;
+        assert_eq!(Address::Object(0).remaining(&frame), Ok(&[0][..]));
+        assert_eq!(frame.read(id, 0..1), Ok(&[0][..]));
+        assert_eq!(frame.read(id, 6..8), Ok(&[0; 2][..]));
+        assert_eq!(
+            frame.transfer(id, 1..2, id, 2..3),
+            Err(MemoryFault::Environment)
+        );
+        assert_eq!(frame.read(id, 2..3), Ok(b"A".as_slice()));
+        frame.transfer(id, 2..3, id, 4..5).unwrap();
+        assert_eq!(frame.read(id, 4..5), Ok(b"A".as_slice()));
+        assert_eq!(frame.read(id, 3..5), Err(MemoryFault::Environment));
+        Ok(())
+    }
 
     #[test]
     fn read_and_seek_share_a_cursor_and_preserve_other_bytes() -> io::Result<()> {

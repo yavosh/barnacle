@@ -39,9 +39,9 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 78 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and two `PE_UNPACKER` hooks.
+The compiler accepts 79 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and three `PE_UNPACKER` hooks.
 The archive test loads those modules into one generation and verifies each hook count.
-Three remaining modules first require a PE resource-directory field. One requires `get_environment`.
+Three remaining modules first require a PE resource-directory field.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -75,6 +75,9 @@ Host calls can seek, read, search, report the engine level, and set a detection 
 Host calls can read decimal and hexadecimal integers and emit diagnostics when clamd debug logging is enabled.
 Bytecode can read the object size, subsignature counts, and first offsets.
 PE bytecode can read the entry offset and section count, fetch section records, and translate virtual addresses.
+The `get_environment` host call supplies the architecture byte used by the verified archive.
+The paired controls verify the architecture value on Debian arm64 and the destination's copy boundaries.
+Reads from copied fields that Barnacle does not model return an explicit unsupported error.
 The `disasm_x86` host call decodes supported legacy 32-bit instructions at the current cursor.
 The return value is the next absolute offset. The cursor stays in place.
 Comparison with pinned stock covered 6,384 instruction records, including operand metadata and result length.

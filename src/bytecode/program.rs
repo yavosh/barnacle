@@ -651,6 +651,7 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
             || !matches!(ty, Some(Type::Function(args)) if match id {
                 host::DISASM => host::disasm_prototype(args, types),
                 PE_SECTION => host::pe_section_prototype(args, types),
+                host::GET_ENVIRONMENT => host::environment_prototype(args, types),
                 _ => args == prototype,
             })
         {
