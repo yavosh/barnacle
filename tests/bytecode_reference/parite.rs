@@ -4,7 +4,7 @@ use super::{
 use std::{fs, io, path::Path};
 
 // One read-only .data section containing numbers and labels. The fixture has no executable section.
-fn receipt(label_offset: usize) -> Vec<u8> {
+pub(super) fn receipt(label_offset: usize) -> Vec<u8> {
     let mut bytes = pe::benign_pe();
     bytes.resize(512 + 4096, 0);
     bytes[512..].fill(0);

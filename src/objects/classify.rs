@@ -401,13 +401,26 @@ impl FileType {
                 }
                 if options.heuristic_alerts
                     && u16::from_le_bytes([header[22], header[23]]) & 0x2000 == 0
-                    && self
+                {
+                    let parite = self
                         .context
                         .last_section_entry()
-                        .is_some_and(|ep| parite(&bytes[ep..]))
-                    && sink.report_heuristic("Heuristics.W32.Parite.B")
-                {
-                    return Ok(Handling::Stopped);
+                        .filter(|&ep| parite(&bytes[ep..]))
+                        .map(|_| "Heuristics.W32.Parite.B");
+                    let magistr = || {
+                        self.context
+                            .last_pe_section()
+                            .and_then(|section| magistr(bytes, header, section))
+                    };
+                    // Immediate reporting takes the first PE alert. Deferred reporting keeps the last.
+                    let name = if options.heuristic_scan_precedence {
+                        parite.or_else(magistr)
+                    } else {
+                        magistr().or(parite)
+                    };
+                    if name.is_some_and(|name| sink.report_heuristic(name)) {
+                        return Ok(Handling::Stopped);
+                    }
                 }
                 match super::upx::extract(bytes, sink)? {
                     Handling::Unrecognized => Ok(earlier),
@@ -423,12 +436,63 @@ impl FileType {
     }
 }
 
-fn pe32_header(bytes: &[u8]) -> Option<&[u8; 26]> {
+fn pe32_header(bytes: &[u8]) -> Option<&[u8]> {
     let pointer = bytes.get(0x3c..)?.first_chunk::<4>()?;
-    let header = bytes
-        .get(u32::from_le_bytes(*pointer) as usize..)?
-        .first_chunk::<26>()?;
-    (header[24..] == [0x0b, 0x01]).then_some(header)
+    let header = bytes.get(u32::from_le_bytes(*pointer) as usize..)?;
+    (header.get(24..26)? == [0x0b, 0x01]).then_some(header)
+}
+
+fn magistr(
+    bytes: &[u8],
+    header: &[u8],
+    (index, raw, size): (usize, usize, usize),
+) -> Option<&'static str> {
+    let table = 24 + usize::from(u16::from_le_bytes([header[20], header[21]]));
+    let section = header.get(table + 40 * index..)?.first_chunk::<40>()?;
+    let (words, _) = section.as_chunks::<4>();
+    if u32::from_le_bytes(words[9]) & 0x80000000 == 0 {
+        return None;
+    }
+    let original_raw = u32::from_le_bytes(words[5]) as usize;
+    let original_size =
+        (u32::from_le_bytes(words[4]) as usize).min(bytes.len().saturating_sub(original_raw));
+    let virtual_size = u32::from_le_bytes(words[2]) as usize;
+    magistr_record(bytes.get(raw..)?, virtual_size, size, original_size)
+}
+
+fn magistr_record(
+    data: &[u8],
+    virtual_size: usize,
+    mapped_size: usize,
+    original_size: usize,
+) -> Option<&'static str> {
+    let size = mapped_size.max(original_size);
+    let damaged = mapped_size < original_size;
+    let (tail, label, name) = match virtual_size & 0xff {
+        0xec if virtual_size >= 0x612c && size >= 0x612c => (
+            0x7000,
+            b"\xe8\x2c\x61\0\0",
+            if damaged {
+                "Heuristics.W32.Magistr.A.dam"
+            } else {
+                "Heuristics.W32.Magistr.A"
+            },
+        ),
+        0xed if virtual_size >= 0x7000 && size >= 0x7000 => (
+            0x8000,
+            b"\xe8\x04\x72\0\0",
+            if damaged {
+                "Heuristics.W32.Magistr.B.dam"
+            } else {
+                "Heuristics.W32.Magistr.B"
+            },
+        ),
+        _ => return None,
+    };
+    let window = data
+        .get(size.saturating_sub(tail)..)?
+        .first_chunk::<4096>()?;
+    memchr::memmem::find(&window[..4091], label).map(|_| name)
 }
 
 fn parite(entry: &[u8]) -> bool {
@@ -449,4 +513,26 @@ fn parite(entry: &[u8]) -> bool {
         .all(|(&[left, right], difference)| {
             u32::from_le_bytes(left) ^ u32::from_le_bytes(right) == difference
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::magistr_record;
+
+    #[test]
+    fn magistr_damaged_names_use_the_larger_original_size() {
+        let mut data = vec![0; 0x9000];
+        for (virtual_size, start, word, expected) in [
+            (0x61ec, 0x2000, 0x612cu32, "Heuristics.W32.Magistr.A.dam"),
+            (0x70ed, 0x1000, 0x7204, "Heuristics.W32.Magistr.B.dam"),
+        ] {
+            data.fill(0);
+            data[start] = 232;
+            data[start + 1..start + 5].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(
+                magistr_record(&data, virtual_size, 4096, data.len()),
+                Some(expected)
+            );
+        }
+    }
 }

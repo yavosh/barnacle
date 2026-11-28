@@ -257,7 +257,18 @@ impl ObjectContext {
 
     pub(crate) fn last_section_entry(&self) -> Option<usize> {
         let layout = self.exe.as_ref()?;
-        layout.entry_at_last_pe_section.then_some(layout.entry)
+        let last = &layout.sections[usize::from(layout.last_pe_section?)];
+        (last.raw == layout.entry).then_some(layout.entry)
+    }
+
+    /// Table index, mapped offset and size of the last section in a multi-section PE.
+    pub(crate) fn last_pe_section(&self) -> Option<(usize, usize, usize)> {
+        let layout = self.exe.as_ref()?;
+        let index = usize::from(layout.last_pe_section?);
+        let last = &layout.sections[index];
+        layout
+            .multiple_pe_sections
+            .then_some((index, last.raw, last.size))
     }
 
     pub fn accepts(&self, target: Target) -> bool {

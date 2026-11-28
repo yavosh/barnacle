@@ -165,7 +165,8 @@ Use the effective daemon options and engine module flags together to determine w
 | Enabled stock detector | Barnacle verification |
 | --- | --- |
 | PE Parite heuristic | Stock comparisons cover the exact verdict, option gates, raw signature priority, and `PE_ALL` breaks. The fixture uses inert data in a non-executable section. [Parite tests](../tests/bytecode_reference/parite.rs) |
-| PE heuristics for Kriz, Magistr, and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
+| PE Magistr heuristics | Paired tests cover A and B, truncated sections, and precedence against Parite. Rust metadata tests cover both `.dam` names. [Magistr tests](../tests/bytecode_reference/magistr.rs) |
+| PE heuristics for Kriz and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
 | PDF obfuscated names | Stock comparisons cover physical and packed dictionaries, escaped Flate filters, and competing child signatures. |
 | Mydoom log checksum | Stock comparisons cover binary and UTF-16BE inputs, checksums, minimum size, the early word screen, and precedence against a hash signature. [Log tests](../tests/object_mydoom.rs) |
 | RIFF | Named finding parity is open. |

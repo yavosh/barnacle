@@ -1,6 +1,8 @@
 //! Compare harmless bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "bytecode_reference/magistr.rs"]
+mod magistr;
 #[path = "bytecode_reference/parite.rs"]
 mod parite;
 #[path = "common/pe.rs"]
