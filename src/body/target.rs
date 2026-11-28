@@ -3,6 +3,9 @@ use std::io;
 use std::ops::RangeInclusive;
 
 mod executable;
+mod icons;
+pub(crate) use icons::IconMetric;
+mod version_info;
 use executable::Executable;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -64,7 +67,7 @@ impl Target {
         }
     }
 
-    fn executable(self) -> bool {
+    pub(super) fn executable(self) -> bool {
         matches!(self, Self::Pe | Self::Elf | Self::MachO)
     }
 }
@@ -79,6 +82,7 @@ enum Base {
     LastSection,
     Section(u32),
     EntireSection(u32),
+    VersionInfo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +93,18 @@ pub struct Offset {
 }
 
 impl Offset {
+    pub(super) fn is_version_info(&self) -> bool {
+        self.base == Base::VersionInfo
+    }
+
+    pub(super) fn is_any(&self) -> bool {
+        self.base == Base::Any
+    }
+
+    pub(super) fn has_shift(&self) -> bool {
+        self.shift != 0 || matches!(self.base, Base::EntireSection(_))
+    }
+
     pub(super) fn is_relative(&self) -> bool {
         !matches!(self.base, Base::Any | Base::Absolute)
     }
@@ -108,7 +124,12 @@ impl Offset {
             Some((position, shift)) => (position, decimal(shift)?),
             None => (text, 0),
         };
-        let (base, displacement) = if let Some(n) = position.strip_prefix("EOF-") {
+        let (base, displacement) = if position == "VI" {
+            if !target.executable() {
+                return Err(invalid("VI requires an executable target"));
+            }
+            (Base::VersionInfo, 0)
+        } else if let Some(n) = position.strip_prefix("EOF-") {
             (Base::End, decimal(n)?)
         } else if position.starts_with(['E', 'S']) {
             if !target.executable() {
@@ -151,6 +172,21 @@ pub struct ObjectContext {
 }
 
 impl ObjectContext {
+    pub(crate) fn icon_metrics(
+        &self,
+        bytes: &[u8],
+        max_icons: usize,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<icons::IconSamples> {
+        if self.target == Target::Pe
+            && let Some(exe) = &self.exe
+        {
+            icons::metrics(bytes, &exe.sections, max_icons, check)
+        } else {
+            Ok(icons::IconSamples::default())
+        }
+    }
+
     /// Infer raw targets with unambiguous header markers from the pinned built-in file types.
     /// Target 7 applies to a normalized ASCII object. Raw text only selects generic rules.
     pub fn raw(bytes: &[u8]) -> Self {
@@ -205,6 +241,11 @@ impl ObjectContext {
         self.exe.is_some()
     }
 
+    pub(super) fn executable_metadata(&self) -> Option<(usize, usize)> {
+        let executable = self.exe.as_ref()?;
+        Some((executable.entry, executable.sections.len()))
+    }
+
     pub(crate) fn pe_overlay(&self) -> Option<usize> {
         self.exe.as_ref()?.pe_overlay
     }
@@ -213,12 +254,27 @@ impl ObjectContext {
         target == Target::Generic || target == self.target
     }
 
+    pub(super) fn version_keys(
+        &self,
+        bytes: &[u8],
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<usize>> {
+        if let Some(exe) = &self.exe
+            && self.target == Target::Pe
+        {
+            return version_info::keys(bytes, &exe.sections, check);
+        }
+        Ok(Vec::new())
+    }
+
     /// Inclusive range of eligible pattern starts, clipped to the object.
     pub fn offset_range(&self, offset: &Offset, size: usize) -> Option<RangeInclusive<usize>> {
         let n = offset.displacement as usize;
         let mut shift = offset.shift as usize;
         let exe = self.exe.as_ref();
         let start = match offset.base {
+            // VI is a disjoint set of resource string keys, not an interval.
+            Base::VersionInfo => return None,
             Base::Any => return Some(0..=size),
             Base::Absolute => n,
             Base::End if self.target.executable() && exe.is_none() => return None,

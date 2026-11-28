@@ -3,12 +3,13 @@ use super::{
     ChildSink, Handling, InputKind, Options, archive, iso, office, ole, onenote, partition, pdf,
     rtf, swf, text, xml,
 };
-use crate::body::{ObjectContext, Target};
+use crate::body::{HandlerType, ObjectContext, Target};
 use std::io;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Parser {
     Archive,
+    Zip,
     AutoIt,
     Rtf,
     Mail,
@@ -36,6 +37,7 @@ pub(super) enum Parser {
     Xml(xml::Format),
     Xdp,
     Text,
+    Script,
     None,
 }
 
@@ -57,6 +59,18 @@ impl FileType {
     pub fn classify(bytes: &[u8], kind: InputKind, sink: &mut dyn ChildSink) -> io::Result<Self> {
         match kind {
             InputKind::Normalized(target) => return Ok(Self::typed(bytes, target, Parser::None)),
+            InputKind::Handler(handler) => {
+                return Ok(match handler {
+                    HandlerType::Graphics => Self {
+                        name: "CL_TYPE_GRAPHICS",
+                        context: ObjectContext::typed(Target::Graphics, bytes),
+                        parser: Parser::Image,
+                    },
+                    HandlerType::Pdf => Self::typed(bytes, Target::Pdf, Parser::Pdf),
+                    HandlerType::Script => Self::generic(bytes, "CL_TYPE_SCRIPT", Parser::Script),
+                    HandlerType::Zip => Self::generic(bytes, "CL_TYPE_ZIP", Parser::Zip),
+                });
+            }
             InputKind::Partition => {
                 let (name, parser) = match bytes.get(1024..1028) {
                     Some(b"H+\x00\x04" | b"HX\x00\x05") => {
@@ -104,6 +118,10 @@ impl FileType {
                 name = office::classify(bytes, sink)?;
             }
             return Ok(Self::generic(bytes, name, Parser::Archive));
+        }
+        if bytes.starts_with(b"[aliases]") && text::file_type(bytes) == "CL_TYPE_TEXT_ASCII" {
+            // The pinned engine retains the POSIX TAR type for this legacy text header.
+            return Ok(Self::generic(bytes, "CL_TYPE_POSIX_TAR", Parser::Raw));
         }
         if bytes.starts_with(b"{\\rt") {
             return Ok(Self::generic(bytes, "CL_TYPE_RTF", Parser::Rtf));
@@ -263,6 +281,7 @@ impl Parser {
         match self {
             Self::AutoIt if options.scan_archive => super::autoit::extract(bytes, sink),
             Self::Archive if options.scan_archive => archive::extract(bytes, sink),
+            Self::Zip if options.scan_archive => archive::zip_extract(bytes, sink),
             Self::UniversalMachO => super::macho::extract(bytes, sink),
             Self::Elf { has_layout: false } if options.scan_elf => Ok(Handling::Incomplete),
             Self::HfsPlus if options.scan_archive => super::hfs::extract(bytes, sink),
@@ -289,8 +308,11 @@ impl Parser {
                 text::before_raw(self, bytes, sink)
             }
             Self::Uuencoded => text::before_raw(self, bytes, sink),
+            Self::Script if options.scan_normalized_script => text::script(bytes, sink),
             // These formats use the ordinary raw matcher after any enabled parser.
             Self::Archive
+            | Self::Zip
+            | Self::Script
             | Self::AutoIt
             | Self::ThinMachO
             | Self::Pe { .. }

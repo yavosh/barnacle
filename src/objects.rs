@@ -1,5 +1,6 @@
 //! Object traversal for one scan against one immutable database generation.
-use crate::body::{ObjectContext, Target};
+use crate::body::{HandlerType, LogicalObject, ObjectContext, Target};
+use md5::{Digest, Md5};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -48,6 +49,7 @@ trait ChildSink {
             None => Ok(false),
         }
     }
+    fn normalized_file(&mut self, data: &mut dyn Read) -> io::Result<bool>;
     fn mailbox_letters(&mut self, letters: &mut text::SavedLetters) -> io::Result<Handling>;
     fn read_child(&mut self, data: &mut dyn Read) -> io::Result<Option<Snapshot>>;
     fn visit_snapshot(
@@ -155,10 +157,23 @@ impl Default for Options {
 }
 
 pub struct Layer {
+    /// Stock hides this layer when matching container types.
+    pub normalized: bool,
     pub file_type: &'static str,
     pub target: Target,
     pub name: Option<Box<[u8]>>,
     pub size: usize,
+}
+
+impl Layer {
+    // Remove the current logical object, including any normalized copies of it.
+    fn logical_parents(stack: &[Layer]) -> &[Layer] {
+        let current = stack
+            .iter()
+            .rposition(|layer| !layer.normalized)
+            .unwrap_or(0);
+        &stack[..current]
+    }
 }
 
 pub struct Object<'a> {
@@ -168,12 +183,20 @@ pub struct Object<'a> {
     pub layer: &'a Layer,
     pub normalized: bool,
     pub body_only: bool,
+    /// This scan stage supplies the digest used by stock file-type rules.
+    pub logical_rescan: bool,
+    pub logical: LogicalObject<'a>,
     pub handled_format: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Verdict {
     Found(String),
+    /// Run logical file-type rules before reporting the next ordinary finding.
+    Handlers {
+        rules: Vec<(Result<Option<String>, String>, HandlerType)>,
+        finding: Result<Option<String>, String>,
+    },
     Miss,
     Incomplete,
     /// The pinned engine omits this entire top-level object.
@@ -301,6 +324,7 @@ struct Traversal<'a> {
     files_scanned: usize,
     stopped: Option<Verdict>,
     first_limit: Option<Limit>,
+    last_handler_hash: [u8; 16],
     matcher: &'a mut Matcher<'a>,
     check: &'a mut dyn FnMut() -> io::Result<()>,
 }
@@ -311,6 +335,7 @@ enum InputKind {
     MailboxLetter,
     Normalized(Target),
     Partition,
+    Handler(HandlerType),
 }
 
 pub fn scan(
@@ -329,10 +354,11 @@ pub fn scan(
         files_scanned: 0,
         stopped: None,
         first_limit: None,
+        last_handler_hash: [0; 16],
         matcher: &mut matcher,
         check: &mut check,
     };
-    walk.visit(bytes, InputKind::File, None)?;
+    walk.visit(bytes, InputKind::File, None, false)?;
     Ok(walk.stopped.unwrap_or_else(|| match walk.first_limit {
         Some(limit) if options.alert_exceeds_max => Verdict::Found(limit.signature()),
         _ => Verdict::Miss,
@@ -347,7 +373,13 @@ impl Traversal<'_> {
         }
     }
 
-    fn visit(&mut self, bytes: &[u8], kind: InputKind, name: Option<&[u8]>) -> io::Result<()> {
+    fn visit(
+        &mut self,
+        bytes: &[u8],
+        kind: InputKind,
+        name: Option<&[u8]>,
+        normalized: bool,
+    ) -> io::Result<()> {
         self.check()?;
         if bytes.len() <= 5 {
             return Ok(());
@@ -383,6 +415,7 @@ impl Traversal<'_> {
             }
         }
         self.parents.push(Layer {
+            normalized,
             target: file_type.context.target(),
             file_type: file_type.name,
             size: bytes.len(),
@@ -392,24 +425,19 @@ impl Traversal<'_> {
         if handling == Handling::Incomplete {
             self.stopped = Some(Verdict::Incomplete);
         }
+        let mut recheck_without_digest = false;
         if self.stopped.is_none()
             && (!matches!(file_type.parser, classify::Parser::Html { .. })
                 || !self.options.scan_html)
         {
-            let (layer, parents) = self.parents.split_last().expect("current layer");
-            let object = Object {
+            let normalized = matches!(kind, InputKind::Normalized(_));
+            recheck_without_digest = self.match_layer(
                 bytes,
-                context: &file_type.context,
-                layer,
-                parents,
-                normalized: matches!(kind, InputKind::Normalized(_)),
-                body_only: false,
-                handled_format: handling == Handling::Complete,
-            };
-            let verdict = (self.matcher)(object, self.check)?;
-            if verdict != Verdict::Miss {
-                self.stopped = Some(verdict);
-            }
+                &file_type.context,
+                normalized,
+                handling == Handling::Complete,
+                !normalized,
+            )?;
         }
         if self.stopped.is_none() {
             let recognize = kind == InputKind::File
@@ -421,9 +449,91 @@ impl Traversal<'_> {
             if self.after_raw(bytes, &file_type, recognize)? == Handling::Incomplete {
                 self.stopped = Some(Verdict::Incomplete);
             }
+            // Stock's final binary pass checks the same map with no reference digest.
+            if recheck_without_digest
+                && file_type.name == "CL_TYPE_BINARY_DATA"
+                && self.stopped.is_none()
+            {
+                let context = ObjectContext::typed(Target::Other, bytes);
+                self.match_layer(bytes, &context, false, true, false)?;
+            }
         }
         self.parents.pop();
         Ok(())
+    }
+
+    fn match_layer(
+        &mut self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        normalized: bool,
+        handled_format: bool,
+        logical_rescan: bool,
+    ) -> io::Result<bool> {
+        let (layer, parents) = self.parents.split_last().expect("current layer");
+        let object = Object {
+            bytes,
+            context,
+            layer,
+            parents,
+            normalized,
+            body_only: false,
+            logical_rescan,
+            logical: LogicalObject {
+                parents: Layer::logical_parents(&self.parents),
+                recursion_level: parents.len() + self.normalized_depth,
+                file_size: bytes.len(),
+                unmapped_script: false,
+                mapped_source_size: None,
+            },
+            handled_format,
+        };
+        let verdict = (self.matcher)(object, self.check)?;
+        self.apply_verdict(bytes, verdict)
+    }
+
+    // Return whether a later stage on the same map may need to retry without a digest.
+    fn apply_verdict(&mut self, bytes: &[u8], verdict: Verdict) -> io::Result<bool> {
+        match verdict {
+            Verdict::Handlers { rules, finding } => {
+                let unsupported = |message| io::Error::new(io::ErrorKind::Unsupported, message);
+                let mut md5 = Md5::new();
+                for block in bytes.chunks(64 << 10) {
+                    self.check()?;
+                    md5.update(block);
+                }
+                let hash: [u8; 16] = md5.finalize().into();
+                for (name, kind) in rules {
+                    if self.last_handler_hash == hash {
+                        if let Some(name) = name.map_err(unsupported)? {
+                            self.stopped = Some(Verdict::Found(name));
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    self.last_handler_hash = hash;
+                    let limit = (self.parents.len() + self.normalized_depth
+                        >= self.recursion_limit())
+                    .then_some(Limit::MaxRecursion)
+                    .or_else(|| self.child_limit())
+                    .or_else(|| self.size_limit(bytes.len() as u64));
+                    if let Some(limit) = limit {
+                        self.first_limit.get_or_insert(limit);
+                        return Ok(true);
+                    }
+                    let filename = self.parents.last().and_then(|p| p.name.clone());
+                    self.visit(bytes, InputKind::Handler(kind), filename.as_deref(), false)?;
+                    if self.stopped.is_some() {
+                        return Ok(false);
+                    }
+                }
+                self.stopped = finding.map_err(unsupported)?.map(Verdict::Found);
+                return Ok(true);
+            }
+            Verdict::Miss => (),
+            other => self.stopped = Some(other),
+        }
+        Ok(false)
     }
 
     fn after_raw(
@@ -533,6 +643,7 @@ impl ChildSink for Traversal<'_> {
         self.check()?;
         let context = ObjectContext::typed(Target::Generic, bytes);
         let layer = Layer {
+            normalized: false,
             file_type: "CL_TYPE_ANY",
             target: Target::Generic,
             name: None,
@@ -545,12 +656,18 @@ impl ChildSink for Traversal<'_> {
             layer: &layer,
             normalized: false,
             body_only: false,
+            logical_rescan: false,
+            logical: LogicalObject {
+                parents: &self.parents,
+                recursion_level: self.parents.len() + self.normalized_depth,
+                file_size: bytes.len(),
+                unmapped_script: false,
+                mapped_source_size: None,
+            },
             handled_format: true,
         };
         let verdict = (self.matcher)(object, self.check)?;
-        if verdict != Verdict::Miss {
-            self.stopped = Some(verdict);
-        }
+        self.apply_verdict(bytes, verdict)?;
         Ok(self.stopped.is_some())
     }
 
@@ -582,7 +699,7 @@ impl ChildSink for Traversal<'_> {
         if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
             return Ok(false);
         }
-        self.visit(bytes, InputKind::Partition, name)?;
+        self.visit(bytes, InputKind::Partition, name, false)?;
         Ok(self.stopped.is_some())
     }
 
@@ -597,6 +714,7 @@ impl ChildSink for Traversal<'_> {
         // A suffix is another map of the same input. Stock checks its size
         // and pushes its type, then charges only the newly extracted children.
         self.parents.push(Layer {
+            normalized: false,
             file_type: kind,
             target: if kind == "CL_TYPE_MSEXE" {
                 Target::Pe
@@ -634,7 +752,7 @@ impl ChildSink for Traversal<'_> {
             let Some(body) = letters.read(self)? else {
                 return Ok(Handling::Incomplete);
             };
-            self.visit(body.as_ref(), InputKind::MailboxLetter, None)?;
+            self.visit(body.as_ref(), InputKind::MailboxLetter, None, false)?;
             let verdict = self.stopped.take().unwrap_or(Verdict::Miss);
             match verdict {
                 Verdict::Miss => (),
@@ -672,7 +790,14 @@ impl ChildSink for Traversal<'_> {
         name: Option<&[u8]>,
     ) -> io::Result<bool> {
         let kind = target.map_or(InputKind::File, InputKind::Normalized);
-        snapshot.with_bytes(|bytes| self.visit(bytes, kind, name))?;
+        snapshot.with_bytes(|bytes| self.visit(bytes, kind, name, target.is_some()))?;
+        Ok(self.stopped.is_some())
+    }
+
+    fn normalized_file(&mut self, data: &mut dyn Read) -> io::Result<bool> {
+        if let Some(snapshot) = self.read_child(data)? {
+            snapshot.with_bytes(|bytes| self.visit(bytes, InputKind::File, None, true))?;
+        }
         Ok(self.stopped.is_some())
     }
 
@@ -697,7 +822,7 @@ impl ChildSink for Traversal<'_> {
             self.skip_declared_size(limit.saturating_add(1));
             return Ok(false);
         }
-        self.visit(bytes, InputKind::File, name)?;
+        self.visit(bytes, InputKind::File, name, false)?;
         Ok(self.stopped.is_some())
     }
 
@@ -725,6 +850,7 @@ impl ChildSink for Traversal<'_> {
             .expect("view has an owning object");
         let context = ObjectContext::typed(Target::Ascii, bytes);
         let layer = Layer {
+            normalized: true,
             target: Target::Ascii,
             file_type: "CL_TYPE_TEXT_ASCII",
             size: bytes.len(),
@@ -737,12 +863,18 @@ impl ChildSink for Traversal<'_> {
             parents: if mapped { &self.parents } else { parents },
             normalized: true,
             body_only: !mapped,
+            logical_rescan: false,
+            logical: LogicalObject {
+                parents: Layer::logical_parents(&self.parents),
+                recursion_level: parents.len() + self.normalized_depth + usize::from(mapped),
+                file_size: if mapped { bytes.len() } else { owner.size },
+                unmapped_script: !mapped,
+                mapped_source_size: mapped.then_some(owner.size),
+            },
             handled_format: true,
         };
         let verdict = (self.matcher)(object, self.check)?;
-        if verdict != Verdict::Miss {
-            self.stopped = Some(verdict);
-        }
+        self.apply_verdict(bytes, verdict)?;
         Ok(self.stopped.is_some())
     }
 

@@ -20,6 +20,7 @@ pub(super) mod workspace;
 mod xar;
 mod zip;
 pub(super) use zip::directory as zip_directory;
+pub(super) use zip::extract as zip_extract;
 pub(super) use zip::single as zip_single;
 
 pub(super) fn file_type(bytes: &[u8]) -> Option<&'static str> {

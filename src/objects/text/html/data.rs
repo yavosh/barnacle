@@ -45,7 +45,7 @@ impl DataUrls {
             }
             header.push(b'\n');
             let mut child = Cursor::new(header).chain(Decoded(&value[comma + 1..]));
-            if sink.child(&mut child, None, None)? {
+            if sink.normalized_file(&mut child)? {
                 return Ok(Handling::Stopped);
             }
         }

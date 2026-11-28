@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use barnacle::body::PcreLimits;
 use barnacle::objects::Options;
 use regex::Regex;
 
@@ -21,6 +22,10 @@ pub(super) struct Config {
     pub detect_pua: bool,
     pub stream_max_length: u64,
     pub objects: Options,
+    pub pcre: PcreLimits,
+    pub scan_image_fuzzy_hash: bool,
+    pub max_icons_pe: usize,
+    pub disable_cache: bool,
     pub max_scan_time: Duration,
     pub command_read_timeout: Duration,
     pub read_timeout: Duration,
@@ -68,6 +73,10 @@ impl Default for Config {
             detect_pua: false,
             stream_max_length: 100 << 20,
             objects: Options::default(),
+            pcre: PcreLimits::default(),
+            scan_image_fuzzy_hash: true,
+            max_icons_pe: 100,
+            disable_cache: false,
             max_scan_time: Duration::ZERO,
             command_read_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(120),
@@ -150,6 +159,7 @@ impl Config {
             "AlertExceedsMax" => self.objects.alert_exceeds_max = boolean(value)?,
             "ScanArchive" => self.objects.scan_archive = boolean(value)?,
             "ScanPE" => self.objects.scan_pe = boolean(value)?,
+            "MaxIconsPE" => self.max_icons_pe = number(value)?,
             "MaxEmbeddedPE" => self.objects.max_embedded_pe = size(value)?,
             "ScanELF" => self.objects.scan_elf = boolean(value)?,
             "ScanPDF" => self.objects.scan_pdf = boolean(value)?,
@@ -159,6 +169,7 @@ impl Config {
             "ScanSWF" => self.objects.scan_swf = boolean(value)?,
             "ScanOneNote" => self.objects.scan_onenote = boolean(value)?,
             "ScanImage" => self.objects.scan_image = boolean(value)?,
+            "ScanImageFuzzyHash" => self.scan_image_fuzzy_hash = boolean(value)?,
             "AlertBrokenMedia" => self.objects.alert_broken_media = boolean(value)?,
             "ScanHTML" => self.objects.scan_html = boolean(value)?,
             "ScanMail" => self.objects.scan_mail = boolean(value)?,
@@ -171,6 +182,9 @@ impl Config {
                     _ => self.objects.max_script_normalize = n,
                 }
             }
+            "PCREMaxFileSize" => self.pcre.max_file_size = size(value)?,
+            "PCREMatchLimit" => self.pcre.match_limit = number(value)?,
+            "PCRERecMatchLimit" => self.pcre.depth_limit = number(value)?,
             "MaxScanTime" => self.max_scan_time = Duration::from_millis(number(value)?),
             "StreamMaxLength" => self.stream_max_length = size(value)?,
             "CommandReadTimeout" => self.command_read_timeout = Duration::from_secs(number(value)?),
@@ -228,9 +242,7 @@ impl Config {
                     return Err(invalid(format!("unsupported option {key}")));
                 }
             }
-            "DisableCache" => {
-                boolean(value)?;
-            } // Every scan runs against its pinned generation.
+            "DisableCache" => self.disable_cache = boolean(value)?,
             "Example" => {
                 return Err(invalid(
                     "edit the example configuration before starting clamd",
@@ -328,10 +340,6 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "DisableCertCheck" => boolean(value).ok() == Some(false),
         "BytecodeSecurity" => value == "TrustSigned",
         "MaxZipTypeRcg" => size(value).ok() == Some(1 << 20),
-        "PCREMaxFileSize" => matches!(size(value), Ok(26214400 | 104857600)),
-        "MaxIconsPE" => value == "100",
-        "PCREMatchLimit" => value == "10000" || value == "100000",
-        "PCRERecMatchLimit" => value == "5000" || value == "2000",
         "BytecodeTimeout" => value == "60000" || value == "10000",
         _ => false,
     }

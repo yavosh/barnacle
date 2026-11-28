@@ -3,7 +3,7 @@ mod cvd;
 mod raw;
 
 use super::Config;
-use barnacle::body::BodyIndex;
+use barnacle::body::{BodyIndex, LogicalIndex};
 use barnacle::index::{self, Index};
 use barnacle::objects::{self, Limit, Options, Snapshot, Verdict};
 use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
@@ -170,10 +170,12 @@ pub(super) struct Generation {
     sources: Vec<Source>,
     index: Index,
     body: BodyIndex,
+    logical: LogicalIndex,
     temporary_directory: PathBuf,
     version: String,
     scan_limit: u64,
     objects: Options,
+    disable_cache: bool,
     scan_time: Duration,
     partial_only: bool,
     needs_hashes: bool,
@@ -239,7 +241,8 @@ impl Generation {
             match ext.as_str() {
                 "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
-                "hdb" | "hsb" | "ndb" | "ndu" | "ign" | "ign2" | "fp" | "sfp" => {
+                "hdb" | "hsb" | "ndb" | "ndu" | "ldb" | "ldu" | "ign" | "ign2" | "fp" | "sfp"
+                | "idb" => {
                     let output =
                         local_dir.join(path.file_name().expect("directory entry has a name"));
                     source.copy_to(&output)?;
@@ -248,11 +251,25 @@ impl Generation {
                 _ => return Err(invalid(format!("unsupported database: {}", path.display()))),
             }
         }
-        let (body_paths, hash_paths): (Vec<_>, Vec<_>) = paths
-            .iter()
-            .map(|(p, official)| (p.as_path(), *official))
-            .partition(|(p, _)| matches!(extension(p).as_str(), "ndb" | "ndu"));
-        let (mut feed, ignores) = if hash_paths.is_empty() && !body_paths.is_empty() {
+        let mut body_paths = Vec::new();
+        let mut logical_paths = Vec::new();
+        let mut hash_paths = Vec::new();
+        let mut icon_paths = Vec::new();
+        for (path, official) in &paths {
+            let group = match extension(path).as_str() {
+                "ndb" | "ndu" => &mut body_paths,
+                "ldb" | "ldu" => &mut logical_paths,
+                "idb" => {
+                    icon_paths.push(path.as_path());
+                    continue;
+                }
+                _ => &mut hash_paths,
+            };
+            group.push((path.as_path(), *official));
+        }
+        let (mut feed, ignores) = if hash_paths.is_empty()
+            && (!body_paths.is_empty() || !logical_paths.is_empty() || !icon_paths.is_empty())
+        {
             (Feed::default(), IgnoreSet::default())
         } else {
             Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
@@ -264,13 +281,18 @@ impl Generation {
         index::build(&db, &mut feed.rules)?;
         drop(feed);
         let index = Index::open_pread(&db)?;
-        // Each body source is a private copy in this generation's temporary directory.
-        // Release its pages when parsing finishes, before building the search automata.
-        let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, |path| {
+        // Unlink each private rule source after opening it so its pages can be released.
+        let open_snapshot = |path: &Path| {
             let file = File::open(path)?;
             fs::remove_file(path)?;
             Ok(file)
-        })?;
+        };
+        let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
+        let logical =
+            LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?
+                .with_pcre_limits(config.pcre)
+                .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
+                .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }
@@ -280,15 +302,19 @@ impl Generation {
             .min()
             .unwrap_or(u64::MAX);
         let mut objects = config.objects.clone();
-        objects.scan_normalized_script = body.needs_normalized_script();
-        objects.map_normalized_script = body.needs_normalized_script_map();
+        objects.scan_normalized_script =
+            body.needs_normalized_script() || logical.needs_normalized_script();
+        objects.map_normalized_script =
+            body.needs_normalized_script_map() || logical.needs_normalized_script_map();
         Ok(Self {
             sources: inputs,
             index,
             body,
+            logical,
             temporary_directory: config.temporary_directory.clone(),
             scan_limit,
             objects,
+            disable_cache: config.disable_cache,
             scan_time: config.max_scan_time,
             partial_only,
             needs_hashes,
@@ -397,7 +423,29 @@ impl Generation {
                             return Ok(Verdict::Found(name));
                         }
                     }
-                    Ok(Verdict::Miss)
+                    let matches = self.logical.matches_checked(
+                        obj.bytes,
+                        obj.context,
+                        obj.logical,
+                        !self.disable_cache && obj.logical_rescan,
+                        &mut *check,
+                    )?;
+                    if !matches.handlers.is_empty() {
+                        return Ok(Verdict::Handlers {
+                            rules: matches
+                                .handlers
+                                .into_iter()
+                                .map(|(name, kind)| {
+                                    (name.map(|name| name.map(str::to_owned)), kind)
+                                })
+                                .collect(),
+                            finding: matches.finding.map(|name| name.map(str::to_owned)),
+                        });
+                    }
+                    Ok(matches
+                        .finding
+                        .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?
+                        .map_or(Verdict::Miss, |name| Verdict::Found(name.to_owned())))
                 },
                 || {
                     (input.check)()?;
@@ -414,7 +462,9 @@ impl Generation {
         }
         Ok(match verdict? {
             Verdict::Found(name) => ScanResult::Found(Detection { name, hashes }),
-            Verdict::Incomplete | Verdict::Miss => ScanResult::Incomplete,
+            Verdict::Incomplete | Verdict::Miss | Verdict::Handlers { .. } => {
+                ScanResult::Incomplete
+            }
             Verdict::Skipped => ScanResult::Skipped,
         })
     }
@@ -677,6 +727,10 @@ mod tests {
             "local.ndb",
             "MixedBody:0:*:6c6f63616c206d697865642067656e65726174696f6e\n",
         );
+        f.write(
+            "local.ldb",
+            "MixedLogical;Target:0;0;6c6f63616c206c6f676963616c20736e617073686f742072656365697074\n",
+        );
         let db = Generation::load(&f.config).unwrap();
         assert!(db.version().starts_with("ClamAV 1.4.3/28187/"));
         let local = hash_reader(&bytes[..])
@@ -692,6 +746,31 @@ mod tests {
                 .unwrap(),
             Some("MixedBody.UNOFFICIAL")
         );
+        // The pinned archives contain 312,303 eligible logical records.
+        assert_eq!(db.logical.rule_count(), 312_304);
+        assert_eq!(db.logical.icon_rule_count(), 222);
+        let logical_control = b"local logical snapshot receipt";
+        assert_eq!(
+            db.logical
+                .first_match_checked(
+                    logical_control,
+                    &ObjectContext::raw(logical_control),
+                    barnacle::body::LogicalObject {
+                        parents: &[],
+                        recursion_level: 0,
+                        file_size: logical_control.len(),
+                        unmapped_script: false,
+                        mapped_source_size: None,
+                    },
+                    || Ok(()),
+                )
+                .unwrap(),
+            Some("MixedLogical.UNOFFICIAL")
+        );
+        assert!(matches!(
+            db.scan_checked(&logical_control[..], || Ok(())).unwrap(),
+            ScanResult::Incomplete
+        ));
         assert!(db.scan(&bytes[..]).unwrap().is_none());
     }
 }

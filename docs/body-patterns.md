@@ -60,3 +60,166 @@ BARNACLE_CVD_DIR="$snapshot_dir" cargo test --release --locked --all-targets -- 
 
 The matcher uses the ClamAV body pattern and extended offset formats.
 [Body signature format](https://docs.clamav.net/manual/Signatures/BodySignatureFormat.html) · [Extended signatures](https://docs.clamav.net/manual/Signatures/ExtendedSignatures.html)
+
+## Local logical signatures
+
+Local `.ldb` rules can combine extended patterns with Boolean expressions, occurrence counts, and distinct subsignature counts.
+The loader applies functionality levels and ignore rules. It supports `Target`, `FileSize`, `Container`, `EntryPoint`, `NumberOfSections`, and `Intermediates`.
+Executable conditions use the parsed PE, ELF, or Mach-O layout. The entry point is a file offset.
+`Container:CL_TYPE_ANY` selects root objects. A named container selects children with that parent type.
+
+`Intermediates` checks the ancestor chain in outer-to-inner order.
+Normalized layers count toward depth. Named types select non-normalized ancestors.
+`CL_TYPE_ANY` adds one required level. Named types consume one visible ancestor each.
+
+Barnacle supports the pinned feed's graphics, PDF, script, and ZIP `HandlerType` rules.
+A matching handler can scan the same bytes as a typed child before later logical rules run.
+The child retains the original type as a parent and counts against scan limits.
+When stock has no reference digest, including with `DisableCache yes`, it reports the handler's name.
+Stock also reports the handler's name when the digest matches the last handler's digest in the scan.
+If a limit denies the rescan, the raw logical pass ends. A later stage can still report a finding.
+For an aliases configuration in the ASCII text class, the rescan retains stock's `CL_TYPE_POSIX_TAR` parent type.
+
+PE logical rules can require `IconGroup1`, `IconGroup2`, or both.
+When a rule requires both groups, one `.idb` row must satisfy both conditions.
+Group names are case-sensitive. `*` selects any group in that column.
+Barnacle reads grouped bitmap icons only after the rule's content and other metadata match.
+`MaxIconsPE` defaults to 100. Stock treats zero as one and still checks icon groups with `ScanPE no`.
+If an unsupported bitmap layout prevents a decision, Barnacle reports an error for the affected rule.
+[Paired PE icon tests](../tests/logical_pe_icons.rs)
+
+The `VI` offset matches the start of a Unicode key in a PE version resource.
+Body patterns check each part at a key offset. The PCRE matcher uses the entire executable subject.
+
+The matcher supports ASCII case folding (`i`), wide bytes (`w`), ASCII with wide bytes (`a`), and fullword boundaries (`f`).
+Case folding applies to literal letters. Wide patterns still measure offsets and brace gaps in bytes.
+ASCII and wide variants share a logical subsignature ID. Two single-part variants at the same start count once.
+Fullword checks run inside the pattern matcher. For multipart patterns, they check the outer edges.
+Patterns support single-arm groups and trailing empty arms after preceding atoms.
+
+Byte comparisons read binary integers or numeric text at a signed offset from a matched body pattern.
+They use the latest match offset and run at the end of each scan window, before PCRE.
+
+Image fuzzy rules compare an eight-byte hash for BMP, GIF, JPEG, PNG, and TIFF.
+Barnacle computes the hash once for each eligible image and uses exact matches.
+Both `ScanImage` and `ScanImageFuzzyHash` must be enabled.
+A fuzzy hash can trigger PCRE. The two options default to enabled.
+Barnacle checks decoded pixel buffers and resizing against a 64 MiB budget.
+The Rust reference tests matched 17 stock hashes, including transparent and 16-bit fixtures.
+
+PCRE subsignatures run after the indexed patterns for the current scan object.
+A trigger can use occurrence counts from earlier patterns and PCRE subsignatures.
+Exact offsets rebase the regex subject. Shifted offsets bound the reported match start. The `e` flag bounds the subject itself.
+Global matching advances after an empty match.
+
+The daemon uses the pinned reference defaults for `PCREMatchLimit` (100,000), `PCRERecMatchLimit` (2,000), and `PCREMaxFileSize` (100 MiB).
+Match and depth limits stop the current regex. The size limit skips PCRE on larger objects.
+Barnacle caps PCRE backtracking heap use at 8 MiB per scan object and reports exhaustion as an error.
+Most regex programs poll for cancellation while matching.
+Programs that exceed PCRE2's compiled size limit with polling enabled retry compilation and poll before and after matching.
+
+On the tested raw objects, stock tries extended body rules, whole-file hashes, and then logical rules.
+A target-specific logical rule wins over a generic rule. Within the selected target, the first matching record wins.
+Logical rules receive each new object's context, including extracted children and normalized views.
+In an unmapped script view, absolute offsets use normalized bytes and `FileSize` uses the source length.
+Mapped script views use the normalized length and inherit the source's container.
+
+The Rust tests compare exact named results on local rules with pinned Debian clamd 1.4.3+dfsg-1.
+They cover overlap, duplicate subsignatures, count limits, compressed ZIP contents, normalized text, and competing matches.
+
+```sh
+cargo test --locked --test logical_signatures -- --include-ignored
+```
+
+With PUA disabled, stock loads 312,303 logical records from the pinned `main.ldb` and `daily.ldb`.
+The inventory applies the pinned functionality level and ignore lists.
+It counts 1,459,845 extended patterns, 1,208 PCRE subsignatures, 111 image fuzzy hashes, and one byte comparison.
+PCRE appears in 1,186 records. Group counts appear in 3,724 records.
+Barnacle compiled all 1,186 PCRE-bearing records in one local index on macOS.
+The test preserved offsets, triggers, and sibling patterns and replaced the rule names.
+
+| Target attribute | Records |
+| --- | ---: |
+| `FileSize` | 1,298 |
+| `Container` | 2,234 |
+| `NumberOfSections` | 44 |
+| `HandlerType` | 11 |
+| `Intermediates` | 1 |
+| `IconGroup1` | 52 |
+| `IconGroup2` | 28 |
+
+The feed includes generic, executable, document, graphics, mail, and normalized text targets.
+Patterns use absolute, end-of-file, entry-point, section, and PE version-info offsets.
+Unsupported active subsignatures, offsets, and target attributes fail loading with a source location.
+The generation loader verifies the pinned CVD digests before reading the logical and icon members.
+The verified snapshot test loads all 312,303 eligible logical records and 222 icon records into one generation.
+The loaded logical index and pinned clamd both name the local control `MixedLogical.UNOFFICIAL`.
+
+One Linux ARM64 run with one CPU, 2 GiB RAM, and no swap measured 599 MiB at readiness and 718 MiB peak during startup.
+A serial reload peaked at 1,231 MiB. The cgroup measurements include file-backed pages.
+
+Official database scans still report incomplete coverage. [Issue #3](https://github.com/yavosh/barnacle/issues/3)
+
+### Local benchmark
+
+One Linux ARM64 CPU, 2 GiB, four INSTREAM clients, and the cache disabled.
+Each of three runs issued 16,384 scans against a 64 KiB fixture and 1,025 local rules.
+All replies named the same expected signature. The table shows medians from `59d09eb` and Debian clamd `1.4.3+dfsg-1`.
+
+| Rules | Scanner | Scans/s | p95 | Peak cgroup memory |
+| --- | --- | ---: | ---: | ---: |
+| Exact body | Barnacle | 48,567 | 0.136 ms | 4.52 MiB |
+| Exact body | Stock clamd | 5,486 | 1.464 ms | 6.68 MiB |
+| Case-insensitive logical | Barnacle | 46,307 | 0.145 ms | 3.95 MiB |
+| Case-insensitive logical | Stock clamd | 3,387 | 2.471 ms | 11.63 MiB |
+| Triggered PCRE | Barnacle | 45,580 | 0.150 ms | 4.59 MiB |
+| Triggered PCRE | Stock clamd | 2,984 | 2.867 ms | 11.75 MiB |
+
+The exact-body build before modifiers (`89e7140`) reached 48,631 scans/s at 0.137 ms p95.
+[Raw results](benchmarks/logical-local.csv)
+
+### Supported pinned subset
+
+Both daemons loaded the same 312,081 eligible logical records and one harmless local PCRE rule.
+The benchmark used the earlier 312,081-record subset. Both daemons used the same pinned ignore lists.
+Each one-CPU, 2 GiB trial used four INSTREAM clients and issued 1,024 scans of a 64 KiB binary.
+A padded fixture used repeated punctuation. A varied fixture replaced that padding with changing bytes.
+Every reply named the local PCRE rule. The table shows medians of three trials.
+
+| Fixture | Scanner | Scans/s | p95 | Peak cgroup memory |
+| --- | --- | ---: | ---: | ---: |
+| Padded | Barnacle before seed change (`10ef879`) | 854 | 18.003 ms | 497.21 MiB |
+| Padded | Barnacle | 3,698 | 1.909 ms | 496.06 MiB |
+| Padded | Stock clamd | 1,090 | 8.023 ms | 722.39 MiB |
+| Varied | Barnacle before seed change (`10ef879`) | 1,897 | 3.698 ms | 497.42 MiB |
+| Varied | Barnacle | 1,804 | 4.269 ms | 496.40 MiB |
+| Varied | Stock clamd | 1,389 | 6.294 ms | 722.46 MiB |
+
+The seed selector now prefers a byte change within the required literal.
+This removed repeated candidate checks on the padded fixture. [Raw results](benchmarks/logical-supported-feed.csv)
+
+### Complete logical and icon tables
+
+Both daemons loaded the same 312,303 eligible logical records, 222 icon records, and pinned ignore lists.
+Each workload added one local logical control. The PE workload also added one local icon record.
+The stock loader reported 312,526 signatures for the PCRE profile.
+Each trial ran in a fresh Linux ARM64 container with one CPU, 2 GiB RAM, and no swap.
+Four INSTREAM clients issued 1,024 requests with `DisableCache yes`.
+Every reply named `Workspace.Reference.UNOFFICIAL`.
+
+The padded and varied 64 KiB inputs use a PCRE control. The 5 KiB PE fixture uses a 32-pixel icon and an icon-group control.
+The table shows the median of three trials per workload for `a209637` and Debian clamd `1.4.3+dfsg-1`.
+Throughput and p95 measure client requests after daemon startup. Peak cgroup memory includes startup and charged file-backed pages.
+
+| Fixture | Scanner | Scans/s | p95 | Peak cgroup memory |
+| --- | --- | ---: | ---: | ---: |
+| Padded binary | Barnacle | 3,628.39 | 2.000 ms | 495.07 MiB |
+| Padded binary | Stock clamd | 1,040.18 | 8.638 ms | 723.33 MiB |
+| Varied binary | Barnacle | 1,736.14 | 4.237 ms | 494.56 MiB |
+| Varied binary | Stock clamd | 1,266.91 | 6.954 ms | 722.89 MiB |
+| PE icon | Barnacle | 2,640.63 | 2.864 ms | 493.34 MiB |
+| PE icon | Stock clamd | 80.84 | 59.287 ms | 1,335.94 MiB |
+
+A separate one-trial check used the [Rust PE fixture generator](../tests/common/pe_icons.rs) with the same icon.
+Barnacle reached 2,632 scans/s at 2.675 ms p95. Stock reached 85 scans/s at 56.885 ms p95.
+The benchmark used the default `ScanPE yes` setting. [Raw measurements](benchmarks/logical-full-feed.csv)
