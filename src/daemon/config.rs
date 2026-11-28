@@ -171,12 +171,13 @@ impl Config {
             "MaxRecursion" => self.objects.max_recursion = number(value)?,
             "MaxRecHWP3" => self.objects.max_rec_hwp3 = number(value)?,
             "AlertExceedsMax" => self.objects.alert_exceeds_max = boolean(value)?,
+            "AlertEncryptedDoc" => self.objects.alert_encrypted_doc = boolean(value)?,
             "AlertPartitionIntersection" => {
                 self.objects.alert_partition_intersection = boolean(value)?
             }
             "HeuristicScanPrecedence" => self.objects.heuristic_scan_precedence = boolean(value)?,
             "HeuristicAlerts" => {
-                // Partition and scan-limit alerts use their own switches on the pinned daemon.
+                // Partition, locked PDF and scan-limit alerts use independent switches.
                 boolean(value)?;
                 self.partial_engine_options.push(key.into());
             }
@@ -350,7 +351,6 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         }
         "AlertEncrypted"
         | "AlertEncryptedArchive"
-        | "AlertEncryptedDoc"
         | "ArchiveBlockEncrypted"
         | "PhishingAlwaysBlockSSLMismatch"
         | "PhishingAlwaysBlockCloak"
@@ -471,7 +471,6 @@ mod tests {
             "LogSyslog yes",
             "AlertEncrypted yes",
             "AlertEncryptedArchive yes",
-            "AlertEncryptedDoc yes",
             "VirusEvent touch %v",
             "MaxFileSize 18446744073709551615G",
             "ExcludePath [",

@@ -40,7 +40,7 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             Some((start, start + u64::from(u32be(p, 12))))
         });
         if super::intersects(ranges, sink)?
-            && sink.partition_intersection("Heuristics.APMPartitionIntersection")
+            && sink.report_heuristic("Heuristics.APMPartitionIntersection")
         {
             return Ok(Handling::Stopped);
         }

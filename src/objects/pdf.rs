@@ -596,7 +596,11 @@ pub(super) fn header_type(data: &[u8]) -> bool {
         .any(|w| (w.starts_with(b"%PDF-") || w.starts_with(b"%pdf-")) && w[6] == b'.')
 }
 
-pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+pub(super) fn extract(
+    data: &[u8],
+    alert_encrypted_doc: bool,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Handling> {
     let Some(start) = data[..data.len().min(1032)]
         .windows(5)
         .position(|w| w == b"%PDF-")
@@ -608,6 +612,9 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         return Ok(Handling::Incomplete);
     };
     sink.check()?;
+    if pdf.locked && alert_encrypted_doc && sink.report_heuristic("Heuristics.Encrypted.PDF") {
+        return Ok(Handling::Stopped);
+    }
     let directories = pdf
         .objects
         .iter()

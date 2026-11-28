@@ -345,6 +345,13 @@ Stock scans stored carriers and stored streams as ciphertext.
 
 When the empty user password fails, stock does not decrypt. Its Flate stage then fails on the ciphertext and it scans each stream's physical bytes.
 Barnacle does the same only when both of stock's inflate attempts must fail at the zlib header. Other locked layouts yield incomplete coverage.
+
+With `AlertEncryptedDoc yes`, both daemons report `Heuristics.Encrypted.PDF` for the password-protected fixture.
+A whole-file signature wins first. A ciphertext stream signature wins with default precedence.
+`HeuristicScanPrecedence yes` reports the PDF alert before scanning those streams, including when `HeuristicAlerts no` is set.
+The alert requires `ScanPDF yes`. Documents that open with an empty user password remain eligible for ordinary stream scanning.
+The controls include documents with extraction restrictions. A deferred PDF alert and a deferred limit can win on different daemon starts.
+Barnacle reports incomplete when that winner is ambiguous. [PDF alert comparisons](../tests/object_pdf_security.rs)
 Stock sets its attachment flag only when `/EmbeddedFile` appears before the filter list.
 Without that flag, a stream whose only filters are LZW or run-length is not scanned. The flag also selects the `/EFF` crypt filter.
 In encrypted documents, stock decrypts a stream before its LZW chain. A leading DCT stage keeps the ciphertext.

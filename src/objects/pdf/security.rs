@@ -258,8 +258,14 @@ impl Security {
         doc.trailer.set("ID", trailer.get(b"ID").ok()?.clone());
         doc.trailer.set("Encrypt", Object::Reference(id));
         doc.objects.insert(id, Object::Dictionary(dict));
-        if doc.authenticate_raw_user_password(b"").is_err() {
-            return Some(Access::Locked);
+        match doc.authenticate_raw_user_password(b"") {
+            Ok(()) => (),
+            Err(lopdf::Error::Decryption(
+                lopdf::encryption::DecryptionError::IncorrectPassword,
+            )) => {
+                return Some(Access::Locked);
+            }
+            Err(_) => return None,
         }
         let state = EncryptionState::decode(&doc, b"").ok()?;
         let dict = doc.get_encrypted().ok()?;
@@ -530,6 +536,14 @@ fn aes_filters<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_security_dictionary_does_not_establish_a_locked_document() {
+        let trailer = b"<< /Encrypt 1 0 R /ID [<11> <11>] >>";
+        let incomplete = b"<< /Filter /Standard /R 4 /V 4 /Length 128 >>";
+        assert!(Security::open((1, 0), incomplete, trailer).is_none());
+    }
+
     #[test]
     fn accept_only_direct_embedded_file_mime_subtypes() {
         for (header, expected) in [

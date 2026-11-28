@@ -32,8 +32,8 @@ pub struct LogicalObject<'a> {
     pub file_size: usize,
     /// An in-memory script view has no generic relative-offset table.
     pub unmapped_script: bool,
-    /// A mapped script also evaluates empty counts against its restored source map.
-    pub mapped_source_size: Option<usize>,
+    /// The owning map for a normalized script view.
+    pub script_source: Option<&'a [u8]>,
 }
 
 struct Conditions {
@@ -337,6 +337,10 @@ impl LogicalIndex {
         self.children
             .iter()
             .any(|r| r.target == Target::Ascii && r.offset.is_relative())
+            || self
+                .bytecode
+                .keys()
+                .any(|&id| self.records[id as usize].conditions.target == Target::Ascii)
     }
 
     /// Return the first eligible logical signature without a reference digest.
@@ -474,18 +478,20 @@ impl LogicalIndex {
             &mut check,
         )?;
         if matches.finding == Ok(None)
-            && let Some(size) = object.mapped_source_size
+            && !object.unmapped_script
+            && let Some(source) = object.script_source
         {
             // cli_scanscript restores the source map after scanning the mapped view,
             // then checks the caller's initially empty logical counters.
             let restored = LogicalObject {
-                file_size: size,
+                file_size: source.len(),
                 recursion_level: object.recursion_level.saturating_sub(1),
+                script_source: None,
                 ..object
             };
             matches.finding = self
                 .evaluate(
-                    bytes,
+                    source,
                     context,
                     &restored,
                     &ScanEvidence::default(),
@@ -601,9 +607,18 @@ impl LogicalIndex {
         let mut icon_samples = None;
         for (_, id) in pending {
             if let Some(program) = self.bytecode.get(&id) {
+                let input = if object.unmapped_script {
+                    object.script_source.unwrap_or(bytes)
+                } else {
+                    bytes
+                };
                 let offsets = evidence.first_offsets.get(&id).unwrap_or(&NO_MATCH_OFFSETS);
+                let counts = evidence
+                    .matches
+                    .get(&id)
+                    .map_or(&[][..], |entry| entry.counts.as_slice());
                 if let Some(name) =
-                    program.run(bytes, offsets, self.bytecode_timeout, &mut *check)?
+                    program.run(input, offsets, counts, self.bytecode_timeout, &mut *check)?
                 {
                     finding = Ok(Some(name));
                     break;
@@ -1075,7 +1090,7 @@ mod tests {
                         recursion_level: 0,
                         file_size: bytes.len(),
                         unmapped_script: false,
-                        mapped_source_size: None,
+                        script_source: None,
                     },
                     || Ok(())
                 )?,
@@ -1116,7 +1131,7 @@ mod tests {
                         recursion_level: layers.as_slice().len(),
                         file_size: size,
                         unmapped_script: false,
-                        mapped_source_size: None,
+                        script_source: None,
                     },
                     || Ok(())
                 )?,

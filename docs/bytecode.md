@@ -39,8 +39,9 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 24 of the 72 logical modules in the signed archive.
-The inventory groups the remaining 58 modules by the first compiler rejection.
+The compiler accepts 52 of the 72 logical modules in the signed archive.
+The archive test loads their triggers together through the logical index.
+The inventory groups the remaining 30 eligible modules by the first compiler rejection.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -62,9 +63,14 @@ The fixture SHA-256 is `36d282680ef43be4eb5fc1aec95b6d262460c3a5ffb2563a280a35db
 ## Supported execution
 
 The Rust interpreter executes logical bytecode with typed integer locals, arithmetic, comparisons, casts, branches, and loops.
-The supported host APIs read bytes, search a bounded part of the scan object, report the engine level, and set a detection name.
-The logical matcher records first subsignature offsets for programs that read them.
-Those programs currently require indexed pattern subsignatures.
+Each call gets a fresh frame, with checked addressable locals and a cursor over the current scan object.
+The frame supports pointer arithmetic, loads, stores, byte swaps, and bounded memory operations.
+Host calls can seek, read, search, report the engine level, and set a detection name.
+Bytecode can read the object size, subsignature counts, and first offsets.
+Programs that use first offsets currently require indexed pattern subsignatures.
+An ASCII-target bytecode rule forces a normalized file map for script scanning.
+An unmapped script scan matches normalized text. Its bytecode reads the owning file map.
+[ClamAV 1.4.3 script scan](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/scanners.c#L2092-L2190)
 
 The interpreter checks the bytecode timeout every 5,000 instructions, matching the pinned stock interpreter.
 `BytecodeTimeout 0` uses the stock engine's 60-second fallback.
@@ -72,7 +78,8 @@ Scan cancellation applies at each instruction and during host searches.
 Local CBC files require `BytecodeUnsigned yes` and `Bytecode yes`.
 An eligible module with unsupported instructions, APIs, or metadata prevents activation.
 
-The comparison covers exact names, first and missing offsets, scalar widths, search boundaries, and a 1 ms timeout.
+The comparison covers exact names, offsets, match counts, scalar widths, search boundaries, and a 1 ms timeout.
+Frame tests compare short reads, EOF, cursor position, nested archive members, and both script map modes.
 It also covers competing generic logical signatures.
 When both rules match, stock evaluates the one loaded first from the database directory.
 Barnacle returns its existing incomplete-scan error for misses while detection coverage remains partial.
@@ -81,3 +88,20 @@ Barnacle returns its existing incomplete-scan error for misses while detection c
 ```sh
 BARNACLE_CBC_FIXTURE=/path/to/pinned/fixture.cbc cargo test --locked --test bytecode_reference -- --include-ignored
 ```
+
+## Focused interpreter timing
+
+The ARM64 Debian comparison used one CPU, 2 GiB RAM, and `ForceInterpreter`.
+Each daemon warmed up with 64 requests. Five trials sent 1,000 sequential `INSTREAM` requests each.
+The table reports the median trial throughput and p95 latency.
+
+| Fixture | Build | Requests/s | p95 |
+| --- | --- | ---: | ---: |
+| 512-iteration scalar loop | Stock | 20,123 | 68 µs |
+| 512-iteration scalar loop | Previous Barnacle | 18,531 | 65 µs |
+| 512-iteration scalar loop | Current Barnacle | 18,004 | 68 µs |
+| Read, seek, and byte swap | Stock | 18,259 | 69 µs |
+| Read, seek, and byte swap | Current Barnacle | 80,664 | 16 µs |
+
+The scalar comparison motivated a direct register path for programs without addressable locals.
+Full-feed throughput, latency, and memory qualification remain open.

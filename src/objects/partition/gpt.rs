@@ -138,7 +138,7 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
                         .then(|| (start, end + 1))
                 });
             if super::intersects(ranges, sink)? {
-                if sink.partition_intersection("Heuristics.GPTPartitionIntersection") {
+                if sink.report_heuristic("Heuristics.GPTPartitionIntersection") {
                     return Ok(Handling::Stopped);
                 }
                 break;

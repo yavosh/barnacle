@@ -786,7 +786,7 @@ mod tests {
                         recursion_level: 0,
                         file_size: logical_control.len(),
                         unmapped_script: false,
-                        mapped_source_size: None,
+                        script_source: None,
                     },
                     || Ok(()),
                 )

@@ -3,7 +3,11 @@ use std::fmt::Write;
 
 pub const NAME: &str = "Local.Bytecode.Receipt";
 const RECEIPT_TRIGGER: &str = "0;72656365697074";
+const ADDRESSABLE: u64 = 1 << 15;
+const READ: u64 = 2;
+const SEEK: u64 = 4;
 const SET_NAME: u64 = 5;
+const FIND: u64 = 16;
 const BYTE_AT: u64 = 17;
 const FIND_LIMIT: u64 = 65;
 const ENGINE_LEVEL: u64 = 66;
@@ -150,8 +154,8 @@ fn image(
         number(32),
         number(locals.len() as u64)
     );
-    for &width in locals {
-        entry += &(number(width) + &fixed(0, 1));
+    for &local in locals {
+        entry += &(number(local & !ADDRESSABLE) + &fixed(u64::from(local & ADDRESSABLE != 0), 1));
     }
     let instructions: usize = blocks.iter().map(Vec::len).sum();
     entry += &(String::from("F") + &number(instructions as u64) + &number(blocks.len() as u64));
@@ -322,4 +326,238 @@ pub fn scalar_widths() -> String {
             vec![ret()],
         ],
     )
+}
+
+/// Seek past the trigger, read a word into an addressable local, and interpret it.
+pub fn read_word() -> String {
+    let mut read = vec![
+        call(2, SEEK, &[immediate(7, 4), immediate(0, 4)]),
+        op(65, 1, 36, &[number(73), number(0), immediate(0, 4)]),
+        call(3, READ, &[number(1), immediate(2, 4)]),
+        op(16, 4, 39, &[number(1)]),
+        op(16, 5, 46, &[number(4)]),
+        op(1, 6, 44, &[]),
+        op(16, 7, 31, &[number(6), number(4), number(5)]),
+        // The pointer moves by one byte, then STORE overwrites that byte.
+        op(65, 8, 35, &[number(65), number(1), immediate(1, 4)]),
+        op(8, 0, 38, &[immediate(u64::from(b'Y'), 1), number(8)]),
+        op(8, 9, 39, &[number(8)]),
+        // A zero-distance seek observes the position reached by the read.
+        call(10, SEEK, &[immediate(0, 4), immediate(1, 4)]),
+    ];
+    for (destination, width, value, expected) in [
+        (11, 32, 2, 7),
+        (12, 32, 3, 2),
+        (13, 16, 7, 0x4142),
+        (14, 8, 9, u64::from(b'Y')),
+        (15, 32, 10, 9),
+    ] {
+        read.push(op(
+            1,
+            destination,
+            21,
+            &[number(width), number(value), immediate(expected, width / 8)],
+        ));
+    }
+    for (dest, left, right) in [(16, 11, 12), (17, 13, 14), (18, 16, 17), (19, 18, 15)] {
+        read.push(op(1, dest, 11, &[number(left), number(right)]));
+    }
+    read.push(branch(19, 1, 2));
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32, 32]),
+            array(NAME.len() + 1, 8),
+            array(2, 8),
+            fixed(5, 1) + &number(72),
+        ],
+        &[
+            (READ, 69, "read"),
+            (SEEK, 70, "seek"),
+            (SET_NAME, 69, "setvirusname"),
+        ],
+        name_globals(0, 3, 71),
+        &[
+            ADDRESSABLE | 72,
+            65,
+            32,
+            32,
+            16,
+            16,
+            1,
+            16,
+            65,
+            8,
+            32,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            32,
+        ],
+        &[read, vec![report(20), ret()], vec![ret()]],
+    )
+}
+
+/// Search from EOF minus four and confirm that searching leaves the cursor at that position.
+pub fn cursor_search() -> String {
+    let mut globals = name_globals(0, 5, 71);
+    global_array(&mut globals, 72, b"ABC");
+    global_pointer(&mut globals, 65, 3, 0);
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32, 32]),
+            array(NAME.len() + 1, 8),
+            array(3, 8),
+        ],
+        &[
+            (SEEK, 70, "seek"),
+            (SET_NAME, 69, "setvirusname"),
+            (FIND, 69, "file_find"),
+        ],
+        globals,
+        &[32, 32, 32, 1, 1, 1, 32],
+        &[
+            vec![
+                call(
+                    0,
+                    SEEK,
+                    &[immediate(u64::from((-4i32) as u32), 4), immediate(2, 4)],
+                ),
+                call(1, FIND, &[pointer(4), immediate(3, 4)]),
+                call(2, SEEK, &[immediate(0, 4), immediate(1, 4)]),
+                op(1, 3, 21, &[number(32), number(0), number(2)]),
+                op(1, 4, 21, &[number(32), number(0), number(1)]),
+                op(1, 5, 11, &[number(3), number(4)]),
+                branch(5, 1, 2),
+            ],
+            vec![report(6), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
+/// Read one byte directly into a scalar that is also read as an instruction operand.
+pub fn direct_read() -> String {
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32, 32]),
+            array(NAME.len() + 1, 8),
+        ],
+        &[
+            (READ, 69, "read"),
+            (SEEK, 70, "seek"),
+            (SET_NAME, 69, "setvirusname"),
+        ],
+        name_globals(0, 3, 71),
+        &[ADDRESSABLE | 8, 32, 32, 1, 1, 1, 32],
+        &[
+            vec![
+                call(1, SEEK, &[immediate(7, 4), immediate(0, 4)]),
+                call(2, READ, &[number(0), immediate(1, 4)]),
+                op(1, 3, 21, &[number(32), number(2), immediate(1, 4)]),
+                op(
+                    1,
+                    4,
+                    21,
+                    &[number(8), number(0), immediate(u64::from(b'Q'), 1)],
+                ),
+                op(1, 5, 11, &[number(3), number(4)]),
+                branch(5, 1, 2),
+            ],
+            vec![report(6), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
+/// Observe the current file size, two matches, and a zero for an unused counter.
+pub fn scan_metadata() -> String {
+    let mut globals = name_globals(0x8004, 6, 70);
+    global_pointer(&mut globals, 67, 0x8000, 0);
+    global_pointer(&mut globals, 67, 0x8000, 4);
+    global_pointer(&mut globals, 67, 0x8004, 0);
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(64, 32),
+            array(1, 32),
+        ],
+        &[(SET_NAME, 69, "setvirusname")],
+        globals,
+        &[32, 32, 32, 1, 1, 1, 1, 1, 32],
+        &[
+            vec![
+                op(32, 0, 39, &[pointer(3)]),
+                op(32, 1, 39, &[pointer(4)]),
+                op(32, 2, 39, &[pointer(5)]),
+                op(1, 3, 21, &[number(32), number(0), immediate(2, 4)]),
+                op(1, 4, 21, &[number(32), number(1), immediate(0, 4)]),
+                op(1, 5, 21, &[number(32), number(2), immediate(24, 4)]),
+                op(1, 6, 11, &[number(3), number(4)]),
+                op(1, 7, 11, &[number(6), number(5)]),
+                branch(7, 1, 2),
+            ],
+            vec![report(8), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
+/// Compare the active map while a script is matched after whitespace collapse.
+pub fn normalized_script(mapped: bool) -> String {
+    let mut globals = name_globals(0x8004, 4, 71);
+    global_pointer(&mut globals, 67, 0x8004, 0);
+    let (expected_size, first_byte) = if mapped { (14, b'r') } else { (17, b'R') };
+    let program = image(
+        "0;7265636569707420706164646564",
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32]),
+            array(NAME.len() + 1, 8),
+            array(1, 32),
+        ],
+        &[(SET_NAME, 69, "setvirusname"), (BYTE_AT, 70, "file_byteat")],
+        globals,
+        &[32, 32, 1, 1, 1, 32],
+        &[
+            vec![
+                op(32, 0, 39, &[pointer(3)]),
+                call(1, BYTE_AT, &[immediate(0, 4)]),
+                op(
+                    1,
+                    2,
+                    21,
+                    &[number(32), number(0), immediate(expected_size, 4)],
+                ),
+                op(
+                    1,
+                    3,
+                    21,
+                    &[number(32), number(1), immediate(u64::from(first_byte), 4)],
+                ),
+                op(1, 4, 11, &[number(2), number(3)]),
+                branch(4, 1, 2),
+            ],
+            vec![report(5), ret()],
+            vec![ret()],
+        ],
+    );
+    if mapped {
+        program.replacen("Target:0", "Target:7", 1)
+    } else {
+        program
+    }
 }

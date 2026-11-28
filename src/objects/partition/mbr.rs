@@ -93,7 +93,7 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             .take(sink.max_partitions())
             .map(|e| (e.kind != 0).then_some((e.start, e.start + e.length)));
         if super::intersects(ranges, sink)?
-            && sink.partition_intersection("Heuristics.MBRPartitionnIntersect")
+            && sink.report_heuristic("Heuristics.MBRPartitionnIntersect")
         {
             return Ok(Handling::Stopped);
         }

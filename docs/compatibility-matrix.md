@@ -87,7 +87,7 @@ Use each profile's recorded database digests when comparing results.
 | PE icons, `.idb` | daily | Local icon-group rules use PE resources and preserve rule precedence. [PE icon comparisons](../tests/logical_pe_icons.rs) |
 | URL rules, `.pdb .wdb` | daily | Exercise benign URL fixtures. [#10](https://github.com/yavosh/barnacle/issues/10) |
 | File types and dynamic settings, `.ftm .cfg` | daily | Check type reclassification at each layer and feature selection. [#9](https://github.com/yavosh/barnacle/issues/9) · [#10](https://github.com/yavosh/barnacle/issues/10) |
-| Bytecode, `.cbc` | bytecode | The interpreter compiles 24 signed logical modules. Local controls compare detections, precedence, host searches, and timeout behavior with stock. Signed-feed activation remains open. [Bytecode requirements](bytecode.md) · [#4](https://github.com/yavosh/barnacle/issues/4) |
+| Bytecode, `.cbc` | bytecode | The interpreter compiles 52 signed logical modules. Local controls compare detections, frame and cursor behavior, and timeouts with stock. Signed-feed activation remains open. [Bytecode requirements](bytecode.md) · [#4](https://github.com/yavosh/barnacle/issues/4) |
 | Generation metadata, `.info` | main, daily, bytecode | Validate signed archives before activation. Exercise CVD and CLD update behavior. [#11](https://github.com/yavosh/barnacle/issues/11) |
 
 The pinned loader also recognizes `.db .sdb .imp .zmd .rmd .gdb .cat .ioc .pwdb .cud` and build-dependent `.yar .yara`.

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{self, Read};
+use std::path::Path;
 
 mod program;
 pub use program::Program;
@@ -14,6 +15,47 @@ pub const PINNED_ARCHIVE: (&str, u64, &str) = (
     "6d4aa01f219e988060fc419f495d07f27e0cdf1a2cccc065971da922c76f7ffb",
 );
 pub const MAX_MEMBER_BYTES: u64 = 1024 * 1024;
+
+fn visit_verified_members(
+    input: impl Read,
+    mut visit: impl FnMut(&Path, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let (name, length, digest) = PINNED_ARCHIVE;
+    let mut bytes = Vec::new();
+    input.take(length + 1).read_to_end(&mut bytes)?;
+    let actual: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if bytes.len() as u64 != length || actual != digest {
+        return Err(invalid(format!(
+            "{name}: SHA-256 differs from the verified generation"
+        )));
+    }
+
+    let mut archive = tar::Archive::new(GzDecoder::new(&bytes[512..]));
+    let mut contents = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.extension() != Some(OsStr::new("cbc")) {
+            continue;
+        }
+        let mut components = path.components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) || !entry.header().entry_type().is_file()
+            || entry.size() > MAX_MEMBER_BYTES
+        {
+            return Err(invalid("invalid bytecode archive member"));
+        }
+        contents.clear();
+        entry.read_to_end(&mut contents)?;
+        visit(&path, &contents)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Inventory {
@@ -35,45 +77,18 @@ pub struct Inventory {
 impl Inventory {
     /// Inspect the pinned archive after checking its complete SHA-256.
     pub fn from_archive(input: impl Read, engine_level: u64) -> io::Result<Self> {
-        let (name, length, digest) = PINNED_ARCHIVE;
-        let mut bytes = Vec::new();
-        input.take(length + 1).read_to_end(&mut bytes)?;
-        let actual: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        if bytes.len() as u64 != length || actual != digest {
-            return Err(invalid(format!(
-                "{name}: SHA-256 differs from the verified generation"
-            )));
-        }
-
-        let mut archive = tar::Archive::new(GzDecoder::new(&bytes[512..]));
         let mut result = Self::default();
-        let mut contents = Vec::new();
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let path = entry.path()?.into_owned();
-            if path.extension() != Some(OsStr::new("cbc")) {
-                continue;
-            }
-            if path.components().count() != 1
-                || !entry.header().entry_type().is_file()
-                || entry.size() > MAX_MEMBER_BYTES
-            {
-                return Err(invalid("invalid bytecode archive member"));
-            }
-            contents.clear();
-            entry.read_to_end(&mut contents)?;
-            result.inspect(&contents, engine_level).ok_or_else(|| {
+        visit_verified_members(input, |path, contents| {
+            result.inspect(contents, engine_level).ok_or_else(|| {
                 invalid(format!("invalid bytecode inventory for {}", path.display()))
             })?;
-            match Program::compile(&contents, engine_level) {
+            match Program::compile(contents, engine_level) {
                 Ok(Some(_)) => result.compiled += 1,
                 Ok(None) => {}
                 Err(error) => *result.compile_errors.entry(error.to_string()).or_default() += 1,
             }
-        }
+            Ok(())
+        })?;
         Ok(result)
     }
 
@@ -369,10 +384,14 @@ mod tests {
 
     #[test]
     #[ignore = "set BARNACLE_CVD_DIR to the verified FreshClam snapshot"]
-    fn matches_stock_archive_inventory() {
+    fn matches_stock_archive_inventory() -> io::Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
         let dir = std::path::PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap());
-        let archive = std::fs::File::open(dir.join(PINNED_ARCHIVE.0)).unwrap();
-        let found = Inventory::from_archive(archive, u64::from(crate::PINNED_FLEVEL)).unwrap();
+        let archive = dir.join(PINNED_ARCHIVE.0);
+        let engine_level = u64::from(crate::PINNED_FLEVEL);
+        let found = Inventory::from_archive(File::open(&archive)?, engine_level)?;
         assert_eq!(found.modules, 85);
         assert_eq!(found.formats, BTreeMap::from([(6, 10), (7, 75)]));
         assert_eq!(found.unsupported_formats, 0);
@@ -385,7 +404,27 @@ mod tests {
         assert_eq!(found.instructions, 15_034);
         assert_eq!(found.opcodes.len(), 44);
         assert_eq!(found.apis.len(), 28);
-        assert_eq!(found.compiled, 24);
-        assert_eq!(found.compile_errors.values().sum::<usize>(), 58);
+        assert_eq!(found.compiled, 52);
+        assert_eq!(found.compile_errors.values().sum::<usize>(), 30);
+
+        let scratch = tempfile::tempdir()?;
+        let mut sources = Vec::new();
+        visit_verified_members(File::open(&archive)?, |path, contents| {
+            if matches!(Program::compile(contents, engine_level), Ok(Some(_))) {
+                let path = scratch.path().join(path);
+                File::create_new(&path)?.write_all(contents)?;
+                sources.push(path);
+            }
+            Ok(())
+        })?;
+        let paths: Vec<_> = sources.iter().map(|path| (path.as_path(), true)).collect();
+        let index = crate::body::LogicalIndex::load_with(
+            &paths,
+            crate::PINNED_FLEVEL,
+            &crate::IgnoreSet::default(),
+            |path| File::open(path),
+        )?;
+        assert_eq!(index.rule_count(), found.compiled);
+        Ok(())
     }
 }

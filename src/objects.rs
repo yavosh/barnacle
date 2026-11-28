@@ -86,7 +86,7 @@ trait ChildSink {
     fn recorded_limit(&self) -> Option<Limit>;
     fn max_partitions(&self) -> usize;
     fn check_partition_intersections(&self) -> bool;
-    fn partition_intersection(&mut self, name: &'static str) -> bool;
+    fn report_heuristic(&mut self, name: &'static str) -> bool;
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool;
     fn size_limit(&self, size: u64) -> Option<Limit>;
     fn skip_declared_size(&mut self, size: u64) -> bool;
@@ -104,6 +104,7 @@ pub struct Options {
     pub max_rec_hwp3: usize,
     pub alert_exceeds_max: bool,
     pub alert_partition_intersection: bool,
+    pub alert_encrypted_doc: bool,
     pub heuristic_scan_precedence: bool,
     pub scan_archive: bool,
     pub scan_pe: bool,
@@ -137,6 +138,7 @@ impl Default for Options {
             max_rec_hwp3: 16,
             alert_exceeds_max: false,
             alert_partition_intersection: false,
+            alert_encrypted_doc: false,
             heuristic_scan_precedence: false,
             scan_archive: true,
             scan_pe: true,
@@ -329,7 +331,7 @@ struct Traversal<'a> {
     files_scanned: usize,
     stopped: Option<Verdict>,
     first_limit: Option<Limit>,
-    partition_alert: Option<Verdict>,
+    deferred_heuristic: Option<Verdict>,
     last_handler_hash: [u8; 16],
     matcher: &'a mut Matcher<'a>,
     check: &'a mut dyn FnMut() -> io::Result<()>,
@@ -360,7 +362,7 @@ pub fn scan(
         files_scanned: 0,
         stopped: None,
         first_limit: None,
-        partition_alert: None,
+        deferred_heuristic: None,
         last_handler_hash: [0; 16],
         matcher: &mut matcher,
         check: &mut check,
@@ -368,7 +370,7 @@ pub fn scan(
     walk.visit(bytes, InputKind::File, None, false)?;
     Ok(walk.stopped.unwrap_or_else(|| {
         match (
-            walk.partition_alert,
+            walk.deferred_heuristic,
             walk.first_limit.filter(|_| options.alert_exceeds_max),
         ) {
             // Pinned daemons can select either name among distinct deferred alerts.
@@ -499,7 +501,7 @@ impl Traversal<'_> {
                 recursion_level: parents.len() + self.normalized_depth,
                 file_size: bytes.len(),
                 unmapped_script: false,
-                mapped_source_size: None,
+                script_source: None,
             },
             handled_format,
         };
@@ -677,7 +679,7 @@ impl ChildSink for Traversal<'_> {
                 recursion_level: self.parents.len() + self.normalized_depth,
                 file_size: bytes.len(),
                 unmapped_script: false,
-                mapped_source_size: None,
+                script_source: None,
             },
             handled_format: true,
         };
@@ -726,15 +728,15 @@ impl ChildSink for Traversal<'_> {
         self.options.alert_partition_intersection
     }
 
-    fn partition_intersection(&mut self, name: &'static str) -> bool {
+    fn report_heuristic(&mut self, name: &'static str) -> bool {
         if self.options.heuristic_scan_precedence {
             self.stopped = Some(Verdict::Found(name.to_owned()));
             true
         } else {
-            match &self.partition_alert {
-                None => self.partition_alert = Some(Verdict::Found(name.to_owned())),
+            match &self.deferred_heuristic {
+                None => self.deferred_heuristic = Some(Verdict::Found(name.to_owned())),
                 Some(Verdict::Found(existing)) if existing != name => {
-                    self.partition_alert = Some(Verdict::Incomplete)
+                    self.deferred_heuristic = Some(Verdict::Incomplete)
                 }
                 _ => (),
             }
@@ -904,7 +906,7 @@ impl ChildSink for Traversal<'_> {
                 recursion_level: parents.len() + self.normalized_depth + usize::from(mapped),
                 file_size: if mapped { bytes.len() } else { owner.size },
                 unmapped_script: !mapped,
-                mapped_source_size: mapped.then_some(owner.size),
+                script_source: Some(source),
             },
             handled_format: true,
         };

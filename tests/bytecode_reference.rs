@@ -1,8 +1,10 @@
-//! Compare one harmless logical bytecode trigger against pinned clamd.
+//! Compare harmless logical bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
 #[path = "bytecode_reference/scalar.rs"]
 mod scalar;
+#[path = "common/zip.rs"]
+mod zip;
 
 use daemon::{Daemon, stream_frame, unix_request};
 use sha2::{Digest, Sha256};
@@ -250,4 +252,83 @@ fn barnacle_scalar_bytecode() -> io::Result<()> {
 fn stock_scalar_bytecode() -> io::Result<()> {
     verify_stock()?;
     compare_vm(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
+fn compare_read_cursor(executable: &Path, miss: &str) -> io::Result<()> {
+    let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    let zip = zip::zip(
+        &[("first.txt", b"receiptAX"), ("second.txt", b"receiptAB")],
+        true,
+        false,
+        false,
+    )?;
+    run_program(
+        executable,
+        &scalar::read_word(),
+        options,
+        &[
+            (b"receiptAB tail", true),
+            (b"receiptAX tail", false),
+            (b"receiptA", false),
+            (b"receipt", false),
+            (b"receiptAB", true),
+            (&zip, true),
+        ],
+        miss,
+    )?;
+    run_program(
+        executable,
+        &scalar::direct_read(),
+        options,
+        &[
+            (b"receiptQ", true),
+            (b"receiptX", false),
+            (b"receipt", false),
+        ],
+        miss,
+    )?;
+    run_program(
+        executable,
+        &scalar::scan_metadata(),
+        options,
+        &[
+            (b"receipt receipt padded!!", true),
+            (b"receipt receipt padded!", false),
+            (b"receipt form            ", false),
+        ],
+        miss,
+    )?;
+    for mapped in [false, true] {
+        run_program(
+            executable,
+            &scalar::normalized_script(mapped),
+            options,
+            &[(b"RECEIPT    PADDED", true), (b"RECEIPT    DRAFT", false)],
+            miss,
+        )?;
+    }
+    run_program(
+        executable,
+        &scalar::cursor_search(),
+        options,
+        &[
+            (b"receiptABC!", true),
+            (b"ABCreceipt!!!", false),
+            (b"receiptXABC", false),
+            (b"receipt!ABC?", true),
+        ],
+        miss,
+    )
+}
+
+#[test]
+fn barnacle_bytecode_frame_and_cursor() -> io::Result<()> {
+    compare_read_cursor(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_bytecode_frame_and_cursor() -> io::Result<()> {
+    verify_stock()?;
+    compare_read_cursor(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }
