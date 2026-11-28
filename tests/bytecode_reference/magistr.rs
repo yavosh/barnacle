@@ -5,7 +5,7 @@ use super::{
 use std::{fs, io, path::Path};
 
 // Two data sections, no executable section, zero entry RVA. The last section contains one numeric record.
-fn receipt(virtual_size: u32, disk_size: u32, tag: u32, tag_offset: usize) -> Vec<u8> {
+pub(super) fn receipt(virtual_size: u32, disk_size: u32, tag: u32, tag_offset: usize) -> Vec<u8> {
     let mut image = pe::benign_pe();
     image[512..].fill(0);
     image.resize(1024 + disk_size as usize, 0);

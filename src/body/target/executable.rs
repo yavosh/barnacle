@@ -84,6 +84,10 @@ pub(crate) struct PeMetadata {
 }
 
 impl PeMetadata {
+    pub(crate) fn with_retained_sections(bytes: &[u8], limit: usize) -> Option<Self> {
+        read_pe_metadata(bytes, Some(limit))
+    }
+
     pub(crate) fn entry(&self) -> u32 {
         self.entry
     }
@@ -130,9 +134,21 @@ impl PeMetadata {
 }
 
 pub(crate) fn pe_metadata(bytes: &[u8]) -> Option<PeMetadata> {
+    read_pe_metadata(bytes, None)
+}
+
+fn read_pe_metadata(bytes: &[u8], retained_limit: Option<usize>) -> Option<PeMetadata> {
     let mut sections = Vec::new();
     let (executable, headers) = read_pe(bytes, |header, salign, rva, mapped| {
         let e = Endian::Little;
+        if let Some(limit) = retained_limit {
+            if mapped.size == 0 && e.u32(header, 16)? != 0 {
+                return Some(());
+            }
+            if sections.len() == limit {
+                return None;
+            }
+        }
         let urva = e.u32(header, 12)?;
         let uvsz = e.u32(header, 8)?;
         let uraw = e.u32(header, 20)?;

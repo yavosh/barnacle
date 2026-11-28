@@ -183,10 +183,11 @@ Use the effective daemon options and engine module flags together to determine w
 | --- | --- |
 | PE Parite heuristic | Stock comparisons cover the exact verdict, option gates, raw signature priority, and `PE_ALL` breaks. The fixture uses inert data in a non-executable section. [Parite tests](../tests/bytecode_reference/parite.rs) |
 | PE Magistr heuristics | Paired tests cover A and B, truncated sections, and precedence against Parite. Rust metadata tests cover both `.dam` names. [Magistr tests](../tests/bytecode_reference/magistr.rs) |
-| PE heuristics for Kriz and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
+| PE Polipos heuristic | Stock comparisons cover all three target prefixes, section selection, target limits, and detection order. The PE entry point returns immediately. [Polipos tests](../tests/bytecode_reference/polipos.rs) |
+| PE Kriz heuristic | Stock comparisons cover DLLs, entry-point bounds, scan options, and precedence with Parite and Magistr. [Kriz tests](../tests/bytecode_reference/kriz.rs) |
 | PDF obfuscated names | Stock comparisons cover physical and packed dictionaries, escaped Flate filters, and competing child signatures. |
 | Mydoom log checksum | Stock comparisons cover binary and UTF-16BE inputs, checksums, minimum size, the early word screen, and precedence against a hash signature. [Log tests](../tests/object_mydoom.rs) |
-| RIFF | Named finding parity is open. |
+| RIFF animated cursors | Payload-free header controls cover both byte orders, groups, padding, options, and body/hash priority. [RIFF tests](../tests/object_riff.rs) |
 | XZ dictionary limit | A final decoder memory refusal reports `Heuristics.XZ.DicSizeLimit` and discards the decoded prefix. The stock test forces a refusal on an ordinary receipt. |
 | URL phishing checks | Verified URL rule loading and detection are tracked in [issue #10](https://github.com/yavosh/barnacle/issues/10). |
 

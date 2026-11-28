@@ -21,6 +21,8 @@ mod ole;
 mod onenote;
 mod partition;
 mod pdf;
+mod polipos;
+mod riff;
 mod rtf;
 mod swf;
 mod text;

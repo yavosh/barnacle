@@ -6,6 +6,8 @@ use super::{
 use crate::body::{HandlerType, ObjectContext, Target};
 use std::io;
 
+mod kriz;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Parser {
     Archive,
@@ -63,6 +65,13 @@ impl FileType {
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
         if options.heuristic_alerts
+            && self.name == "CL_TYPE_RIFF"
+            && super::riff::irregular_header(bytes, || sink.check())?
+            && sink.report_heuristic("Heuristics.Exploit.W32.MS05-002")
+        {
+            return Ok(Handling::Stopped);
+        }
+        if options.heuristic_alerts
             && matches!(self.name, "CL_TYPE_BINARY_DATA" | "CL_TYPE_TEXT_UTF16BE")
             && mydoom_log(bytes)
             && sink.report_heuristic("Heuristics.Worm.Mydoom.M.log")
@@ -102,13 +111,7 @@ impl FileType {
             return Ok(Self::generic(bytes, name, Parser::PartitionMap(name)));
         }
         if bytes.starts_with(b"RIFF") || bytes.starts_with(b"RIFX") {
-            // Stock has an additional pre-match pass for animated cursors.
-            let parser = if bytes.get(8..12) == Some(b"ACON") {
-                Parser::None
-            } else {
-                Parser::Raw
-            };
-            return Ok(Self::generic(bytes, "CL_TYPE_RIFF", parser));
+            return Ok(Self::generic(bytes, "CL_TYPE_RIFF", Parser::Raw));
         }
         if let Some(layout) = iso::Layout::recognize(bytes) {
             return Ok(Self::generic(
@@ -399,24 +402,39 @@ impl FileType {
                     HookControl::Break => return Ok(Handling::Complete),
                     HookControl::Continue => (),
                 }
-                if options.heuristic_alerts
-                    && u16::from_le_bytes([header[22], header[23]]) & 0x2000 == 0
-                {
-                    let parite = self
-                        .context
-                        .last_section_entry()
-                        .filter(|&ep| parite(&bytes[ep..]))
-                        .map(|_| "Heuristics.W32.Parite.B");
+                if options.heuristic_alerts {
+                    let dll = u16::from_le_bytes([header[22], header[23]]) & 0x2000 != 0;
+                    let parite = || {
+                        if dll {
+                            return None;
+                        }
+                        self.context
+                            .last_section_entry()
+                            .filter(|&ep| parite(&bytes[ep..]))
+                            .map(|_| "Heuristics.W32.Parite.B")
+                    };
+                    let kriz = || kriz::detect(&self.context, bytes);
                     let magistr = || {
+                        if dll {
+                            return None;
+                        }
                         self.context
                             .last_pe_section()
                             .and_then(|section| magistr(bytes, header, section))
                     };
-                    // Immediate reporting takes the first PE alert. Use a stable order when deferring both.
-                    let name = if options.heuristic_scan_precedence {
-                        parite.or_else(magistr)
+                    // Immediate reporting takes the first PE alert. Prefer the last when deferring.
+                    let earlier_name = if options.heuristic_scan_precedence {
+                        parite().or_else(kriz).or_else(magistr)
                     } else {
-                        magistr().or(parite)
+                        magistr().or_else(kriz).or_else(parite)
+                    };
+                    let name = if !dll
+                        && (!options.heuristic_scan_precedence || earlier_name.is_none())
+                        && super::polipos::matches(bytes, header, sink)?
+                    {
+                        Some("Heuristics.W32.Polipos.A")
+                    } else {
+                        earlier_name
                     };
                     if name.is_some_and(|name| sink.report_heuristic(name)) {
                         return Ok(Handling::Stopped);

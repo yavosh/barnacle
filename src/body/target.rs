@@ -261,6 +261,13 @@ impl ObjectContext {
         (last.raw == layout.entry).then_some(layout.entry)
     }
 
+    pub(crate) fn entry_in_last_pe_section(&self, length: usize) -> Option<usize> {
+        let layout = self.exe.as_ref()?;
+        let last = &layout.sections[usize::from(layout.last_pe_section?)];
+        let offset = layout.entry.checked_sub(last.raw)?;
+        (last.size.checked_sub(offset)? >= length).then_some(layout.entry)
+    }
+
     /// Table index, mapped offset and size of the last section in a multi-section PE.
     pub(crate) fn last_pe_section(&self) -> Option<(usize, usize, usize)> {
         let layout = self.exe.as_ref()?;

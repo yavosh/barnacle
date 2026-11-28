@@ -1,6 +1,8 @@
 //! Compare harmless bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "bytecode_reference/kriz.rs"]
+mod kriz;
 #[path = "bytecode_reference/magistr.rs"]
 mod magistr;
 #[path = "bytecode_reference/parite.rs"]
@@ -11,6 +13,8 @@ mod pe;
 mod pe_icons;
 #[path = "bytecode_reference/pe_unpacker.rs"]
 mod pe_unpacker;
+#[path = "bytecode_reference/polipos.rs"]
+mod polipos;
 #[path = "bytecode_reference/scalar.rs"]
 mod scalar;
 #[path = "common/zip.rs"]
