@@ -47,7 +47,7 @@ It compiles the authenticated member bytes directly from memory.
 Local CBC files still require `BytecodeUnsigned yes`.
 `Bytecode no` skips CBC activation but still authenticates the pinned archive.
 The existing CVD scan policy returns an incomplete verdict before executing any matcher, including these modules.
-Broader verdict qualification remains open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
+Full-feed verdict qualification depends on auxiliary coverage and match precedence. [Auxiliary coverage issue #10](https://github.com/yavosh/barnacle/issues/10)
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
 ## Harmless stock control
@@ -169,6 +169,22 @@ The comparison covers earlier raw and overlay findings, sibling archive members,
 On PE32+, the scan skips the overlay and hook phase. A `PE_ALL` break skips later PE checks.
 Barnacle runs supported `PE_UNPACKER` hooks when native UPX does not unpack the PE.
 An unpacker can run unconditionally or use a logical prefilter.
+An unchanged harmless ledger PE32 selects one signed unpacker from the verified archive on Debian arm64.
+Stock completes 3,291 interpreter instructions and returns cleanly without output. Neither signed `PE_ALL` module runs.
+The Rust qualification selects the program through the actual logical index.
+It requires exactly 3,290 VM checks, `Continue`, and no output.
+Stock counts one synthetic entry call. Rust enters the function directly.
+An inactive PE32 control selects no PE hooks.
+Stock also runs the unpacker on the existing UPX fixture's recursive child. Barnacle's signed recursive path remains unqualified.
+The production official-feed gate stays in effect. Signed detection and extraction branches still need coverage.
+Native macOS arm64 leaves the architecture field unmodeled. This runtime qualification is limited to Linux arm64.
+[Signed unpacker controls](../tests/bytecode_reference/pe_unpacker.rs)
+
+```sh
+BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --lib signed_pe_unpacker_receipt -- --ignored
+BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --test bytecode_reference stock_signed_receipt_selection -- --ignored
+```
+
 The hook scans its written output before reporting its own name. A matching child takes precedence.
 The paired tests cover hook breaks, clean native unpacking, and exact file and scan-size limits.
 The `extract_new` host call scans the current output before the VM continues.

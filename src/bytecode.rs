@@ -384,6 +384,10 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    mod pe {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/pe.rs"));
+    }
     use super::*;
 
     fn header(min: u8, max: u8) -> Vec<u8> {
@@ -427,7 +431,6 @@ mod tests {
     #[ignore = "set BARNACLE_CVD_DIR to the verified FreshClam snapshot"]
     fn matches_stock_archive_inventory() -> io::Result<()> {
         use std::fs::File;
-        use std::io::Write;
 
         let dir = std::path::PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap());
         let archive = dir.join(PINNED_ARCHIVE.0);
@@ -447,29 +450,115 @@ mod tests {
         assert_eq!(found.apis.len(), 28);
         assert_eq!(found.compiled, 82);
         assert!(found.compile_errors.is_empty());
-
-        let scratch = tempfile::tempdir()?;
-        let mut sources = Vec::new();
-        visit_verified_members(File::open(&archive)?, |path, contents| {
-            if matches!(Program::compile(contents, engine_level), Ok(Some(_))) {
-                let path = scratch.path().join(path);
-                File::create_new(&path)?.write_all(contents)?;
-                sources.push(path);
-            }
-            Ok(())
-        })?;
-        let paths: Vec<_> = sources.iter().map(|path| (path.as_path(), true)).collect();
-        let index = crate::body::LogicalIndex::load_with(
-            &paths,
-            crate::PINNED_FLEVEL,
-            &crate::IgnoreSet::default(),
-            |path| File::open(path),
-        )?;
-        assert_eq!(sources.len(), 82);
+        let index = verified_index(&archive)?;
         assert_eq!(index.rule_count(), 80);
         assert_eq!(index.pe_hooks().unwrap().programs.len(), 2);
         assert_eq!(index.pe_hooks().unwrap().unpackers.len(), 6);
         assert_eq!(index.pdf_hooks().unwrap().programs.len(), 2);
+        Ok(())
+    }
+
+    fn verified_index(archive: &Path) -> io::Result<crate::body::LogicalIndex> {
+        use std::fs::File;
+        let mut sources = Vec::new();
+        visit_verified_members(File::open(archive)?, |path, contents| {
+            if matches!(
+                Program::compile(contents, u64::from(crate::PINNED_FLEVEL)),
+                Ok(Some(_))
+            ) {
+                sources.push((path.to_path_buf(), contents.to_vec()));
+            }
+            Ok(())
+        })?;
+        let paths: Vec<_> = sources
+            .iter()
+            .map(|(path, _)| (path.as_path(), true))
+            .collect();
+        assert_eq!(sources.len(), 82);
+        crate::body::LogicalIndex::load_with_bytecode(
+            &paths,
+            crate::PINNED_FLEVEL,
+            &crate::IgnoreSet::default(),
+            std::time::Duration::from_secs(10),
+            |path| {
+                sources
+                    .iter()
+                    .find(|(name, _)| name == path)
+                    .map(|(_, contents)| io::Cursor::new(contents.as_slice()))
+                    .ok_or_else(|| io::Error::other("missing authenticated test member"))
+            },
+        )
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[ignore = "requires the pinned Linux architecture and BARNACLE_CVD_DIR"]
+    fn signed_pe_unpacker_receipt() -> io::Result<()> {
+        let dir = std::path::PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap());
+        let index = verified_index(&dir.join(PINNED_ARCHIVE.0))?;
+        let scratch = tempfile::tempdir()?;
+        let hooks = index.pe_hooks().unwrap();
+        let ledger = include_bytes!("../tests/fixtures/upx/ledger.exe");
+        for (bytes, expected) in [(pe::benign_pe(), 0), (ledger.to_vec(), 1)] {
+            let context = crate::body::ObjectContext::typed(crate::body::Target::Pe, &bytes);
+            let selected = index.matches_checked(
+                &bytes,
+                &context,
+                crate::body::LogicalObject {
+                    parents: &[],
+                    recursion_level: 0,
+                    file_size: bytes.len(),
+                    unmapped_script: false,
+                    script_source: None,
+                },
+                false,
+                || Ok(()),
+            )?;
+            assert!(selected.finding.unwrap().is_none());
+            assert!(selected.handlers.is_empty());
+            assert_eq!(selected.pe_hooks.len(), expected);
+            assert!(
+                hooks
+                    .programs
+                    .iter()
+                    .all(|(id, _)| !selected.pe_hooks.contains(id))
+            );
+            let mut executed = 0;
+            for (condition, program) in hooks.unpackers {
+                if condition.is_none_or(|id| !selected.pe_hooks.contains(&id)) {
+                    continue;
+                }
+                let output = std::cell::RefCell::new(Output::new(OutputLimits {
+                    file_size: 1024 * 1024,
+                    scan_remaining: 1024 * 1024,
+                    file_slot: true,
+                }));
+                let mut checks = 0;
+                let result = program.run_pe_unpacker(
+                    &bytes,
+                    UnpackerInput {
+                        output: &output,
+                        directory: scratch.path(),
+                        extract: &|| Err(io::Error::other("unexpected signed receipt extraction")),
+                    },
+                    false,
+                    std::time::Duration::from_secs(10),
+                    || {
+                        checks += 1;
+                        Ok(())
+                    },
+                )?;
+                // Stock reports 3,291 opcodes, including its synthetic entry CALL.
+                // Rust enters the function directly and checks each of its 3,290 instructions.
+                assert_eq!(checks, 3290);
+                assert_eq!(result, PdfHookResult::Continue);
+                let output = output.into_inner();
+                assert_eq!(output.size, 0);
+                assert!(output.snapshot.is_none() && output.rejected.is_none());
+                executed += 1;
+            }
+            assert_eq!(executed, expected);
+        }
         Ok(())
     }
 }

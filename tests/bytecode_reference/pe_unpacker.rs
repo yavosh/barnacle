@@ -4,6 +4,137 @@ use super::{
 use scalar::WriteFinish::{Abort, Report, Result as Returns};
 use std::{fs, io, path::Path};
 
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[ignore = "requires pinned Debian clamd and BARNACLE_CVD_DIR"]
+fn stock_signed_receipt_selection() -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    verify_stock()?;
+    let snapshot = std::env::var_os("BARNACLE_CVD_DIR")
+        .ok_or_else(|| io::Error::other("set BARNACLE_CVD_DIR to the verified snapshot"))?;
+    let verified = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")?;
+    let archives = [
+        barnacle::bytecode::PINNED_ARCHIVE,
+        (
+            "main.cvd",
+            89_072_577,
+            "0b2182d229f46981ec8f535382222f7c9dfdd656b250ad47988b910a8d302365",
+        ),
+        (
+            "daily.cvd",
+            23_450_852,
+            "423f7774182bfbc82b50c7796c68a93f8b1817ef7ebbc88d7def444bc2c8f35b",
+        ),
+    ];
+    for (name, length, digest) in archives {
+        let mut input = fs::File::open(Path::new(&snapshot).join(name))?.take(length + 1);
+        let mut output = fs::File::create_new(verified.path().join(name))?;
+        let mut hash = Sha256::new();
+        let mut size = 0;
+        let mut block = [0; 64 * 1024];
+        loop {
+            let count = input.read(&mut block)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&block[..count])?;
+            hash.update(&block[..count]);
+            size += count as u64;
+        }
+        assert_eq!(size, length);
+        let actual: String = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(actual, digest);
+    }
+    for (label, bytes, pe_all, executed) in [
+        ("inactive PE32", pe::benign_pe(), 1, 0),
+        (
+            "ledger PE32",
+            include_bytes!("../fixtures/upx/ledger.exe").to_vec(),
+            1,
+            1,
+        ),
+        (
+            "packed ledger",
+            include_bytes!("../fixtures/upx/ledger-nrv2b.exe").to_vec(),
+            2,
+            1,
+        ),
+    ] {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
+        let db = root.path().join("db");
+        fs::create_dir(&db)?;
+        for (name, _, _) in archives {
+            std::os::unix::fs::symlink(verified.path().join(name), db.join(name))?;
+        }
+        let (daemon, socket) = start(
+            root.path(),
+            Path::new("/usr/sbin/clamd"),
+            "Debug yes\nBytecode yes\nBytecodeUnsigned no\nBytecodeMode ForceInterpreter\nScanPE yes\n",
+        )?;
+        let log = root.path().join("clamd.log");
+        let scan_start = fs::metadata(&log)?.len() as usize;
+        assert_eq!(
+            unix_request(&socket, &stream_frame(&bytes)?)?,
+            STOCK_MISS,
+            "{label}"
+        );
+        drop(daemon);
+        let log = fs::read_to_string(log)?;
+        let scan = &log[scan_start..];
+        assert_eq!(
+            scan.matches("Bytecode executing hook id 259 (2 hooks)")
+                .count(),
+            pe_all,
+            "{label}"
+        );
+        assert_eq!(
+            scan.matches("Bytecode executing hook id 257 (6 hooks)")
+                .count(),
+            1,
+            "{label}"
+        );
+        assert_eq!(
+            scan.matches("Bytecode: executing bytecode ").count(),
+            executed,
+            "{label}"
+        );
+        assert_eq!(
+            scan.matches("Bytecode: executed 1 bytecodes for this hook")
+                .count(),
+            executed,
+            "{label}"
+        );
+        assert_eq!(
+            scan.matches("after executing 3291 opcodes").count(),
+            executed,
+            "{label}"
+        );
+        assert_eq!(
+            scan.matches("previous tempfile had 0 bytes").count(),
+            executed,
+            "{label}"
+        );
+        assert_eq!(
+            scan.matches("Bytecode 26 returned 0").count(),
+            executed,
+            "{label}"
+        );
+        assert!(!scan.contains("failed to run:"), "{label}");
+    }
+    Ok(())
+}
+
 fn compare(executable: &Path, miss: &str) -> io::Result<()> {
     let trigger = "Local.Receipt.Unpack.{};Target:1;0;544:72656365697074";
     let always = "Local.Receipt.Unpack";

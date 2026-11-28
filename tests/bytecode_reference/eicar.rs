@@ -5,6 +5,7 @@ use barnacle::{IgnoreSet, PINNED_FLEVEL};
 use std::{
     fs,
     io::{self, Read},
+    os::unix::fs::PermissionsExt,
     path::Path,
     time::Duration,
 };
@@ -79,7 +80,9 @@ fn verified_eicar_logical_rule() -> io::Result<()> {
         assert_eq!(found, hit.then_some("Eicar-Signature"), "Barnacle {label}");
     }
     for enabled in [true, false] {
-        let root = tempfile::tempdir_in("/tmp")?;
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
         let db = root.path().join("db");
         fs::create_dir(&db)?;
         fs::write(db.join(PINNED_ARCHIVE.0), &archive)?;
