@@ -158,7 +158,11 @@ impl Config {
             "DetectPUA" => self.detect_pua = boolean(value)?,
             "Bytecode" => self.bytecode = boolean(value)?,
             "BytecodeUnsigned" => self.bytecode_unsigned = boolean(value)?,
-            "BytecodeTimeout" => self.bytecode_timeout = Duration::from_millis(number(value)?),
+            "BytecodeTimeout" => {
+                let millis = number(value)?;
+                self.bytecode_timeout =
+                    Duration::from_millis(if millis == 0 { 60_000 } else { millis });
+            }
             "BytecodeMode" if matches!(value, "Auto" | "ForceInterpreter") => {}
             "MaxFileSize" => self.objects.max_file_size = size(value)?,
             "MaxScanSize" => self.objects.max_scan_size = size(value)?,

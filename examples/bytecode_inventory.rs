@@ -17,6 +17,10 @@ fn main() -> io::Result<()> {
     println!("outside engine window\t{}", inventory.outside_engine_window);
     println!("functions\t{}", inventory.functions);
     println!("instructions\t{}", inventory.instructions);
+    println!("compiled\t{}", inventory.compiled);
+    for (reason, count) in inventory.compile_errors {
+        println!("compiler rejection\t{count}\t{reason}");
+    }
     for (format, count) in inventory.formats {
         println!("format\t{format}\t{count}");
     }

@@ -1,6 +1,8 @@
 //! Compare one harmless logical bytecode trigger against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "bytecode_reference/scalar.rs"]
+mod scalar;
 
 use daemon::{Daemon, stream_frame, unix_request};
 use sha2::{Digest, Sha256};
@@ -145,9 +147,107 @@ fn barnacle_logical_bytecode() -> io::Result<()> {
 #[test]
 #[ignore = "requires pinned Debian clamd and BARNACLE_CBC_FIXTURE"]
 fn stock_logical_bytecode() -> io::Result<()> {
-    let pin = std::process::Command::new("dpkg-query")
+    verify_stock()?;
+    compare(Path::new("/usr/sbin/clamd"), &fixture()?, STOCK_MISS)
+}
+
+fn verify_stock() -> io::Result<()> {
+    let package = std::process::Command::new("dpkg-query")
         .args(["-W", "-f=${Version}", "clamav-daemon"])
         .output()?;
-    assert_eq!(pin.stdout, b"1.4.3+dfsg-1");
-    compare(Path::new("/usr/sbin/clamd"), &fixture()?, STOCK_MISS)
+    assert_eq!(package.stdout, b"1.4.3+dfsg-1");
+    Ok(())
+}
+
+fn run_program(
+    executable: &Path,
+    program: &str,
+    options: &str,
+    cases: &[(&[u8], bool)],
+    miss: &str,
+) -> io::Result<()> {
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let db = dir.path().join("db");
+    fs::create_dir(&db)?;
+    fs::write(db.join(CBC), program)?;
+    let (_daemon, socket) = start(dir.path(), executable, options)?;
+    let found = format!("stream: {} FOUND\0", scalar::NAME);
+    for (case, &(input, detects)) in cases.iter().enumerate() {
+        let reply = unix_request(&socket, &stream_frame(input)?)?;
+        assert_eq!(reply, if detects { &found } else { miss }, "case {case}");
+    }
+    Ok(())
+}
+
+fn compare_vm(executable: &Path, miss: &str) -> io::Result<()> {
+    let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    run_program(
+        executable,
+        &scalar::first_match(),
+        options,
+        &[
+            (b"xxreceiptYzzreceiptX", true),
+            (b"xxreceiptXzzreceiptY", false),
+            (b"xxreceipt", false),
+            (b"xxreceiptY with draft", false),
+            (b"no trigger", false),
+        ],
+        miss,
+    )?;
+    let files = [
+        (4_093, true),
+        (4_094, false),
+        (4_096, true),
+        (4_102, true),
+        (4_103, false),
+    ]
+    .map(|(position, detects)| {
+        let mut input = vec![b' '; 4_110];
+        input[..7].copy_from_slice(b"receipt");
+        input[position..position + 3].copy_from_slice(b"ABC");
+        (input, detects)
+    });
+    run_program(
+        executable,
+        &scalar::find(),
+        options,
+        &files
+            .each_ref()
+            .map(|(input, detects)| (input.as_slice(), *detects)),
+        miss,
+    )?;
+    run_program(
+        executable,
+        &scalar::scalar_widths(),
+        options,
+        &[(b"receipt", true)],
+        miss,
+    )?;
+    let options = format!("{options}BytecodeTimeout 1\n");
+    run_program(
+        executable,
+        &scalar::counted_loop(8),
+        &options,
+        &[(b"receipt", true)],
+        miss,
+    )?;
+    run_program(
+        executable,
+        &scalar::counted_loop(3_000_000),
+        &options,
+        &[(b"receipt", false)],
+        miss,
+    )
+}
+
+#[test]
+fn barnacle_scalar_bytecode() -> io::Result<()> {
+    compare_vm(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_scalar_bytecode() -> io::Result<()> {
+    verify_stock()?;
+    compare_vm(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }

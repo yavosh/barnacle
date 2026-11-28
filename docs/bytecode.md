@@ -38,7 +38,10 @@ Stock disassembly uses zero-based host API indices.
 The opcode set includes arithmetic, comparisons, control flow, calls, and pointer and memory operations.
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
-Execution for the signed feed and official-feed verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
+It also checks the Rust compiler against every eligible module.
+The compiler accepts 24 of the 72 logical modules in the signed archive.
+The inventory groups the remaining 58 modules by the first compiler rejection.
+Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
 ## Harmless stock control
@@ -58,13 +61,19 @@ The fixture SHA-256 is `36d282680ef43be4eb5fc1aec95b6d262460c3a5ffb2563a280a35db
 
 ## Supported execution
 
-Barnacle compiles the one-block logical form used by the harmless control.
-It supports a scalar return and a `setvirusname` call with validated constant arguments.
-The caller checks scan cancellation and the bytecode timeout at each instruction.
+The Rust interpreter executes logical bytecode with typed integer locals, arithmetic, comparisons, casts, branches, and loops.
+The supported host APIs read bytes, search a bounded part of the scan object, report the engine level, and set a detection name.
+The logical matcher records first subsignature offsets for programs that read them.
+Those programs currently require indexed pattern subsignatures.
+
+The interpreter checks the bytecode timeout every 5,000 instructions, matching the pinned stock interpreter.
+`BytecodeTimeout 0` uses the stock engine's 60-second fallback.
+Scan cancellation applies at each instruction and during host searches.
 Local CBC files require `BytecodeUnsigned yes` and `Bytecode yes`.
 An eligible module with unsupported instructions, APIs, or metadata prevents activation.
 
-The comparison covers exact detection names, trigger offsets, and competing generic logical signatures.
+The comparison covers exact names, first and missing offsets, scalar widths, search boundaries, and a 1 ms timeout.
+It also covers competing generic logical signatures.
 When both rules match, stock evaluates the one loaded first from the database directory.
 Barnacle returns its existing incomplete-scan error for misses while detection coverage remains partial.
 [Comparison tests](../tests/bytecode_reference.rs)

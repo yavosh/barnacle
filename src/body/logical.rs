@@ -14,10 +14,12 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::RangeInclusive;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_LINE: usize = 32768;
 const MAX_CHILDREN: usize = 64;
+const NO_MATCH_OFFSET: u32 = 0xffff_fffe;
+const NO_MATCH_OFFSETS: [u32; MAX_CHILDREN] = [NO_MATCH_OFFSET; MAX_CHILDREN];
 
 /// File-map and container information used by the pinned logical matcher.
 #[derive(Clone, Copy)]
@@ -164,7 +166,7 @@ impl LogicalIndex {
         ignored: &IgnoreSet,
         open: impl FnMut(&Path) -> io::Result<File>,
     ) -> io::Result<Self> {
-        Self::load_with_bytecode(paths, flevel, ignored, Duration::ZERO, open)
+        Self::load_with_bytecode(paths, flevel, ignored, Duration::from_secs(10), open)
     }
 
     /// Compile ordinary logical signatures and bytecode triggers in source order.
@@ -194,6 +196,7 @@ impl LogicalIndex {
                     Program::compile(&contents, u64::from(flevel)).map_err(located)?
                 {
                     let id = builder.records.len();
+                    let first_binding = builder.bindings.len();
                     builder
                         .add(program.trigger(), true, flevel, ignored)
                         .map_err(located)?;
@@ -209,6 +212,18 @@ impl LogicalIndex {
                             return Err(located(io::Error::new(
                                 io::ErrorKind::Unsupported,
                                 "bytecode trigger requires handler or icon evaluation",
+                            )));
+                        }
+                        if program.uses_match_offsets()
+                            && (0..record.children).any(|slot| {
+                                !builder.bindings[first_binding..]
+                                    .iter()
+                                    .any(|binding| usize::from(binding.slot) == slot)
+                            })
+                        {
+                            return Err(located(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "bytecode match offsets require indexed pattern subsignatures",
                             )));
                         }
                         bytecode.insert(id as u32, program);
@@ -346,7 +361,7 @@ impl LogicalIndex {
         rescan: bool,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<LogicalMatches<'_>> {
-        let mut evidence: HashMap<u32, Evidence> = HashMap::new();
+        let mut evidence = ScanEvidence::default();
         self.search.run_events(
             &self.children,
             bytes,
@@ -366,7 +381,7 @@ impl LogicalIndex {
                                 if i % 256 == 0 {
                                     check()?;
                                 }
-                                let Some(e) = evidence.get_mut(owner) else {
+                                let Some(e) = evidence.matches.get_mut(owner) else {
                                     continue;
                                 };
                                 if e.counts
@@ -392,10 +407,25 @@ impl LogicalIndex {
                     return Ok(());
                 }
                 let slot = usize::from(binding.slot);
-                let e = evidence.entry(binding.owner).or_insert_with(|| Evidence {
-                    counts: vec![0; record.children],
-                    last: vec![0; record.children],
-                });
+                let e = evidence
+                    .matches
+                    .entry(binding.owner)
+                    .or_insert_with(|| Evidence {
+                        counts: vec![0; record.children],
+                        last: vec![0; record.children],
+                    });
+                if e.counts[slot] == 0
+                    && self
+                        .bytecode
+                        .get(&binding.owner)
+                        .is_some_and(Program::uses_match_offsets)
+                {
+                    let offsets = evidence
+                        .first_offsets
+                        .entry(binding.owner)
+                        .or_insert(NO_MATCH_OFFSETS);
+                    offsets[slot] = u32::try_from(hit.start).unwrap_or(NO_MATCH_OFFSET);
+                }
                 // Stock counts repeated multipart completions at the same first-part
                 // position. It suppresses earlier positions for every subsignature.
                 let partial = self.children[child].pattern.parts().len() > 1;
@@ -423,15 +453,18 @@ impl LogicalIndex {
                 if context.accepts(record.conditions.target)
                     && record.conditions.accepts(context, &object)
                 {
-                    let entry = evidence.entry(binding.owner).or_insert_with(|| Evidence {
-                        counts: vec![0; record.children],
-                        last: vec![0; record.children],
-                    });
+                    let entry = evidence
+                        .matches
+                        .entry(binding.owner)
+                        .or_insert_with(|| Evidence {
+                            counts: vec![0; record.children],
+                            last: vec![0; record.children],
+                        });
                     entry.counts[usize::from(binding.slot)] = 1;
                 }
             }
         }
-        self.scan_regexes(bytes, context, &object, &mut evidence, &mut check)?;
+        self.scan_regexes(bytes, context, &object, &mut evidence.matches, &mut check)?;
         let mut matches = self.evaluate(
             bytes,
             context,
@@ -455,7 +488,7 @@ impl LogicalIndex {
                     bytes,
                     context,
                     &restored,
-                    &HashMap::new(),
+                    &ScanEvidence::default(),
                     false,
                     &mut check,
                 )?
@@ -519,7 +552,7 @@ impl LogicalIndex {
         bytes: &[u8],
         context: &ObjectContext,
         object: &LogicalObject<'_>,
-        evidence: &HashMap<u32, Evidence>,
+        evidence: &ScanEvidence,
         rescan: bool,
         check: &mut impl FnMut() -> io::Result<()>,
     ) -> io::Result<LogicalMatches<'_>> {
@@ -528,10 +561,10 @@ impl LogicalIndex {
         // known to pass with all-zero counts can win.
         let mut winner = None;
         let mut pending = Vec::new();
-        let candidates = evidence.iter().map(|(&id, e)| (id, Some(e))).chain(
+        let candidates = evidence.matches.iter().map(|(&id, e)| (id, Some(e))).chain(
             self.zero_matches
                 .iter()
-                .filter(|id| !evidence.contains_key(id))
+                .filter(|id| !evidence.matches.contains_key(id))
                 .map(|&id| (id, None)),
         );
         for (n, (id, e)) in candidates.enumerate() {
@@ -568,19 +601,10 @@ impl LogicalIndex {
         let mut icon_samples = None;
         for (_, id) in pending {
             if let Some(program) = self.bytecode.get(&id) {
-                let start = Instant::now();
-                let mut expired = false;
-                let result = program.run(|| {
-                    check()?;
-                    if !self.bytecode_timeout.is_zero() && start.elapsed() >= self.bytecode_timeout
-                    {
-                        expired = true;
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    Ok(())
-                });
-                // Stock proceeds with the rest of the scan after a bytecode-only timeout.
-                if !expired && let Some(name) = result? {
+                let offsets = evidence.first_offsets.get(&id).unwrap_or(&NO_MATCH_OFFSETS);
+                if let Some(name) =
+                    program.run(bytes, offsets, self.bytecode_timeout, &mut *check)?
+                {
                     finding = Ok(Some(name));
                     break;
                 }
@@ -634,6 +658,12 @@ impl LogicalIndex {
 struct Evidence {
     counts: Vec<u32>,
     last: Vec<usize>,
+}
+
+#[derive(Default)]
+struct ScanEvidence {
+    matches: HashMap<u32, Evidence>,
+    first_offsets: HashMap<u32, [u32; MAX_CHILDREN]>,
 }
 
 impl Builder {

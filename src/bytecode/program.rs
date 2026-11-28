@@ -1,5 +1,6 @@
-//! A single-block logical bytecode entry point with constant data and no host memory access.
+//! A typed scalar interpreter for a single logical bytecode entry point.
 use super::{Cursor, MAX_MEMBER_BYTES, invalid};
+use std::time::{Duration, Instant};
 use std::{io, str};
 
 const LOGICAL_HOOK: u64 = 256;
@@ -7,12 +8,15 @@ const SET_VIRUS_NAME: u64 = 5;
 const I32: u64 = 32;
 const BYTE_POINTER: u64 = 65;
 const FIRST_USER_TYPE: usize = 69;
+const CLOCK_INTERVAL: u32 = 5_000;
+const FIND_WINDOW: usize = 4096;
 
 #[derive(Debug)]
 pub struct Program {
     trigger: Box<str>,
-    // The only supported side effect has constant arguments. Resolve them once at load time.
-    set_name: Option<Box<str>>,
+    locals: usize,
+    blocks: Vec<Vec<Instruction>>,
+    uses_match_offsets: bool,
 }
 
 fn field<T>(value: Option<T>) -> io::Result<T> {
@@ -80,20 +84,61 @@ impl Program {
             return Err(invalid("invalid CBC logical trigger"));
         }
         let types = types(line()?, type_count)?;
-        let has_api = api(line()?, &types)?;
+        let apis = api(line()?, &types)?;
         let globals = globals(line()?, &types)?;
         let function = line()?;
         if function.first() == Some(b'D') {
             return Err(unsupported("debug metadata"));
         }
-        let (locals, instructions) = entry(function)?;
-        let set_name = block(line()?, locals, instructions, has_api, &globals)?;
+        let (widths, instruction_count, block_count) = entry(function)?;
+        let mut blocks = Vec::new();
+        let mut remaining = instruction_count;
+        let mut data_budget = MAX_MEMBER_BYTES as usize;
+        for index in 0..block_count {
+            let mut line = line()?;
+            field(line.expect(b'B'))?;
+            let mut instructions = Vec::new();
+            loop {
+                remaining = remaining
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid("excess CBC instructions"))?;
+                if line.first() == Some(b'T') {
+                    instructions.push(terminator(&mut line, &widths, block_count)?);
+                    break;
+                }
+                instructions.push(instruction(
+                    &mut line,
+                    &widths,
+                    &apis,
+                    &globals,
+                    engine_level,
+                    &mut data_budget,
+                )?);
+            }
+            if index + 1 == block_count {
+                field(line.expect(b'E'))?;
+            }
+            if line.first() == Some(b'D') {
+                return Err(unsupported("block debug metadata"));
+            }
+            field(line.end())?;
+            blocks.push(instructions);
+        }
+        if remaining != 0 {
+            return Err(invalid("missing CBC instructions"));
+        }
         if lines.next().and_then(|s| s.first()) != Some(&b'S') {
             return Err(invalid("missing CBC source boundary"));
         }
+        let uses_match_offsets = blocks
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, Instruction::Write(_, Expression::MatchOffset(_))));
         Ok(Some(Self {
             trigger: trigger.into(),
-            set_name,
+            uses_match_offsets,
+            locals: widths.len(),
+            blocks,
         }))
     }
 
@@ -101,20 +146,67 @@ impl Program {
         &self.trigger
     }
 
-    /// Run the optional setvirusname call and the return, checking the deadline at each instruction.
-    pub fn run(&self, mut check: impl FnMut() -> io::Result<()>) -> io::Result<Option<&str>> {
-        if self.set_name.is_some() {
-            check()?;
+    pub fn uses_match_offsets(&self) -> bool {
+        self.uses_match_offsets
+    }
+
+    /// Run on the current scan object. Treat a bytecode-only timeout as a miss.
+    pub fn run(
+        &self,
+        input: &[u8],
+        offsets: &[u32; 64],
+        timeout: Duration,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<&str>> {
+        let mut locals = vec![0; self.locals];
+        let mut name = None;
+        let mut block = 0;
+        let start = Instant::now();
+        let mut operations = 0;
+        loop {
+            for instruction in &self.blocks[block] {
+                check()?;
+                operations += 1;
+                if operations == CLOCK_INTERVAL {
+                    operations = 0;
+                    if start.elapsed() >= timeout {
+                        return Ok(None);
+                    }
+                }
+                match instruction {
+                    Instruction::Write(dest, expression) => {
+                        let Some(value) =
+                            expression.eval(&locals, input, offsets, &mut name, &mut check)?
+                        else {
+                            return Ok(None);
+                        };
+                        locals[*dest] = value;
+                    }
+                    Instruction::Branch(value, yes, no) => {
+                        block = if value.get(&locals) & 1 != 0 {
+                            *yes
+                        } else {
+                            *no
+                        };
+                        break;
+                    }
+                    Instruction::Jump(target) => {
+                        block = *target;
+                        break;
+                    }
+                    Instruction::Return => return Ok(name),
+                    Instruction::Abort => return Ok(None),
+                }
+            }
         }
-        check()?;
-        Ok(self.set_name.as_deref())
     }
 }
 
 enum Type {
+    OffsetArray,
     Bytes(usize),
     Pointer(u64),
-    SetNameFunction,
+    Function(Vec<u64>),
 }
 
 fn user_type(types: &[Type], id: u64) -> Option<&Type> {
@@ -135,21 +227,23 @@ fn types(mut line: Cursor<'_>, total: u64) -> io::Result<Vec<Type>> {
     for _ in 0..count {
         let ty = match field(line.fixed(1))? {
             1 => {
-                if field(line.number())? != 3
-                    || field(line.number())? != I32
-                    || field(line.number())? != BYTE_POINTER
-                    || field(line.number())? != I32
-                {
+                let args = field(line.number())?;
+                if !(1..=4).contains(&args) {
                     return Err(unsupported("function prototype"));
                 }
-                Type::SetNameFunction
+                Type::Function(
+                    (0..args)
+                        .map(|_| field(line.number()))
+                        .collect::<io::Result<_>>()?,
+                )
             }
             4 => {
                 let n = field(line.number())?;
-                if field(line.number())? != 8 || n > MAX_MEMBER_BYTES {
-                    return Err(unsupported("array type or length"));
+                match (field(line.number())?, n) {
+                    (32, 64) => Type::OffsetArray,
+                    (8, n) if n <= MAX_MEMBER_BYTES => Type::Bytes(n as usize),
+                    _ => return Err(unsupported("array type or length")),
                 }
-                Type::Bytes(usize::try_from(n).map_err(|_| invalid("invalid array length"))?)
             }
             5 => Type::Pointer(field(line.number())?),
             _ => return Err(unsupported("type kind")),
@@ -159,8 +253,11 @@ fn types(mut line: Cursor<'_>, total: u64) -> io::Result<Vec<Type>> {
     field(line.end())?;
     for ty in &types {
         if let Type::Pointer(id) = ty
-            && !matches!(*id, 8 | BYTE_POINTER)
-            && !matches!(user_type(&types, *id), Some(Type::Bytes(_)))
+            && !matches!(*id, 8 | 32 | BYTE_POINTER | 67)
+            && !matches!(
+                user_type(&types, *id),
+                Some(Type::Bytes(_) | Type::OffsetArray)
+            )
         {
             return Err(unsupported("pointer type"));
         }
@@ -168,38 +265,49 @@ fn types(mut line: Cursor<'_>, total: u64) -> io::Result<Vec<Type>> {
     Ok(types)
 }
 
-fn api(mut line: Cursor<'_>, types: &[Type]) -> io::Result<bool> {
+const FILE_BYTEAT: u64 = 17;
+const FILE_FIND_LIMIT: u64 = 65;
+const ENGINE_LEVEL: u64 = 66;
+
+fn api(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<u64>> {
     field(line.expect(b'E'))?;
     let max_id = field(line.number())?;
     let count = field(line.number())?;
-    match (max_id, count) {
-        (0, 0) => {}
-        (SET_VIRUS_NAME, 1) => {
-            if field(line.number())? != SET_VIRUS_NAME
-                || !matches!(
-                    user_type(types, field(line.number())?),
-                    Some(Type::SetNameFunction)
-                )
-            {
-                return Err(unsupported("API declaration"));
-            }
-            let encoded = field(line.string())?;
-            let name = encoded
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| ((pair[1] & 15) << 4) | (pair[0] & 15));
-            if !name.eq(b"setvirusname\0".iter().copied()) {
-                return Err(invalid("unexpected CBC name for setvirusname API ID"));
-            }
+    let mut apis = Vec::new();
+    for _ in 0..count {
+        let id = field(line.number())?;
+        let (name, prototype): (&[u8], &[u64]) = match id {
+            SET_VIRUS_NAME => (b"setvirusname\0", &[I32, BYTE_POINTER, I32]),
+            FILE_BYTEAT => (b"file_byteat\0", &[I32, I32]),
+            FILE_FIND_LIMIT => (b"file_find_limit\0", &[I32, BYTE_POINTER, I32, I32]),
+            ENGINE_LEVEL => (b"engine_functionality_level\0", &[I32]),
+            _ => return Err(unsupported("API declaration")),
+        };
+        let ty = user_type(types, field(line.number())?);
+        if id > max_id
+            || apis.contains(&id)
+            || !matches!(ty, Some(Type::Function(args)) if args == prototype)
+        {
+            return Err(invalid("invalid CBC API declaration or prototype"));
         }
-        _ => return Err(unsupported("API table")),
+        let encoded = field(line.string())?;
+        let decoded = encoded
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| ((pair[1] & 15) << 4) | (pair[0] & 15));
+        if !decoded.eq(name.iter().copied()) {
+            return Err(invalid("unexpected CBC name for API ID"));
+        }
+        apis.push(id);
     }
     field(line.end())?;
-    Ok(count == 1)
+    Ok(apis)
 }
 
 enum Global {
+    Scalar,
+    MatchOffset(usize),
     Zero,
     Bytes(Vec<u8>),
     Pointer { base: usize, offset: usize },
@@ -229,7 +337,9 @@ impl Cursor<'_> {
 
 fn globals(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<Global>> {
     field(line.expect(b'G'))?;
-    if field(line.number())? != 0 {
+    const MATCH_OFFSETS: u64 = 0x8005;
+    let max_host = field(line.number())?;
+    if !matches!(max_host, 0 | MATCH_OFFSETS) {
         return Err(unsupported("host global"));
     }
     let count = field(line.number())?;
@@ -241,6 +351,22 @@ fn globals(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<Global>> {
         let id = field(line.number())?;
         let global = match (id, user_type(types, id)) {
             (0, _) if index == 0 && line.literal()? == 0 => Global::Zero,
+            (1 | 8 | 16 | 32 | 64, _) => {
+                line.literal()?;
+                Global::Scalar
+            }
+            (67, _) | (_, Some(Type::Pointer(32))) => {
+                let offset = line.index_literal()?;
+                let base = line.literal()?;
+                if base != MATCH_OFFSETS
+                    || max_host != MATCH_OFFSETS
+                    || offset % 4 != 0
+                    || offset >= 256
+                {
+                    return Err(unsupported("i32 pointer outside the match-offset array"));
+                }
+                Global::MatchOffset(offset / 4)
+            }
             (BYTE_POINTER, _) | (_, Some(Type::Pointer(8))) => Global::Pointer {
                 offset: line.index_literal()?,
                 base: line.index_literal()?,
@@ -273,90 +399,486 @@ fn globals(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<Global>> {
     Ok(globals)
 }
 
-fn entry(mut line: Cursor<'_>) -> io::Result<(u64, u64)> {
+fn entry(mut line: Cursor<'_>) -> io::Result<(Vec<Width>, usize, usize)> {
     field(line.expect(b'A'))?;
     if field(line.fixed(1))? != 0 || field(line.number())? != I32 {
         return Err(unsupported("entry signature"));
     }
     field(line.expect(b'L'))?;
-    let locals = field(line.number())?;
-    if locals > 1 {
-        return Err(unsupported("entry locals"));
+    let count = field(line.number())?;
+    if count > u16::MAX.into() || count > line.0.len() as u64 {
+        return Err(invalid("invalid CBC local count"));
     }
-    if locals == 1 && (field(line.number())? != I32 || field(line.fixed(1))? != 0) {
-        return Err(unsupported("local type"));
+    let mut widths = Vec::new();
+    for _ in 0..count {
+        widths.push(Width::new(field(line.number())?)?);
+        if field(line.fixed(1))? != 0 {
+            return Err(unsupported("addressable local"));
+        }
     }
     field(line.expect(b'F'))?;
     let instructions = field(line.number())?;
-    if !(1..=2).contains(&instructions) || field(line.number())? != 1 {
-        return Err(unsupported("instruction count or control flow"));
+    let blocks = field(line.number())?;
+    if instructions > u16::MAX.into() || blocks == 0 || blocks > instructions {
+        return Err(invalid("invalid CBC instruction or block count"));
     }
     field(line.end())?;
-    Ok((locals, instructions))
+    Ok((widths, instructions as usize, blocks as usize))
 }
 
-fn name(globals: &[Global], id: usize, length: u32) -> io::Result<Box<str>> {
-    let Some(Global::Pointer { base, offset }) = globals.get(id) else {
-        return Err(invalid("setvirusname expects a global byte pointer"));
-    };
-    let Some(Global::Bytes(bytes)) = globals.get(*base) else {
-        return Err(invalid("invalid CBC name array"));
-    };
-    let bytes = field(bytes.get(*offset..))?;
-    if u64::from(length) > bytes.len() as u64 {
-        return Err(invalid("setvirusname length exceeds its global array"));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Width(u32);
+
+impl Width {
+    const BOOL: Self = Self(1);
+    const WORD: Self = Self(32);
+
+    fn new(id: u64) -> io::Result<Self> {
+        match id {
+            1 | 8 | 16 | 32 | 64 => Ok(Self(id as u32)),
+            _ => Err(unsupported("scalar type")),
+        }
     }
-    // The stock VM checks the supplied length, then the API reads a NUL-terminated name.
-    let nul = field(bytes.iter().position(|&b| b == 0))?;
-    let name = str::from_utf8(&bytes[..nul]).map_err(|_| invalid("invalid CBC detection name"))?;
-    if name.is_empty() || name.bytes().any(|b| b.is_ascii_control()) {
-        return Err(invalid("empty or control-containing CBC detection name"));
+
+    fn mask(self) -> u64 {
+        u64::MAX >> (64 - self.0)
     }
-    Ok(name.into())
+
+    fn signed(self, value: u64) -> i64 {
+        let shift = 64 - self.0;
+        ((value << shift) as i64) >> shift
+    }
 }
 
-fn block(
-    mut line: Cursor<'_>,
-    locals: u64,
-    instructions: u64,
-    has_api: bool,
-    globals: &[Global],
-) -> io::Result<Option<Box<str>>> {
-    field(line.expect(b'B'))?;
-    let mut set_name = None;
-    if instructions == 2 {
-        if field(line.number())? != I32 || field(line.number())? != 0 || locals != 1 {
-            return Err(unsupported("call destination"));
+#[derive(Clone, Copy, Debug)]
+enum Value {
+    Constant(u64),
+    Local(usize),
+}
+
+impl Value {
+    fn get(self, locals: &[u64]) -> u64 {
+        match self {
+            Self::Constant(value) => value,
+            Self::Local(i) => locals[i],
         }
-        if field(line.fixed(2))? != 33 {
-            return Err(unsupported("instruction before return"));
-        }
-        if !has_api || field(line.fixed(1))? != 2 || field(line.number())? != SET_VIRUS_NAME {
-            return Err(unsupported("host call"));
-        }
-        let id = line.index_literal()?;
-        if field(line.fixed(1))? != 0 {
-            return Err(unsupported("non-global name operand"));
-        }
-        set_name = Some(name(globals, id, line.i32_literal()?)?);
     }
+}
+
+impl Cursor<'_> {
+    fn local(&mut self, widths: &[Width]) -> io::Result<(usize, Width)> {
+        if matches!(self.first(), Some(b'@'..=b'P')) {
+            return Err(unsupported("non-local operand"));
+        }
+        let i = usize::try_from(field(self.number())?)
+            .map_err(|_| invalid("invalid CBC local index"))?;
+        Ok((i, *field(widths.get(i))?))
+    }
+
+    fn scalar(&mut self, widths: &[Width], width: Width) -> io::Result<Value> {
+        if matches!(self.first(), Some(b'@'..=b'P')) {
+            let value = self.literal()?;
+            if field(self.fixed(1))? != u64::from(width.0.div_ceil(8)) {
+                return Err(unsupported("scalar operand width or global operand"));
+            }
+            Ok(Value::Constant(value & width.mask()))
+        } else {
+            let (i, ty) = self.local(widths)?;
+            if ty != width {
+                return Err(invalid("CBC scalar operand type mismatch"));
+            }
+            Ok(Value::Local(i))
+        }
+    }
+
+    fn global<'a>(&mut self, globals: &'a [Global]) -> io::Result<&'a Global> {
+        if !matches!(self.first(), Some(b'@'..=b'P')) {
+            return Err(unsupported("non-global pointer operand"));
+        }
+        let id = self.index_literal()?;
+        if field(self.fixed(1))? != 0 {
+            return Err(unsupported("non-global pointer operand"));
+        }
+        field(globals.get(id))
+    }
+
+    fn const_bytes<'a>(&mut self, globals: &'a [Global]) -> io::Result<(&'a [u8], usize)> {
+        let Global::Pointer { base, offset } = self.global(globals)? else {
+            return Err(unsupported("host call without an immutable byte pointer"));
+        };
+        let Some(Global::Bytes(bytes)) = globals.get(*base) else {
+            return Err(invalid("invalid CBC byte pointer"));
+        };
+        let bytes = field(bytes.get(*offset..))?;
+        if !matches!(self.first(), Some(b'@'..=b'P')) {
+            return Err(unsupported("dynamic host-call buffer length"));
+        }
+        let len = self.i32_literal()? as usize;
+        if len > bytes.len() {
+            return Err(invalid("CBC host-call length exceeds its global array"));
+        }
+        Ok((bytes, len))
+    }
+}
+
+#[derive(Debug)]
+enum Instruction {
+    Write(usize, Expression),
+    Branch(Value, usize, usize),
+    Jump(usize),
+    Return,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Binary {
+    Add,
+    Sub,
+    Mul,
+    UDiv,
+    SDiv,
+    URem,
+    SRem,
+    Shl,
+    LShr,
+    AShr,
+    And,
+    Or,
+    Xor,
+    Eq,
+    Ne,
+    Ugt,
+    Uge,
+    Ult,
+    Ule,
+    Sgt,
+    Sge,
+    Sle,
+    Slt,
+}
+
+impl Binary {
+    const MATH: [Self; 13] = [
+        Self::Add,
+        Self::Sub,
+        Self::Mul,
+        Self::UDiv,
+        Self::SDiv,
+        Self::URem,
+        Self::SRem,
+        Self::Shl,
+        Self::LShr,
+        Self::AShr,
+        Self::And,
+        Self::Or,
+        Self::Xor,
+    ];
+    const COMPARISON: [Self; 10] = [
+        Self::Eq,
+        Self::Ne,
+        Self::Ugt,
+        Self::Uge,
+        Self::Ult,
+        Self::Ule,
+        Self::Sgt,
+        Self::Sge,
+        Self::Sle,
+        Self::Slt,
+    ];
+
+    fn eval(self, width: Width, a: u64, b: u64) -> Option<u64> {
+        // The interpreter reads i1 arithmetic operands as masked, positive bytes.
+        let signed = |n| {
+            if width == Width::BOOL {
+                n as i64
+            } else {
+                width.signed(n)
+            }
+        };
+        let value = match self {
+            Self::Add => a.wrapping_add(b),
+            Self::Sub => a.wrapping_sub(b),
+            Self::Mul => a.wrapping_mul(b),
+            Self::UDiv => a.checked_div(b)?,
+            Self::URem => a.checked_rem(b)?,
+            Self::SDiv => signed(a).checked_div(signed(b))? as u64,
+            Self::SRem => signed(a).checked_rem(signed(b))? as u64,
+            Self::Shl | Self::LShr | Self::AShr if b > u64::from(width.0) => return None,
+            Self::Shl | Self::LShr | Self::AShr => {
+                // Narrow C operands are promoted to 32 bits before shifting.
+                let shift = b as u32 % width.0.max(32);
+                match self {
+                    Self::Shl => a << shift,
+                    Self::LShr => a >> shift,
+                    _ => (signed(a) >> shift) as u64,
+                }
+            }
+            Self::And => a & b,
+            Self::Or => a | b,
+            Self::Xor => a ^ b,
+            Self::Eq => u64::from(a == b),
+            Self::Ne => u64::from(a != b),
+            Self::Ugt => u64::from(a > b),
+            Self::Uge => u64::from(a >= b),
+            Self::Ult => u64::from(a < b),
+            Self::Ule => u64::from(a <= b),
+            Self::Sgt => u64::from(signed(a) > signed(b)),
+            Self::Sge => u64::from(signed(a) >= signed(b)),
+            Self::Sle => u64::from(signed(a) <= signed(b)),
+            Self::Slt => u64::from(signed(a) < signed(b)),
+        };
+        Some(value & width.mask())
+    }
+}
+
+#[derive(Debug)]
+enum Expression {
+    Binary(Binary, Width, Value, Value),
+    Cast {
+        source: usize,
+        from: Width,
+        to: Width,
+        sign_extend: bool,
+    },
+    Select(Value, Value, Value),
+    Copy(Value),
+    FileByte(Value),
+    Find(Box<[u8]>, Value),
+    MatchOffset(usize),
+    SetName(Box<str>),
+}
+
+impl Expression {
+    fn eval<'a>(
+        &'a self,
+        locals: &[u64],
+        input: &[u8],
+        offsets: &[u32; 64],
+        name: &mut Option<&'a str>,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<u64>> {
+        let value = match *self {
+            Self::Binary(op, width, a, b) => {
+                return Ok(op.eval(width, a.get(locals), b.get(locals)));
+            }
+            Self::Cast {
+                source,
+                from,
+                to,
+                sign_extend,
+            } => {
+                let v = locals[source];
+                (if sign_extend {
+                    from.signed(v) as u64
+                } else {
+                    v
+                }) & to.mask()
+            }
+            Self::Select(cond, yes, no) => {
+                (if cond.get(locals) & 1 == 1 { yes } else { no }).get(locals)
+            }
+            Self::Copy(v) => v.get(locals),
+            Self::FileByte(v) => input
+                .get(v.get(locals) as usize)
+                .map_or(u32::MAX as u64, |&b| u64::from(b)),
+            Self::MatchOffset(i) => u64::from(offsets[i]),
+            Self::Find(ref needle, limit) => {
+                let limit = limit.get(locals) as i32;
+                let length = input.len().min(limit.max(0) as usize);
+                let mut result = u32::MAX;
+                if !needle.is_empty() && needle.len() <= 1024 {
+                    // Stock file_find_limit searches each 4096-byte read independently.
+                    let finder = memchr::memmem::Finder::new(needle);
+                    for (i, chunk) in input[..length].chunks(FIND_WINDOW).enumerate() {
+                        if i != 0 && i % 64 == 0 {
+                            check()?;
+                        }
+                        if let Some(at) = finder.find(chunk) {
+                            result = (i * FIND_WINDOW + at) as u32;
+                            break;
+                        }
+                    }
+                }
+                u64::from(result)
+            }
+            Self::SetName(ref s) => {
+                *name = Some(s);
+                0
+            }
+        };
+        Ok(Some(value))
+    }
+}
+
+fn terminator(line: &mut Cursor<'_>, widths: &[Width], blocks: usize) -> io::Result<Instruction> {
     field(line.expect(b'T'))?;
-    if field(line.fixed(2))? != 19 || field(line.number())? != I32 {
-        return Err(unsupported("entry terminator"));
+    let target = |line: &mut Cursor<'_>| -> io::Result<usize> {
+        let i = field(line.number())?;
+        if i == 0 || i >= blocks as u64 {
+            return Err(invalid("CBC branch target outside function"));
+        }
+        Ok(i as usize)
+    };
+    Ok(match field(line.fixed(2))? {
+        17 => Instruction::Branch(
+            line.scalar(widths, Width::BOOL)?,
+            target(line)?,
+            target(line)?,
+        ),
+        18 => Instruction::Jump(target(line)?),
+        19 => {
+            if field(line.number())? != I32 {
+                return Err(unsupported("entry return type"));
+            }
+            line.scalar(widths, Width::WORD)?;
+            Instruction::Return
+        }
+        45 => Instruction::Abort,
+        _ => return Err(unsupported("entry terminator")),
+    })
+}
+
+fn instruction(
+    line: &mut Cursor<'_>,
+    widths: &[Width],
+    apis: &[u64],
+    globals: &[Global],
+    engine_level: u64,
+    data_budget: &mut usize,
+) -> io::Result<Instruction> {
+    let ty = field(line.number())?;
+    let dest = field(line.number())?;
+    let opcode = field(line.fixed(2))?;
+    if dest >= widths.len() as u64 && (opcode != 45 || dest != 0) {
+        return Err(invalid("CBC instruction destination outside function"));
     }
-    if matches!(line.first(), Some(b'@'..=b'P')) {
-        line.i32_literal()?;
-    } else if set_name.is_none() || field(line.number())? != 0 {
-        return Err(unsupported("return value"));
+    if opcode == 45 {
+        return Ok(Instruction::Abort);
     }
-    field(line.expect(b'E'))?;
-    field(line.end())?;
-    Ok(set_name)
+    if opcode == 34 {
+        // COPY writes its second operand. Its instruction header carries no result.
+        let source = if matches!(line.first(), Some(b'@'..=b'P')) {
+            let value = line.literal()?;
+            let storage = field(line.fixed(1))?;
+            let (i, width) = line.local(widths)?;
+            if storage != u64::from(width.0.div_ceil(8)) {
+                return Err(unsupported("COPY constant width or global"));
+            }
+            (i, Value::Constant(value & width.mask()))
+        } else {
+            let (src, from) = line.local(widths)?;
+            let (i, to) = line.local(widths)?;
+            if from != to {
+                return Err(invalid("CBC COPY operand types differ"));
+            }
+            (i, Value::Local(src))
+        };
+        return Ok(Instruction::Write(source.0, Expression::Copy(source.1)));
+    }
+    let width = Width::new(ty)?;
+    let dest = usize::try_from(dest).map_err(|_| invalid("invalid CBC destination"))?;
+    if widths.get(dest) != Some(&width) {
+        return Err(invalid("CBC destination type mismatch"));
+    }
+    let expr = match opcode {
+        1..=13 | 21..=30 => {
+            let (op, ty) = if opcode <= 13 {
+                (Binary::MATH[opcode as usize - 1], width)
+            } else {
+                if width != Width::BOOL {
+                    return Err(invalid("CBC comparison result must be i1"));
+                }
+                (
+                    Binary::COMPARISON[opcode as usize - 21],
+                    Width::new(field(line.number())?)?,
+                )
+            };
+            Expression::Binary(op, ty, line.scalar(widths, ty)?, line.scalar(widths, ty)?)
+        }
+        14..=16 => {
+            let (source, from) = line.local(widths)?;
+            if (opcode == 14 && from.0 <= width.0) || (opcode != 14 && from.0 >= width.0) {
+                return Err(invalid("invalid CBC integer cast widths"));
+            }
+            Expression::Cast {
+                source,
+                from,
+                to: width,
+                sign_extend: opcode == 15,
+            }
+        }
+        31 => Expression::Select(
+            line.scalar(widths, Width::BOOL)?,
+            line.scalar(widths, width)?,
+            line.scalar(widths, width)?,
+        ),
+        33 => host_call(
+            line,
+            width,
+            widths,
+            apis,
+            globals,
+            engine_level,
+            data_budget,
+        )?,
+        39 if width == Width::WORD => {
+            let Global::MatchOffset(i) = line.global(globals)? else {
+                return Err(unsupported("LOAD outside the match-offset array"));
+            };
+            Expression::MatchOffset(*i)
+        }
+        _ => return Err(unsupported("instruction opcode")),
+    };
+    Ok(Instruction::Write(dest, expr))
+}
+
+fn host_call(
+    line: &mut Cursor<'_>,
+    width: Width,
+    widths: &[Width],
+    apis: &[u64],
+    globals: &[Global],
+    engine_level: u64,
+    data_budget: &mut usize,
+) -> io::Result<Expression> {
+    let count = field(line.fixed(1))?;
+    let id = field(line.number())?;
+    if width != Width::WORD || !apis.contains(&id) {
+        return Err(unsupported("host call"));
+    }
+    Ok(match (id, count) {
+        (SET_VIRUS_NAME, 2) => {
+            let (bytes, _) = line.const_bytes(globals)?;
+            // The VM checks the supplied length. The API reads through the first NUL.
+            let nul = field(bytes.iter().position(|&b| b == 0))?;
+            let name =
+                str::from_utf8(&bytes[..nul]).map_err(|_| invalid("invalid CBC detection name"))?;
+            if name.is_empty() || name.bytes().any(|b| b.is_ascii_control()) {
+                return Err(invalid("empty or control-containing CBC detection name"));
+            }
+            *data_budget = data_budget
+                .checked_sub(name.len())
+                .ok_or_else(|| unsupported("constant data budget"))?;
+            Expression::SetName(name.into())
+        }
+        (FILE_BYTEAT, 1) => Expression::FileByte(line.scalar(widths, Width::WORD)?),
+        (FILE_FIND_LIMIT, 3) => {
+            let (bytes, len) = line.const_bytes(globals)?;
+            *data_budget = data_budget
+                .checked_sub(len)
+                .ok_or_else(|| unsupported("constant data budget"))?;
+            Expression::Find(bytes[..len].into(), line.scalar(widths, Width::WORD)?)
+        }
+        (ENGINE_LEVEL, 0) => Expression::Copy(Value::Constant(engine_level & u64::from(u32::MAX))),
+        _ => return Err(unsupported("host call argument count")),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn fixed(value: u64, digits: usize) -> String {
         (0..digits)
@@ -469,14 +991,20 @@ mod tests {
             assert_eq!(program.trigger(), "Local.Trigger;Target:0;0;72656365697074");
             let mut steps = 0;
             assert_eq!(
-                program.run(|| {
+                program.run(&[], &[0; 64], TEST_TIMEOUT, || {
                     steps += 1;
                     Ok(())
                 })?,
                 calls.then_some("Local.Receipt")
             );
             assert_eq!(steps, if calls { 2 } else { 1 });
-            assert!(program.run(|| Err(io::Error::other("cancelled"))).is_err());
+            assert!(
+                program
+                    .run(&[], &[0; 64], TEST_TIMEOUT, || Err(io::Error::other(
+                        "cancelled"
+                    )))
+                    .is_err()
+            );
         }
         Ok(())
     }
@@ -487,7 +1015,7 @@ mod tests {
         assert!(Program::compile(text.as_bytes(), 55).unwrap().is_none());
         assert!(Program::compile(b"ClamBCai", 213).unwrap().is_none()); // Format 9.
         let mut unsupported = sample(true);
-        unsupported[6] = unsupported[6].replacen(&fixed(33, 2), &fixed(1, 2), 1);
+        unsupported[6] = unsupported[6].replacen(&fixed(33, 2), &fixed(38, 2), 1);
         assert_eq!(
             Program::compile(unsupported.join("\n").as_bytes(), 213)
                 .unwrap_err()
@@ -503,6 +1031,153 @@ mod tests {
     }
 
     #[test]
+    fn executes_a_counted_loop_and_checks_cancellation_on_back_edges() -> io::Result<()> {
+        let mut module = sample(true);
+        let n = |v| number(v, false);
+        let op = |ty, dest, opcode| format!("{}{}{}", n(ty), n(dest), fixed(opcode, 2));
+        let byte = |v| number(v, true) + &fixed(1, 1);
+        let jump = |block| format!("T{}{}", fixed(18, 2), n(block));
+        let branch = |v, yes, no| format!("T{}{}{}{}", fixed(17, 2), n(v), n(yes), n(no));
+        let mut entry = format!("A{}{}L{}", fixed(0, 1), n(32), n(3));
+        for ty in [32, 8, 1] {
+            entry += &(n(ty) + &fixed(0, 1));
+        }
+        module[5] = entry + "F" + &n(7) + &n(3);
+        let hit = module[6].clone();
+        module.splice(
+            6..7,
+            [
+                "B".to_string() + &op(0, 0, 34) + &byte(3) + &n(1) + &jump(1),
+                "B".to_string()
+                    + &op(8, 1, 2)
+                    + &n(1)
+                    + &byte(1)
+                    + &op(1, 2, 21)
+                    + &n(8)
+                    + &n(1)
+                    + &byte(0)
+                    + &branch(2, 2, 1),
+                hit,
+            ],
+        );
+        let program = Program::compile(module.join("\n").as_bytes(), 213)?.unwrap();
+        let mut steps = 0;
+        let result = program.run(&[], &[0; 64], TEST_TIMEOUT, || {
+            steps += 1;
+            Ok(())
+        })?;
+        assert_eq!(result, Some("Local.Receipt"));
+        assert_eq!(steps, 13);
+        let mut steps = 0;
+        let error = program
+            .run(&[], &[0; 64], TEST_TIMEOUT, || {
+                steps += 1;
+                if steps == 8 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        for target in [0, 3] {
+            let mut bad = module.clone();
+            bad[7] = bad[7].replace(&branch(2, 2, 1), &branch(2, target, 1));
+            assert!(Program::compile(bad.join("\n").as_bytes(), 213).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_signedness_width_and_arithmetic_faults() {
+        for bits in [1, 8, 16, 32, 64] {
+            let w = Width(bits);
+            let max = w.mask();
+            assert_eq!(Binary::Add.eval(w, max, 1), Some(0));
+            assert_eq!(Binary::Sub.eval(w, 0, 1), Some(max));
+            assert_eq!(Binary::Ult.eval(w, max, 0), Some(0));
+            assert_eq!(Binary::Slt.eval(w, max, 0), Some(u64::from(bits != 1)));
+            assert_eq!(Binary::UDiv.eval(w, 1, 0), None);
+        }
+        assert_eq!(Binary::SDiv.eval(Width(8), 250, 2), Some(253));
+        assert_eq!(Binary::SRem.eval(Width(16), 65531, 2), Some(65535));
+        assert_eq!(Binary::AShr.eval(Width(16), 0x8000, 1), Some(0xc000));
+        assert_eq!(Binary::Shl.eval(Width(8), 1, 9), None);
+        assert_eq!(Binary::SDiv.eval(Width(64), 1 << 63, u64::MAX), None);
+    }
+
+    #[test]
+    fn decodes_scalar_casts_and_select() -> io::Result<()> {
+        let widths = [Width(8), Width(16), Width(32), Width(1), Width(64)];
+        let mut locals = [0xfb, 0, 0, 0, 0];
+        let n = |v| number(v, false);
+        let write = |outputs: &mut [u64], ty, dest, opcode, args: String| -> io::Result<()> {
+            let text = n(ty) + &n(dest) + &fixed(opcode, 2) + &args;
+            let mut line = Cursor(text.as_bytes());
+            let Instruction::Write(i, expr) =
+                instruction(&mut line, &widths, &[], &[], 213, &mut 0)?
+            else {
+                panic!("expected scalar result")
+            };
+            field(line.end())?;
+            outputs[i] = expr
+                .eval(outputs, &[], &[0; 64], &mut None, &mut || Ok(()))?
+                .unwrap();
+            Ok(())
+        };
+        write(&mut locals, 16, 1, 15, n(0))?; // Sign-extend i8 -5.
+        write(&mut locals, 32, 2, 16, n(1))?; // Zero-extend i16.
+        write(&mut locals, 1, 3, 14, n(2))?; // Truncate to the low bit.
+        write(&mut locals, 64, 4, 15, n(3))?;
+        let choices = n(3) + &n(2) + &number(7, true) + &fixed(4, 1);
+        write(&mut locals, 32, 2, 31, choices.clone())?;
+        assert_eq!(locals, [0xfb, 0xfffb, 0xfffb, 1, u64::MAX]);
+        locals[3] = 0;
+        write(&mut locals, 32, 2, 31, choices)?;
+        assert_eq!(locals[2], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_checked_host_data_with_the_stock_search_window() {
+        let offsets = [123; 64];
+        let mut input = vec![0xff; 8192];
+        input[4095..4097].copy_from_slice(b"ab");
+        input[5010..5012].copy_from_slice(b"ab");
+        let read = |expr: Expression| {
+            expr.eval(&[], &input, &offsets, &mut None, &mut || Ok(()))
+                .unwrap()
+        };
+        assert_eq!(read(Expression::FileByte(Value::Constant(0))), Some(255));
+        assert_eq!(
+            read(Expression::FileByte(Value::Constant(8192))),
+            Some(u32::MAX.into())
+        );
+        assert_eq!(read(Expression::MatchOffset(63)), Some(123));
+        let find = |limit| {
+            read(Expression::Find(
+                b"ab".to_vec().into(),
+                Value::Constant(limit),
+            ))
+        };
+        assert_eq!(find(5011), Some(u32::MAX.into()));
+        assert_eq!(find(5012), Some(5010));
+        assert_eq!(find(u32::MAX.into()), Some(u32::MAX.into()));
+    }
+
+    #[test]
+    fn polls_cancellation_during_a_single_host_search() {
+        let input = vec![b'-'; 65 * FIND_WINDOW];
+        let search = Expression::Find(b"ABC".to_vec().into(), Value::Constant(input.len() as u64));
+        let error = search
+            .eval(&[], &input, &[0; 64], &mut None, &mut || {
+                Err(io::ErrorKind::Interrupted.into())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
     #[ignore = "requires the pinned upstream harmless CBC fixture"]
     fn stock_marker() -> io::Result<()> {
         let path = std::env::var_os("BARNACLE_CBC_FIXTURE").ok_or_else(|| {
@@ -511,7 +1186,7 @@ mod tests {
         let data = std::fs::read(path)?;
         let program = Program::compile(&data, 213)?.unwrap();
         assert_eq!(
-            program.run(|| Ok(()))?,
+            program.run(&[], &[0; 64], TEST_TIMEOUT, || Ok(()))?,
             Some("BC.Clamav-Unit-Test-Signature")
         );
         Ok(())

@@ -28,6 +28,8 @@ pub struct Inventory {
     pub instructions: usize,
     pub opcodes: BTreeSet<u64>,
     pub apis: BTreeMap<u64, String>,
+    pub compiled: usize,
+    pub compile_errors: BTreeMap<String, usize>,
 }
 
 impl Inventory {
@@ -66,6 +68,11 @@ impl Inventory {
             result.inspect(&contents, engine_level).ok_or_else(|| {
                 invalid(format!("invalid bytecode inventory for {}", path.display()))
             })?;
+            match Program::compile(&contents, engine_level) {
+                Ok(Some(_)) => result.compiled += 1,
+                Ok(None) => {}
+                Err(error) => *result.compile_errors.entry(error.to_string()).or_default() += 1,
+            }
         }
         Ok(result)
     }
@@ -378,5 +385,7 @@ mod tests {
         assert_eq!(found.instructions, 15_034);
         assert_eq!(found.opcodes.len(), 44);
         assert_eq!(found.apis.len(), 28);
+        assert_eq!(found.compiled, 24);
+        assert_eq!(found.compile_errors.values().sum::<usize>(), 58);
     }
 }
