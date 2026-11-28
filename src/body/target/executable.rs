@@ -60,6 +60,93 @@ fn up(n: usize, align: usize) -> Option<usize> {
 }
 
 pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
+    read_pe(bytes, |_, _, _, _| Some(())).map(|(executable, _)| executable)
+}
+
+pub(crate) struct PeMetadata {
+    sections: Vec<[u32; 9]>,
+    entry: u32,
+    headers: usize,
+    file_size: usize,
+}
+
+impl PeMetadata {
+    pub(crate) fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    pub(crate) fn section_count(&self) -> u16 {
+        self.sections.len() as u16
+    }
+
+    pub(crate) fn section(&self, index: usize) -> Option<[u32; 9]> {
+        self.sections.get(index).copied()
+    }
+
+    pub(crate) fn raw_offset(&self, rva: u32) -> Option<u32> {
+        if (rva as usize) < self.headers {
+            return ((rva as usize) < self.file_size).then_some(rva);
+        }
+        self.sections
+            .iter()
+            .rev()
+            .find_map(|&[base, _, raw, size, ..]| {
+                let delta = rva.checked_sub(base)?;
+                if delta >= size {
+                    return None;
+                }
+                raw.checked_add(delta)
+            })
+    }
+}
+
+pub(crate) fn pe_metadata(bytes: &[u8]) -> Option<PeMetadata> {
+    let mut sections = Vec::new();
+    let (executable, headers) = read_pe(bytes, |header, salign, rva, mapped| {
+        let e = Endian::Little;
+        let urva = e.u32(header, 12)?;
+        let uvsz = e.u32(header, 8)?;
+        let uraw = e.u32(header, 20)?;
+        let ursz = e.u32(header, 16)?.min(bytes.len().saturating_sub(uraw));
+        let vsz = up(
+            if uvsz == 0 && mapped.size != 0 {
+                ursz
+            } else {
+                uvsz
+            },
+            salign,
+        )?;
+        // The host record stores aligned fields before the original header fields.
+        let fields = [
+            rva,
+            vsz,
+            mapped.raw,
+            mapped.size,
+            e.u32(header, 36)?,
+            urva,
+            uvsz,
+            uraw,
+            ursz,
+        ];
+        let mut section = [0; 9];
+        for (output, field) in section.iter_mut().zip(fields) {
+            *output = u32::try_from(field).ok()?;
+        }
+        sections.push(section);
+        Some(())
+    })?;
+    Some(PeMetadata {
+        sections,
+        entry: u32::try_from(executable.entry).ok()?,
+        headers,
+        file_size: bytes.len(),
+    })
+}
+
+fn read_pe(
+    bytes: &[u8],
+    mut record: impl FnMut(&[u8; 40], usize, usize, &Section) -> Option<()>,
+) -> Option<(Executable, usize)> {
     let e = Endian::Little;
     if !bytes.starts_with(b"MZ") {
         return None;
@@ -133,7 +220,9 @@ pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
             // The reference selects the last section containing the entry point.
             mapped_entry = Some(raw + delta);
         }
-        result.push(Section { raw, size });
+        let section = Section { raw, size };
+        record(h, salign, aligned_rva, &section)?;
+        result.push(section);
     }
 
     let entry = if entry < header_bytes {
@@ -141,11 +230,14 @@ pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
     } else {
         mapped_entry?
     };
-    Some(Executable {
-        entry,
-        sections: result,
-        pe_overlay,
-    })
+    Some((
+        Executable {
+            entry,
+            sections: result,
+            pe_overlay,
+        },
+        header_bytes,
+    ))
 }
 
 pub(super) fn elf(bytes: &[u8]) -> Option<Executable> {

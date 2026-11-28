@@ -25,6 +25,8 @@ impl Slot {
             (_, _) if pointer_element(types, ty).is_some() && !addressable => 8,
             _ => return Err(unsupported("frame local type or storage")),
         };
+        let alignment = width.map_or(if addressable { 1 } else { 8 }, Width::bytes);
+        let start = start.next_multiple_of(alignment);
         Ok(Self {
             ty,
             width,
@@ -38,12 +40,18 @@ impl Slot {
         self.start + self.size
     }
 
+    pub(super) fn padded_i32_cell(&self, next: Option<&Slot>) -> bool {
+        // Stock aligns the constant table to 8 after its last local.
+        let end = next.map_or_else(|| self.end().next_multiple_of(8), |s| s.start);
+        self.width == Some(Width::WORD) && self.start.is_multiple_of(8) && end >= self.start + 8
+    }
+
     fn object(&self) -> Range<usize> {
         self.start..self.end()
     }
 }
 
-fn pointer_element(types: &[Type], ty: u64) -> Option<u64> {
+pub(super) fn pointer_element(types: &[Type], ty: u64) -> Option<u64> {
     match ty {
         65..=68 => Some(8 << (ty - 65)),
         _ => match user_type(types, ty)? {
@@ -79,17 +87,18 @@ fn write_int(bytes: &mut [u8], n: u64) {
     }
 }
 
-pub(super) struct Frame<'a> {
+struct Storage<'a> {
+    base: u32,
     slots: &'a [Slot],
     registers: Option<Vec<u64>>,
     bytes: Vec<u8>,
-    pub(super) cursor: usize,
 }
 
-impl<'a> Frame<'a> {
-    pub(super) fn new(slots: &'a [Slot]) -> Self {
+impl<'a> Storage<'a> {
+    fn new(slots: &'a [Slot], base: u32) -> Self {
         let addressable = slots.iter().any(|slot| slot.addressable);
         Self {
+            base,
             slots,
             registers: (!addressable).then(|| vec![0; slots.len()]),
             bytes: if addressable {
@@ -97,8 +106,14 @@ impl<'a> Frame<'a> {
             } else {
                 Vec::new()
             },
-            cursor: 0,
         }
+    }
+
+    fn slot(&self, id: u32) -> Option<Slot> {
+        self.slots
+            .get(id.checked_sub(self.base)? as usize)
+            .copied()
+            .filter(|s| s.addressable)
     }
 
     // The compiler emits scalar reads and writes only for integer or pointer slots.
@@ -121,11 +136,177 @@ impl<'a> Frame<'a> {
     }
 }
 
+const HEAP_TAG: u32 = 1 << 31;
+const HEAP_OBJECT_LIMIT: usize = 4096;
+
+struct Allocation {
+    bytes: Vec<u8>,
+    initialized: Vec<bool>,
+}
+
+pub(super) struct Frame<'a> {
+    current: Storage<'a>,
+    parents: Vec<Storage<'a>>,
+    next_object: u32,
+    heap: Vec<Allocation>,
+    heap_bytes: usize,
+    pub(super) cursor: usize,
+}
+
+impl<'a> Frame<'a> {
+    pub(super) fn new(slots: &'a [Slot]) -> Self {
+        Self {
+            current: Storage::new(slots, 1),
+            parents: Vec::new(),
+            next_object: 1 + slots.len() as u32,
+            heap: Vec::new(),
+            heap_bytes: 0,
+            cursor: 0,
+        }
+    }
+
+    pub(super) fn get(&self, i: usize) -> u64 {
+        self.current.get(i)
+    }
+    pub(super) fn set(&mut self, i: usize, n: u64) {
+        self.current.set(i, n)
+    }
+
+    pub(super) fn enter(&mut self, slots: &'a [Slot], args: &[Value]) -> io::Result<()> {
+        let base = self.next_object;
+        // Retired objects never reuse their handle during the invocation.
+        self.next_object = base
+            .checked_add(slots.len() as u32)
+            .filter(|&next| next < HEAP_TAG)
+            .ok_or_else(|| unsupported("frame object identity budget"))?;
+        let mut child = Storage::new(slots, base);
+        for (i, arg) in args.iter().enumerate() {
+            child.set(i, arg.get(self));
+        }
+        self.parents
+            .push(std::mem::replace(&mut self.current, child));
+        Ok(())
+    }
+
+    pub(super) fn leave(&mut self) {
+        self.current = self.parents.pop().expect("paired direct call frame");
+    }
+
+    pub(super) fn allocate(&mut self, size: usize) -> io::Result<u64> {
+        if size == 0 {
+            return Ok(0);
+        }
+        let total = self
+            .heap_bytes
+            .checked_add(size)
+            .filter(|&n| n <= super::MAX_MEMBER_BYTES as usize)
+            .ok_or_else(|| unsupported("scan heap byte limit"))?;
+        if self.heap.len() >= HEAP_OBJECT_LIMIT {
+            return Err(unsupported("scan heap allocation count"));
+        }
+        let id = HEAP_TAG | self.heap.len() as u32;
+        self.heap.push(Allocation {
+            bytes: vec![0; size],
+            initialized: vec![false; size],
+        });
+        self.heap_bytes = total;
+        Ok(u64::from(id) << 32)
+    }
+
+    fn stack_object(&self, id: u32) -> Result<(&Storage<'a>, Slot), MemoryFault> {
+        std::iter::once(&self.current)
+            .chain(self.parents.iter().rev())
+            .find_map(|f| f.slot(id).map(|s| (f, s)))
+            .ok_or(MemoryFault::Bounds)
+    }
+
+    fn object_len(&self, id: u32) -> Result<usize, MemoryFault> {
+        if id & HEAP_TAG != 0 {
+            return self
+                .heap
+                .get((id ^ HEAP_TAG) as usize)
+                .map(|h| h.bytes.len())
+                .ok_or(MemoryFault::Bounds);
+        }
+        Ok(self.stack_object(id)?.1.size)
+    }
+
+    fn read(&self, id: u32, range: Range<usize>) -> Result<&[u8], MemoryFault> {
+        if id & HEAP_TAG != 0 {
+            let h = self
+                .heap
+                .get((id ^ HEAP_TAG) as usize)
+                .ok_or(MemoryFault::Bounds)?;
+            if !h.initialized[range.clone()].iter().all(|&v| v) {
+                return Err(MemoryFault::Uninitialized);
+            }
+            return Ok(&h.bytes[range]);
+        }
+        let (storage, slot) = self.stack_object(id)?;
+        Ok(&storage.bytes[slot.object()][range])
+    }
+
+    fn transfer(
+        &mut self,
+        src: u32,
+        from: Range<usize>,
+        dest: u32,
+        to: Range<usize>,
+    ) -> Result<(), MemoryFault> {
+        // Validate all source bytes before modifying the destination.
+        self.read(src, from.clone())?;
+        if src == dest && src & HEAP_TAG != 0 {
+            let h = &mut self.heap[(src ^ HEAP_TAG) as usize];
+            h.bytes.copy_within(from, to.start);
+            h.initialized[to].fill(true);
+            return Ok(());
+        }
+        for storage in std::iter::once(&mut self.current).chain(self.parents.iter_mut().rev()) {
+            if let (Some(s), Some(d)) = (storage.slot(src), storage.slot(dest)) {
+                storage
+                    .bytes
+                    .copy_within(s.start + from.start..s.start + from.end, d.start + to.start);
+                return Ok(());
+            }
+        }
+        // Different backing buffers cannot overlap.
+        let mut buffer = [0u8; 4096];
+        for offset in (0..from.len()).step_by(buffer.len()) {
+            let n = buffer.len().min(from.len() - offset);
+            let at = from.start + offset;
+            buffer[..n].copy_from_slice(self.read(src, at..at + n)?);
+            let at = to.start + offset;
+            self.writable(dest, at..at + n)?
+                .copy_from_slice(&buffer[..n]);
+        }
+        Ok(())
+    }
+
+    fn writable(&mut self, id: u32, range: Range<usize>) -> Result<&mut [u8], MemoryFault> {
+        if id & HEAP_TAG != 0 {
+            let h = self
+                .heap
+                .get_mut((id ^ HEAP_TAG) as usize)
+                .ok_or(MemoryFault::Bounds)?;
+            h.initialized[range.clone()].fill(true);
+            return Ok(&mut h.bytes[range]);
+        }
+        std::iter::once(&mut self.current)
+            .chain(self.parents.iter_mut().rev())
+            .find_map(|f| {
+                let slot = f.slot(id)?;
+                Some(&mut f.bytes[slot.object()][range.clone()])
+            })
+            .ok_or(MemoryFault::Bounds)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MemoryFault {
     Null,
     Bounds,
     OverlappingCopy,
+    Uninitialized,
 }
 
 pub(super) fn outcome<T>(result: Result<T, MemoryFault>) -> io::Result<Option<T>> {
@@ -133,6 +314,7 @@ pub(super) fn outcome<T>(result: Result<T, MemoryFault>) -> io::Result<Option<T>
         Ok(value) => Ok(Some(value)),
         Err(MemoryFault::Null) => Ok(None),
         Err(MemoryFault::OverlappingCopy) => Err(unsupported("overlapping MEMCPY ranges")),
+        Err(MemoryFault::Uninitialized) => Err(unsupported("read from unwritten heap storage")),
         Err(MemoryFault::Bounds) => Err(unsupported("memory span outside its modeled object")),
     }
 }
@@ -175,37 +357,45 @@ impl Address {
         }
     }
 
-    fn local_pointer(&self, frame: &Frame<'_>) -> Result<(usize, i32), MemoryFault> {
+    fn local_pointer(&self, frame: &Frame<'_>) -> Result<(u32, i32), MemoryFault> {
         match *self {
-            Self::Object(i) => Ok((i, 0)),
+            Self::Object(i) => Ok((frame.current.base + i as u32, 0)),
             Self::Pointer(i) => {
-                // A zero high word is null. GEP instructions create the other pointer values.
                 let encoded = frame.get(i);
-                let object = (encoded >> 32).checked_sub(1).ok_or(MemoryFault::Null)?;
-                Ok((object as usize, encoded as i32))
+                let id = (encoded >> 32) as u32;
+                if id == 0 {
+                    return Err(MemoryFault::Null);
+                }
+                Ok((id, encoded as i32))
             }
             Self::Constant(_, _) => Err(MemoryFault::Bounds),
         }
     }
 
-    fn range(&self, frame: &Frame<'_>, len: usize) -> Result<Range<usize>, MemoryFault> {
-        let (i, off) = self.local_pointer(frame)?;
-        let object = frame.slots.get(i).ok_or(MemoryFault::Bounds)?;
+    fn span(&self, frame: &Frame<'_>, len: usize) -> Result<(u32, Range<usize>), MemoryFault> {
+        let (id, off) = self.local_pointer(frame)?;
         let start = usize::try_from(off).map_err(|_| MemoryFault::Bounds)?;
         let end = start.checked_add(len).ok_or(MemoryFault::Bounds)?;
-        if !object.addressable || end > object.size {
+        if end > frame.object_len(id)? {
             return Err(MemoryFault::Bounds);
         }
-        Ok(object.start + start..object.start + end)
+        Ok((id, start..end))
     }
 
     pub(super) fn remaining<'a>(&'a self, frame: &'a Frame<'_>) -> Result<&'a [u8], MemoryFault> {
         match self {
             Self::Constant(bytes, off) => bytes.get(*off..).ok_or(MemoryFault::Bounds),
             _ => {
-                let (i, _) = self.local_pointer(frame)?;
-                let start = self.range(frame, 0)?.start;
-                Ok(&frame.bytes[start..frame.slots[i].end()])
+                let (id, start) = self.span(frame, 0)?;
+                if id & HEAP_TAG != 0 {
+                    let heap = &frame.heap[(id ^ HEAP_TAG) as usize];
+                    let available = heap.initialized[start.start..]
+                        .iter()
+                        .take_while(|&&v| v)
+                        .count();
+                    return Ok(&heap.bytes[start.start..start.start + available]);
+                }
+                frame.read(id, start.start..frame.object_len(id)?)
             }
         }
     }
@@ -219,8 +409,17 @@ impl Address {
             Self::Constant(bytes, off) => bytes
                 .get(*off..off.checked_add(len).ok_or(MemoryFault::Bounds)?)
                 .ok_or(MemoryFault::Bounds),
-            _ => Ok(&frame.bytes[self.range(frame, len)?]),
+            _ => {
+                let (id, range) = self.span(frame, len)?;
+                frame.read(id, range)
+            }
         }
+    }
+
+    pub(super) fn write(&self, frame: &mut Frame<'_>, bytes: &[u8]) -> Result<(), MemoryFault> {
+        let (id, range) = self.span(frame, bytes.len())?;
+        frame.writable(id, range)?.copy_from_slice(bytes);
+        Ok(())
     }
 }
 
@@ -251,15 +450,15 @@ impl MemoryOp {
                     .checked_mul(*stride)
                     .and_then(|n| n.checked_add(offset))
                     .ok_or(MemoryFault::Bounds)?;
-                Ok(((object as u64 + 1) << 32) | u64::from(offset as u32))
+                Ok((u64::from(object) << 32) | u64::from(offset as u32))
             }
             Self::Load(source, width) => {
                 Ok(read_int(source.read(frame, width.bytes())?) & width.mask())
             }
             Self::Store(dest, value, width) => {
                 let value = value.get(frame);
-                let range = dest.range(frame, width.bytes())?;
-                write_int(&mut frame.bytes[range], value);
+                let (id, range) = dest.span(frame, width.bytes())?;
+                write_int(frame.writable(id, range)?, value);
                 Ok(0)
             }
             Self::Compare(left, right, len) => {
@@ -279,35 +478,34 @@ impl MemoryOp {
                 len,
                 overlapping,
             } => {
-                let len = len.get(frame) as usize;
-                let dest = dest.range(frame, len)?;
+                let len = len.get(frame) as u32 as usize;
+                let (id, to) = dest.span(frame, len)?;
                 if let Address::Constant(bytes, off) = source {
-                    frame.bytes[dest].copy_from_slice(
-                        bytes
-                            .get(*off..off.checked_add(len).ok_or(MemoryFault::Bounds)?)
-                            .ok_or(MemoryFault::Bounds)?,
-                    );
+                    let data = bytes
+                        .get(*off..off.checked_add(len).ok_or(MemoryFault::Bounds)?)
+                        .ok_or(MemoryFault::Bounds)?;
+                    frame.writable(id, to)?.copy_from_slice(data);
                 } else {
-                    let source = source.range(frame, len)?;
-                    if !overlapping && source.start < dest.end && dest.start < source.end {
+                    let (from_id, from) = source.span(frame, len)?;
+                    if !overlapping && from_id == id && from.start < to.end && to.start < from.end {
                         return Err(MemoryFault::OverlappingCopy);
                     }
-                    frame.bytes.copy_within(source, dest.start);
+                    frame.transfer(from_id, from, id, to)?;
                 }
                 Ok(0)
             }
             Self::Fill(dest, value, len) => {
-                let range = dest.range(frame, len.get(frame) as usize)?;
+                let (id, range) = dest.span(frame, len.get(frame) as u32 as usize)?;
                 let byte = value.get(frame) as u8;
-                frame.bytes[range].fill(byte);
+                frame.writable(id, range)?.fill(byte);
                 Ok(0)
             }
             Self::Read(dest, len) => {
                 let size = len.get(frame) as usize;
-                let range = dest.range(frame, size)?;
+                dest.span(frame, size)?;
                 let tail = &input[frame.cursor..];
                 let n = size.min(tail.len());
-                frame.bytes[range.start..range.start + n].copy_from_slice(&tail[..n]);
+                dest.write(frame, &tail[..n])?;
                 frame.cursor += n;
                 Ok(n as u64)
             }
@@ -384,7 +582,7 @@ mod tests {
         assert_eq!(seek(-2, 1).eval(&mut frame, input), Ok(u32::MAX.into()));
         let read = MemoryOp::Read(Address::Object(0), Value::Constant(3));
         assert_eq!(read.eval(&mut frame, input), Ok(2));
-        assert_eq!(&frame.bytes[..4], &[b'b', b'c', 255, 255]);
+        assert_eq!(&frame.current.bytes[..4], &[b'b', b'c', 255, 255]);
         assert_eq!(
             frame.get(0),
             u64::from(u32::from_ne_bytes([b'b', b'c', 255, 255]))
@@ -431,10 +629,137 @@ mod tests {
             Err(MemoryFault::OverlappingCopy)
         );
         assert_eq!(transfer(true).eval(&mut frame, &[]), Ok(0));
-        assert_eq!(&frame.bytes[..4], &[b'a', b'a', b'b', 255]);
+        assert_eq!(&frame.current.bytes[..4], &[b'a', b'a', b'b', 255]);
         let compare =
             MemoryOp::Compare(Address::Pointer(1), Address::Object(0), Value::Constant(3));
         assert_eq!(compare.eval(&mut frame, &[]), Ok(1));
+        Ok(())
+    }
+
+    #[test]
+    fn pointer_arguments_share_live_storage_and_retired_frames_stay_inaccessible() -> io::Result<()>
+    {
+        let types = [Type::Bytes(4)];
+        let caller = [
+            Slot::new(69, true, 0, &types)?,
+            Slot::new(65, false, 4, &types)?,
+        ];
+        let child = [
+            Slot::new(65, false, 0, &types)?,
+            Slot::new(69, true, 8, &types)?,
+        ];
+        let mut frame = Frame::new(&caller);
+        let addr = MemoryOp::Gep(Address::Object(0), Value::Constant(1), 1)
+            .eval(&mut frame, &[])
+            .unwrap();
+        frame.set(1, addr);
+        frame.enter(&child, &[Value::Local(1)])?;
+        Address::Pointer(0).write(&mut frame, b"abc").unwrap();
+        let retired = MemoryOp::Gep(Address::Object(1), Value::Constant(0), 1)
+            .eval(&mut frame, &[])
+            .unwrap();
+        frame.leave();
+        assert_eq!(Address::Pointer(1).read(&frame, 3), Ok(&b"abc"[..]));
+        frame.enter(&child, &[Value::Constant(retired)])?;
+        assert_eq!(
+            Address::Pointer(0).read(&frame, 1),
+            Err(MemoryFault::Bounds)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn allocated_bytes_require_initialization_and_enforce_object_bounds() -> io::Result<()> {
+        let slots = [Slot::new(65, false, 0, &[])?, Slot::new(65, false, 8, &[])?];
+        let mut frame = Frame::new(&slots);
+        assert_eq!(frame.allocate(0)?, 0);
+        let ptr = frame.allocate(4)?;
+        frame.set(0, ptr);
+        let addr = Address::Pointer(0);
+        assert_eq!(addr.read(&frame, 1), Err(MemoryFault::Uninitialized));
+        MemoryOp::Read(addr, Value::Constant(4))
+            .eval(&mut frame, b"xy")
+            .unwrap();
+        assert_eq!(Address::Pointer(0).read(&frame, 2), Ok(&b"xy"[..]));
+        assert_eq!(Address::Pointer(0).remaining(&frame), Ok(&b"xy"[..]));
+        assert_eq!(
+            Address::Pointer(0).read(&frame, 3),
+            Err(MemoryFault::Uninitialized)
+        );
+        let out = MemoryOp::Gep(Address::Pointer(0), Value::Constant(3), 1)
+            .eval(&mut frame, &[])
+            .unwrap();
+        frame.set(1, out);
+        assert_eq!(
+            Address::Pointer(1).write(&mut frame, b"ok"),
+            Err(MemoryFault::Bounds)
+        );
+        frame.enter(&slots, &[Value::Local(0)])?;
+        Address::Pointer(0).write(&mut frame, b"abcd").unwrap();
+        frame.leave();
+        assert_eq!(Address::Pointer(0).read(&frame, 4), Ok(&b"abcd"[..]));
+        assert_eq!(
+            frame
+                .allocate(super::super::MAX_MEMBER_BYTES as usize)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cross_object_copy_validates_all_input_before_writing() -> io::Result<()> {
+        let slots = [Slot::new(65, false, 0, &[])?, Slot::new(65, false, 8, &[])?];
+        let mut frame = Frame::new(&slots);
+        let len = 8200;
+        for i in 0..2 {
+            let ptr = frame.allocate(len)?;
+            frame.set(i, ptr);
+        }
+        let fill = |i, value, n| {
+            MemoryOp::Fill(
+                Address::Pointer(i),
+                Value::Constant(value),
+                Value::Constant(n),
+            )
+        };
+        fill(0, 1, len as u64 - 1).eval(&mut frame, &[]).unwrap();
+        fill(1, 2, len as u64).eval(&mut frame, &[]).unwrap();
+        let copy = MemoryOp::Transfer {
+            dest: Address::Pointer(1),
+            source: Address::Pointer(0),
+            len: Value::Constant(len as u64),
+            overlapping: false,
+        };
+        assert_eq!(copy.eval(&mut frame, &[]), Err(MemoryFault::Uninitialized));
+        assert!(
+            Address::Pointer(1)
+                .read(&frame, len)
+                .unwrap()
+                .iter()
+                .all(|&n| n == 2)
+        );
+        fill(0, 1, len as u64).eval(&mut frame, &[]).unwrap();
+        assert_eq!(copy.eval(&mut frame, &[]), Ok(0));
+        assert!(
+            Address::Pointer(1)
+                .read(&frame, len)
+                .unwrap()
+                .iter()
+                .all(|&n| n == 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_length_needs_an_aligned_cell_with_unused_upper_bytes() -> io::Result<()> {
+        let word = Slot::new(32, false, 0, &[])?;
+        let adjacent = Slot::new(32, false, 4, &[])?;
+        let padded = Slot::new(65, false, 4, &[])?;
+        assert!(word.padded_i32_cell(Some(&padded)));
+        assert!(!word.padded_i32_cell(Some(&adjacent)));
+        assert!(!adjacent.padded_i32_cell(None));
         Ok(())
     }
 

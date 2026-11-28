@@ -1,6 +1,8 @@
 //! Compare harmless logical bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/pe.rs"]
+mod pe;
 #[path = "bytecode_reference/scalar.rs"]
 mod scalar;
 #[path = "common/zip.rs"]
@@ -395,4 +397,56 @@ fn barnacle_bytecode_host_calls_and_helpers() -> io::Result<()> {
 fn stock_bytecode_host_calls_and_helpers() -> io::Result<()> {
     verify_stock()?;
     compare_host_calls_and_helpers(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
+fn compare_memory_and_pe_queries(executable: &Path, miss: &str) -> io::Result<()> {
+    let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    run_program(
+        executable,
+        &scalar::heap_search(),
+        options,
+        &[
+            (b"receiptOKAY", true),
+            (b"receiptOOPS", false),
+            (b"receiptOA", false),
+        ],
+        miss,
+    )?;
+
+    let mut image = pe::benign_pe();
+    image[544..551].copy_from_slice(b"receipt");
+    let mut other = image.clone();
+    other[544..551].copy_from_slice(b"product");
+    let mut larger_section = image.clone();
+    larger_section[384..388].copy_from_slice(&4097u32.to_le_bytes());
+    larger_section[208..212].copy_from_slice(&12288u32.to_le_bytes());
+    let mut nonzero_entry = image.clone();
+    nonzero_entry[168..172].copy_from_slice(&0x1040u32.to_le_bytes());
+    for target in [0, 1] {
+        run_program(
+            executable,
+            &scalar::pe_metadata(target),
+            options,
+            &[
+                (&image, true),
+                (&other, false),
+                (&larger_section, false),
+                (&nonzero_entry, false),
+            ],
+            miss,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn barnacle_bytecode_memory_and_pe_queries() -> io::Result<()> {
+    compare_memory_and_pe_queries(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_bytecode_memory_and_pe_queries() -> io::Result<()> {
+    verify_stock()?;
+    compare_memory_and_pe_queries(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }

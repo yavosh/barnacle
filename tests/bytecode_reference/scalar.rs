@@ -9,10 +9,14 @@ const SEEK: u64 = 4;
 const SET_NAME: u64 = 5;
 const DEBUG_STRING: u64 = 6;
 const DEBUG_UINT: u64 = 7;
+const PE_RAW_OFFSET: u64 = 15;
 const FIND: u64 = 16;
 const BYTE_AT: u64 = 17;
+const ALLOCATE: u64 = 18;
+const PE_SECTION: u64 = 20;
 const READ_NUMBER: u64 = 23;
 const RUNTIME_ERROR: u64 = 42;
+const MEMORY_SEARCH: u64 = 51;
 const DEBUG_START: u64 = 54;
 const DEBUG_BYTES: u64 = 55;
 const FIND_LIMIT: u64 = 65;
@@ -63,8 +67,12 @@ fn op(width: u64, output: u64, opcode: u64, args: &[String]) -> String {
 }
 
 fn call(output: u64, id: u64, args: &[String]) -> String {
+    call_with_type(32, output, id, args)
+}
+
+fn call_with_type(ty: u64, output: u64, id: u64, args: &[String]) -> String {
     let arguments = fixed(args.len() as u64, 1) + &number(id) + &args.concat();
-    op(32, output, 33, &[arguments])
+    op(ty, output, 33, &[arguments])
 }
 
 fn call_direct(output: u64, id: u64, args: &[String]) -> String {
@@ -766,4 +774,161 @@ pub fn direct_calls() -> String {
             },
         ],
     )
+}
+
+pub fn heap_search() -> String {
+    let mut globals = name_globals(0, 5, 73);
+    global_array(&mut globals, 74, b"!AY");
+    global_pointer(&mut globals, 65, 3, 0);
+    module(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32, 32]),
+            callable(&[65, 32]),
+            callable(&[32, 65, 32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(3, 8),
+        ],
+        &[
+            (READ, 69, "read"),
+            (SEEK, 70, "seek"),
+            (SET_NAME, 69, "setvirusname"),
+            (ALLOCATE, 71, "malloc"),
+            (MEMORY_SEARCH, 72, "memstr"),
+        ],
+        globals,
+        &[
+            Function {
+                args: 0,
+                slots: &[32, 65, 32, 32, 32, 1, 32],
+                blocks: &[
+                    vec![
+                        call(0, SEEK, &[immediate(7, 4), immediate(0, 4)]),
+                        call_with_type(65, 1, ALLOCATE, &[immediate(8, 4)]),
+                        call(2, READ, &[number(1), immediate(4, 4)]),
+                        op(1, 5, 21, &[number(32), number(2), immediate(4, 4)]),
+                        branch(5, 1, 3),
+                    ],
+                    vec![
+                        call_direct(3, 2, &[number(1)]),
+                        call(
+                            4,
+                            MEMORY_SEARCH,
+                            &[number(1), immediate(4, 4), pointer(4), immediate(3, 4)],
+                        ),
+                        op(1, 5, 21, &[number(32), number(4), immediate(1, 4)]),
+                        branch(5, 2, 3),
+                    ],
+                    vec![report(6), ret()],
+                    vec![ret()],
+                ],
+            },
+            Function {
+                args: 1,
+                slots: &[65, 65],
+                blocks: &[vec![
+                    op(65, 1, 35, &[number(65), number(0), immediate(1, 4)]),
+                    op(8, 0, 38, &[immediate(u64::from(b'!'), 1), number(1)]),
+                    ret(),
+                ]],
+            },
+        ],
+    )
+}
+
+pub fn pe_metadata(target: u8) -> String {
+    let mut globals = name_globals(0x8003, 5, 75);
+    global_pointer(&mut globals, 66, 0x8003, 8);
+    global_pointer(&mut globals, 67, 0x8003, 4);
+    let mut comparisons = vec![
+        call(1, PE_SECTION, &[number(0), immediate(0, 4)]),
+        call(2, PE_SECTION, &[number(0), immediate(1, 4)]),
+        call(7, PE_RAW_OFFSET, &[immediate(0x1020, 4)]),
+        call(8, PE_RAW_OFFSET, &[immediate(0x1200, 4)]),
+        call(9, PE_RAW_OFFSET, &[immediate(128, 4)]),
+        op(16, 18, 39, &[pointer(3)]),
+        op(32, 19, 39, &[pointer(4)]),
+    ];
+    for (bit, register, bits, expect) in [
+        (10, 1, 32, 0),
+        (11, 2, 32, u64::from(u32::MAX)),
+        (14, 7, 32, 544),
+        (15, 8, 32, u64::from(u32::MAX)),
+        (16, 9, 32, 128),
+        (20, 18, 16, 1),
+        (21, 19, 32, 0),
+    ] {
+        comparisons.push(op(
+            1,
+            bit,
+            21,
+            &[number(bits), number(register), immediate(expect, bits / 8)],
+        ));
+        if bit > 10 {
+            comparisons.push(op(1, 10, 11, &[number(10), number(bit)]));
+        }
+    }
+    for (index, field) in [4096, 4096, 512, 512, 0x40000040, 4096, 512, 512, 512]
+        .into_iter()
+        .enumerate()
+    {
+        comparisons.extend([
+            op(
+                65,
+                3,
+                36,
+                &[number(74), number(0), immediate((index * 4) as u64, 4)],
+            ),
+            op(32, 4, 39, &[number(3)]),
+            op(1, 11, 21, &[number(32), number(4), immediate(field, 4)]),
+            op(1, 10, 11, &[number(10), number(11)]),
+        ]);
+    }
+    comparisons.push(branch(10, 1, 2));
+    image(
+        "0;544:72656365697074",
+        &[
+            callable(&[32, 65, 32]),
+            fixed(3, 1) + &number(9) + &number(32).repeat(9),
+            fixed(5, 1) + &number(70),
+            callable(&[32, 71, 32]),
+            array(36, 8),
+            fixed(5, 1) + &number(73),
+            array(NAME.len() + 1, 8),
+            callable(&[32, 32]),
+        ],
+        &[
+            (SET_NAME, 69, "setvirusname"),
+            (PE_RAW_OFFSET, 76, "pe_rawaddr"),
+            (PE_SECTION, 72, "get_pe_section"),
+        ],
+        globals,
+        &[
+            ADDRESSABLE | 73,
+            32,
+            32,
+            65,
+            32,
+            65,
+            32,
+            32,
+            32,
+            32,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            32,
+            16,
+            32,
+            1,
+            1,
+        ],
+        &[comparisons, vec![report(17), ret()], vec![ret()]],
+    )
+    .replacen("Target:0;", &format!("Target:{target};"), 1)
 }

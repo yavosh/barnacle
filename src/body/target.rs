@@ -3,6 +3,7 @@ use std::io;
 use std::ops::RangeInclusive;
 
 mod executable;
+pub(crate) use executable::{PeMetadata, pe_metadata};
 mod icons;
 pub(crate) use icons::IconMetric;
 mod version_info;

@@ -1,11 +1,15 @@
-//! Numeric input and diagnostic calls used by the CBC interpreter.
+//! Numeric input, PE metadata, and diagnostic calls used by the CBC interpreter.
 use super::{
-    Address, BYTE_POINTER, Cursor, Frame, Global, I32, Slot, Value, Width, memory, unsupported,
+    Address, BYTE_POINTER, Cursor, Frame, Global, I32, Scan, Slot, Type, Value, Width, memory,
+    unsupported, user_type,
 };
+use crate::body::pe_metadata;
 use std::io::{self, Write};
 
 const DEBUG_STRING: u64 = 6;
 const DEBUG_UINT: u64 = 7;
+const PE_RAW_OFFSET: u64 = 15;
+const PE_SECTION: u64 = 20;
 const READ_NUMBER: u64 = 23;
 const RUNTIME_ERROR: u64 = 42;
 const DEBUG_START: u64 = 54;
@@ -17,12 +21,26 @@ pub(super) fn declaration(id: u64) -> Option<(&'static [u8], &'static [u64])> {
     Some(match id {
         DEBUG_STRING => (b"debug_print_str\0", &[I32, BYTE_POINTER, I32]),
         DEBUG_UINT => (b"debug_print_uint\0", &[I32, I32]),
+        PE_RAW_OFFSET => (b"pe_rawaddr\0", &[I32, I32]),
         READ_NUMBER => (b"read_number\0", &[I32, I32]),
         RUNTIME_ERROR => (b"bytecode_rt_error\0", &[I32, I32]),
         DEBUG_START => (b"debug_print_str_start\0", &[I32, BYTE_POINTER, I32]),
         DEBUG_BYTES => (b"debug_print_str_nonl\0", &[I32, BYTE_POINTER, I32]),
         _ => return None,
     })
+}
+
+pub(super) fn pe_section_prototype(args: &[u64], types: &[Type]) -> bool {
+    let [I32, dest, I32] = *args else {
+        return false;
+    };
+    let Some(Type::Pointer(record)) = user_type(types, dest) else {
+        return false;
+    };
+    matches!(
+        user_type(types, *record),
+        Some(Type::Struct { packed: false, fields }) if fields == &[I32; 9]
+    )
 }
 
 #[derive(Debug)]
@@ -35,6 +53,10 @@ pub(super) enum TextMode {
 #[derive(Debug)]
 pub(super) enum Operation {
     Number(Value),
+    PeEntry,
+    PeSectionCount,
+    PeRawOffset(Value),
+    PeSection(Address, Value),
     RuntimeError(Value),
     DebugInt(Value),
     DebugText(Address, Value, TextMode),
@@ -49,6 +71,11 @@ pub(super) fn decode(
 ) -> io::Result<Operation> {
     Ok(match (id, count) {
         (READ_NUMBER, 1) => Operation::Number(line.scalar(slots, Width::WORD)?),
+        (PE_RAW_OFFSET, 1) => Operation::PeRawOffset(line.scalar(slots, Width::WORD)?),
+        (PE_SECTION, 2) => Operation::PeSection(
+            Address::decode(line, slots, globals, true)?,
+            line.scalar(slots, Width::WORD)?,
+        ),
         (RUNTIME_ERROR, 1) => Operation::RuntimeError(line.scalar(slots, Width::WORD)?),
         (DEBUG_UINT, 1) => Operation::DebugInt(line.scalar(slots, Width::WORD)?),
         (DEBUG_STRING | DEBUG_START | DEBUG_BYTES, 2) => {
@@ -69,14 +96,49 @@ impl Operation {
     pub(super) fn eval(
         &self,
         frame: &mut Frame<'_>,
-        input: &[u8],
-        debug: bool,
+        scan: &Scan<'_>,
         check: &mut impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<u64>> {
         let result = match self {
             Self::Number(radix) => {
                 let radix = radix.get(frame) as u32;
-                read_number(input, &mut frame.cursor, radix, check)?
+                read_number(scan.input, &mut frame.cursor, radix, check)?
+            }
+            Self::PeEntry | Self::PeSectionCount => {
+                let pe = scan
+                    .pe
+                    .get_or_init(|| pe_metadata(scan.input))
+                    .as_ref()
+                    .ok_or_else(|| unsupported("PE globals for this object"))?;
+                if matches!(self, Self::PeEntry) {
+                    pe.entry()
+                } else {
+                    u32::from(pe.section_count())
+                }
+            }
+            Self::PeRawOffset(rva) => scan
+                .pe
+                .get_or_init(|| pe_metadata(scan.input))
+                .as_ref()
+                .and_then(|pe| pe.raw_offset(rva.get(frame) as u32))
+                .unwrap_or(u32::MAX),
+            Self::PeSection(dest, index) => {
+                let Some(fields) = scan
+                    .pe
+                    .get_or_init(|| pe_metadata(scan.input))
+                    .as_ref()
+                    .and_then(|pe| pe.section(index.get(frame) as usize))
+                else {
+                    return Ok(Some(u64::from(u32::MAX)));
+                };
+                let mut bytes = [0; 36];
+                for (out, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(fields) {
+                    out.copy_from_slice(&value.to_ne_bytes());
+                }
+                if memory::outcome(dest.write(frame, &bytes))?.is_none() {
+                    return Ok(None);
+                }
+                0
             }
             Self::RuntimeError(location) => {
                 let location = location.get(frame) as i32;
@@ -88,7 +150,7 @@ impl Operation {
                 );
                 0
             }
-            Self::DebugInt(value) if debug => {
+            Self::DebugInt(value) if scan.debug => {
                 let printed = (value.get(frame) as i32).to_string();
                 io::stderr()
                     .lock()
@@ -104,7 +166,7 @@ impl Operation {
                 if len == 0 && !matches!(mode, TextMode::Line) {
                     return Ok(Some(u32::MAX.into()));
                 }
-                if !debug {
+                if !scan.debug {
                     return Ok(Some(0));
                 }
                 let mut output = io::stderr().lock();

@@ -22,6 +22,7 @@ pub use logical::{HandlerType, LogicalIndex, LogicalMatches, LogicalObject};
 pub use logical_pcre::PcreLimits;
 pub(crate) use target::IconMetric;
 pub use target::{ObjectContext, Offset, Target};
+pub(crate) use target::{PeMetadata, pe_metadata};
 
 const FILEBUFF: usize = 8192;
 
