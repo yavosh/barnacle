@@ -1,8 +1,10 @@
 //! Object traversal for one scan against one immutable database generation.
 use crate::body::{HandlerType, LogicalObject, ObjectContext, Target};
+use crate::bytecode::{PdfHookContext, PdfHookResult, Program};
 use md5::{Digest, Md5};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 mod archive;
 mod autoit;
@@ -19,6 +21,8 @@ mod ole;
 mod onenote;
 mod partition;
 mod pdf;
+mod polipos;
+mod riff;
 mod rtf;
 mod swf;
 mod text;
@@ -34,6 +38,30 @@ enum Handling {
     Complete,
     Incomplete,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HookControl {
+    Continue,
+    Break,
+    Found,
+}
+
+/// Scan-time settings for the generation's PDF bytecode programs.
+#[derive(Clone, Copy)]
+pub struct PdfHooks<'a> {
+    pub programs: &'a [Program],
+    pub debug: bool,
+    pub timeout: Duration,
+}
+
+/// Scan-time settings for PE hooks in database order within each phase.
+#[derive(Clone, Copy)]
+pub struct PeHooks<'a> {
+    pub programs: &'a [(u32, Program)],
+    pub unpackers: &'a [(Option<u32>, Program)],
+    pub debug: bool,
+    pub timeout: Duration,
 }
 
 trait ChildSink {
@@ -74,6 +102,14 @@ trait ChildSink {
     }
     fn partition_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
     fn script_view(&mut self, source: &[u8]) -> io::Result<bool>;
+    fn pdf_hooks_enabled(&self) -> bool;
+    fn run_pdf_hooks(
+        &mut self,
+        input: &[u8],
+        context: PdfHookContext<'_>,
+    ) -> io::Result<HookControl>;
+    fn run_pe_all_hooks(&mut self, bytes: &[u8]) -> io::Result<HookControl>;
+    fn run_pe_unpackers(&mut self, bytes: &[u8]) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
     fn at_root(&self) -> bool;
@@ -86,6 +122,8 @@ trait ChildSink {
     fn record_file_limit(&mut self);
     fn recorded_limit(&self) -> Option<Limit>;
     fn max_partitions(&self) -> usize;
+    fn check_partition_intersections(&self) -> bool;
+    fn report_heuristic(&mut self, name: &str) -> bool;
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool;
     fn size_limit(&self, size: u64) -> Option<Limit>;
     fn skip_declared_size(&mut self, size: u64) -> bool;
@@ -102,6 +140,10 @@ pub struct Options {
     pub max_recursion: usize,
     pub max_rec_hwp3: usize,
     pub alert_exceeds_max: bool,
+    pub alert_partition_intersection: bool,
+    pub alert_encrypted_doc: bool,
+    pub heuristic_alerts: bool,
+    pub heuristic_scan_precedence: bool,
     pub scan_archive: bool,
     pub scan_pe: bool,
     pub max_embedded_pe: u64,
@@ -133,6 +175,10 @@ impl Default for Options {
             max_recursion: 17,
             max_rec_hwp3: 16,
             alert_exceeds_max: false,
+            alert_partition_intersection: false,
+            alert_encrypted_doc: false,
+            heuristic_alerts: true,
+            heuristic_scan_precedence: false,
             scan_archive: true,
             scan_pe: true,
             max_embedded_pe: 40 << 20,
@@ -156,6 +202,7 @@ impl Default for Options {
     }
 }
 
+#[derive(Clone)]
 pub struct Layer {
     /// Stock hides this layer when matching container types.
     pub normalized: bool,
@@ -176,7 +223,22 @@ impl Layer {
     }
 }
 
+pub struct LogicalStep<'a> {
+    pub(crate) cursor: &'a mut Option<Box<crate::body::LogicalCursor>>,
+    pub(crate) output: &'a std::cell::RefCell<crate::bytecode::Output>,
+    pub(crate) directory: &'a Path,
+    pub(crate) restored_output: &'a mut bool,
+}
+
+impl LogicalStep<'_> {
+    pub fn is_resuming(&self) -> bool {
+        self.cursor.is_some()
+    }
+}
+
 pub struct Object<'a> {
+    pub logical_step: LogicalStep<'a>,
+
     pub bytes: &'a [u8],
     pub context: &'a ObjectContext,
     pub parents: &'a [Layer],
@@ -187,6 +249,8 @@ pub struct Object<'a> {
     pub logical_rescan: bool,
     pub logical: LogicalObject<'a>,
     pub handled_format: bool,
+    /// Matching PE prefilters belong to this map until its PE hook runs.
+    pub pe_hook_hits: Option<&'a mut Vec<u32>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -324,7 +388,11 @@ struct Traversal<'a> {
     files_scanned: usize,
     stopped: Option<Verdict>,
     first_limit: Option<Limit>,
+    deferred_heuristic: Option<Verdict>,
     last_handler_hash: [u8; 16],
+    pdf_hooks: Option<PdfHooks<'a>>,
+    pe_hooks: Option<PeHooks<'a>>,
+    pe_hook_hits: Vec<u32>,
     matcher: &'a mut Matcher<'a>,
     check: &'a mut dyn FnMut() -> io::Result<()>,
 }
@@ -342,6 +410,47 @@ pub fn scan(
     bytes: &[u8],
     options: &Options,
     temporary_directory: &Path,
+    matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
+    check: impl FnMut() -> io::Result<()>,
+) -> io::Result<Verdict> {
+    scan_with_hooks(
+        bytes,
+        options,
+        temporary_directory,
+        None,
+        None,
+        matcher,
+        check,
+    )
+}
+
+/// Scan objects with PDF bytecode hooks.
+pub fn scan_with_pdf_hooks(
+    bytes: &[u8],
+    options: &Options,
+    temporary_directory: &Path,
+    pdf_hooks: Option<PdfHooks<'_>>,
+    matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
+    check: impl FnMut() -> io::Result<()>,
+) -> io::Result<Verdict> {
+    scan_with_hooks(
+        bytes,
+        options,
+        temporary_directory,
+        pdf_hooks,
+        None,
+        matcher,
+        check,
+    )
+}
+
+/// Scan objects with the bytecode hooks from the same database generation.
+pub fn scan_with_hooks(
+    bytes: &[u8],
+    options: &Options,
+    temporary_directory: &Path,
+    pdf_hooks: Option<PdfHooks<'_>>,
+    pe_hooks: Option<PeHooks<'_>>,
     mut matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
     mut check: impl FnMut() -> io::Result<()>,
 ) -> io::Result<Verdict> {
@@ -354,15 +463,33 @@ pub fn scan(
         files_scanned: 0,
         stopped: None,
         first_limit: None,
+        deferred_heuristic: None,
         last_handler_hash: [0; 16],
+        pdf_hooks,
+        pe_hooks,
+        pe_hook_hits: Vec::new(),
         matcher: &mut matcher,
         check: &mut check,
     };
     walk.visit(bytes, InputKind::File, None, false)?;
-    Ok(walk.stopped.unwrap_or_else(|| match walk.first_limit {
-        Some(limit) if options.alert_exceeds_max => Verdict::Found(limit.signature()),
-        _ => Verdict::Miss,
+    Ok(walk.stopped.unwrap_or_else(|| {
+        match (
+            walk.deferred_heuristic,
+            walk.first_limit.filter(|_| options.alert_exceeds_max),
+        ) {
+            // Pinned daemons can select either name among distinct deferred alerts.
+            (Some(_), Some(_)) => Verdict::Incomplete,
+            (Some(alert), None) => alert,
+            (None, Some(limit)) => Verdict::Found(limit.signature()),
+            (None, None) => Verdict::Miss,
+        }
     }))
+}
+
+enum MatchFlow {
+    Done,
+    Handlers,
+    HandlerLimit,
 }
 
 impl Traversal<'_> {
@@ -414,6 +541,7 @@ impl Traversal<'_> {
                 return Ok(());
             }
         }
+        let parent_hook_hits = std::mem::take(&mut self.pe_hook_hits);
         self.parents.push(Layer {
             normalized,
             target: file_type.context.target(),
@@ -421,7 +549,7 @@ impl Traversal<'_> {
             size: bytes.len(),
             name: name.map(Into::into),
         });
-        let handling = file_type.parser.before_raw(bytes, self.options, self)?;
+        let handling = file_type.before_raw(bytes, self.options, self)?;
         if handling == Handling::Incomplete {
             self.stopped = Some(Verdict::Incomplete);
         }
@@ -459,6 +587,7 @@ impl Traversal<'_> {
             }
         }
         self.parents.pop();
+        self.pe_hook_hits = parent_hook_hits;
         Ok(())
     }
 
@@ -470,30 +599,176 @@ impl Traversal<'_> {
         handled_format: bool,
         logical_rescan: bool,
     ) -> io::Result<bool> {
-        let (layer, parents) = self.parents.split_last().expect("current layer");
-        let object = Object {
-            bytes,
-            context,
-            layer,
-            parents,
-            normalized,
-            body_only: false,
-            logical_rescan,
-            logical: LogicalObject {
-                parents: Layer::logical_parents(&self.parents),
-                recursion_level: parents.len() + self.normalized_depth,
-                file_size: bytes.len(),
-                unmapped_script: false,
-                mapped_source_size: None,
-            },
-            handled_format,
+        self.match_steps(bytes, None, |walk, step| {
+            let (layer, parents) = walk.parents.split_last().expect("current layer");
+            let object = Object {
+                logical_step: step,
+                bytes,
+                context,
+                layer,
+                parents,
+                normalized,
+                body_only: false,
+                logical_rescan,
+                logical: LogicalObject {
+                    parents: Layer::logical_parents(&walk.parents),
+                    recursion_level: parents.len() + walk.normalized_depth,
+                    file_size: bytes.len(),
+                    unmapped_script: false,
+                    script_source: None,
+                },
+                handled_format,
+                pe_hook_hits: (walk.pe_hooks.is_some() && !normalized && context.is_valid_pe())
+                    .then_some(&mut walk.pe_hook_hits),
+            };
+            (walk.matcher)(object, walk.check)
+        })
+    }
+
+    fn match_steps(
+        &mut self,
+        bytes: &[u8],
+        virtual_layer: Option<&Layer>,
+        mut evaluate: impl FnMut(&mut Self, LogicalStep<'_>) -> io::Result<Verdict>,
+    ) -> io::Result<bool> {
+        let mut cursor = None;
+        let mut recheck = false;
+        loop {
+            let output = self.bytecode_output();
+            let mut restored_output = false;
+            let step = LogicalStep {
+                cursor: &mut cursor,
+                output: &output,
+                directory: self.temporary_directory,
+                restored_output: &mut restored_output,
+            };
+            let verdict = evaluate(self, step)?;
+            let output = output.into_inner();
+            if let Some(reason) = output.rejected {
+                self.first_limit.get_or_insert(reason);
+            }
+            if let Some(snapshot) = output.snapshot {
+                let layer = virtual_layer.filter(|_| !restored_output);
+                if let Some(layer) = layer {
+                    self.parents.push(layer.clone());
+                }
+                let result = self.bytecode_child(snapshot, output.size);
+                if layer.is_some() {
+                    self.parents.pop();
+                }
+                result?;
+                if self.stopped.is_some() {
+                    return Ok(recheck);
+                }
+            }
+            match self.apply_verdict(bytes, verdict)? {
+                MatchFlow::Handlers => recheck = true,
+                MatchFlow::HandlerLimit => return Ok(true),
+                MatchFlow::Done => (),
+            }
+            if self.stopped.is_some() || cursor.is_none() {
+                return Ok(recheck);
+            }
+        }
+    }
+
+    fn bytecode_output(&self) -> std::cell::RefCell<crate::bytecode::Output> {
+        std::cell::RefCell::new(crate::bytecode::Output::new(self.bytecode_limits()))
+    }
+
+    fn bytecode_limits(&self) -> crate::bytecode::OutputLimits {
+        crate::bytecode::OutputLimits {
+            file_size: self.max_file_size(),
+            scan_remaining: unlimited_if_zero(self.options.max_scan_size)
+                .saturating_sub(self.bytes_scanned),
+            file_slot: self.options.max_files == 0 || self.files_scanned < self.options.max_files,
+        }
+    }
+
+    fn bytecode_child(&mut self, snapshot: Snapshot, size: u64) -> io::Result<()> {
+        if self.charge_bytecode_output(size) {
+            self.scan_bytecode_child(snapshot, size)?;
+        }
+        Ok(())
+    }
+
+    fn charge_bytecode_output(&mut self, size: u64) -> bool {
+        // Stock extract_new charges the completed output before the recursive file scan.
+        if self.skip_declared_size(size) {
+            return false;
+        }
+        if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
+            self.first_limit.get_or_insert(Limit::MaxFiles);
+            return false;
+        }
+        self.files_scanned += 1;
+        self.bytes_scanned += size;
+        true
+    }
+
+    fn scan_bytecode_child(&mut self, snapshot: Snapshot, size: u64) -> io::Result<Option<Limit>> {
+        self.check()?;
+        // The recursive stock scanner skips tiny files, then checks bytes before count and depth.
+        if size <= 5 {
+            return Ok(None);
+        }
+        if let Some(reason) = self.size_limit(size).or_else(|| self.child_limit()) {
+            self.first_limit.get_or_insert(reason);
+            return Ok(Some(reason));
+        }
+        self.visit_snapshot(snapshot, None, None)?;
+        Ok(None)
+    }
+
+    fn extract_bytecode(
+        &mut self,
+        output: &std::cell::RefCell<crate::bytecode::Output>,
+        first_finding: &mut Option<String>,
+    ) -> io::Result<Option<u32>> {
+        let (snapshot, size) = {
+            let mut spool = output.borrow_mut();
+            if let Some(reason) = spool.rejected.take() {
+                self.first_limit.get_or_insert(reason);
+            }
+            if spool.size == 0 {
+                return Ok(Some(0));
+            }
+            if !self.charge_bytecode_output(spool.size) {
+                return Ok(Some(u32::MAX));
+            }
+            let size = std::mem::take(&mut spool.size);
+            (
+                spool.snapshot.take().expect("nonempty bytecode output"),
+                size,
+            )
         };
-        let verdict = (self.matcher)(object, self.check)?;
-        self.apply_verdict(bytes, verdict)
+        let limit = self.scan_bytecode_child(snapshot, size)?;
+        output.borrow_mut().limits = self.bytecode_limits();
+        if let Some(stopped) = self.stopped.take() {
+            if stopped == Verdict::Incomplete && first_finding.is_some() {
+                // The API result is unknown. Stop this VM and retain the earlier detection.
+                return Ok(None);
+            }
+            let Verdict::Found(name) = stopped else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "incomplete bytecode child scan",
+                ));
+            };
+            first_finding.get_or_insert(name);
+            return Ok(Some(1));
+        }
+        Ok(Some(match limit {
+            Some(Limit::MaxRecursion) => 23,
+            Some(Limit::MaxFileSize | Limit::MaxScanSize) => 24,
+            Some(Limit::MaxFiles) => 25,
+            Some(Limit::MaxScanTime) => return Err(io::ErrorKind::TimedOut.into()),
+            None => 0,
+        }))
     }
 
     // Return whether a later stage on the same map may need to retry without a digest.
-    fn apply_verdict(&mut self, bytes: &[u8], verdict: Verdict) -> io::Result<bool> {
+    fn apply_verdict(&mut self, bytes: &[u8], verdict: Verdict) -> io::Result<MatchFlow> {
         match verdict {
             Verdict::Handlers { rules, finding } => {
                 let unsupported = |message| io::Error::new(io::ErrorKind::Unsupported, message);
@@ -507,7 +782,7 @@ impl Traversal<'_> {
                     if self.last_handler_hash == hash {
                         if let Some(name) = name.map_err(unsupported)? {
                             self.stopped = Some(Verdict::Found(name));
-                            return Ok(false);
+                            return Ok(MatchFlow::Done);
                         }
                         continue;
                     }
@@ -519,21 +794,21 @@ impl Traversal<'_> {
                     .or_else(|| self.size_limit(bytes.len() as u64));
                     if let Some(limit) = limit {
                         self.first_limit.get_or_insert(limit);
-                        return Ok(true);
+                        return Ok(MatchFlow::HandlerLimit);
                     }
                     let filename = self.parents.last().and_then(|p| p.name.clone());
                     self.visit(bytes, InputKind::Handler(kind), filename.as_deref(), false)?;
                     if self.stopped.is_some() {
-                        return Ok(false);
+                        return Ok(MatchFlow::Done);
                     }
                 }
                 self.stopped = finding.map_err(unsupported)?.map(Verdict::Found);
-                return Ok(true);
+                return Ok(MatchFlow::Handlers);
             }
             Verdict::Miss => (),
             other => self.stopped = Some(other),
         }
-        Ok(false)
+        Ok(MatchFlow::Done)
     }
 
     fn after_raw(
@@ -596,11 +871,125 @@ impl Traversal<'_> {
                 return Ok(result);
             }
         }
-        file_type.parser.after_raw(bytes, self.options, self)
+        file_type.after_raw(bytes, self.options, self)
+    }
+
+    fn report_hook_detection(&mut self, name: &str) -> bool {
+        if name.starts_with("BC.Heuristics") {
+            return self.report_heuristic(name);
+        }
+        self.stopped = Some(Verdict::Found(name.to_owned()));
+        true
     }
 }
 
 impl ChildSink for Traversal<'_> {
+    fn pdf_hooks_enabled(&self) -> bool {
+        self.pdf_hooks
+            .is_some_and(|hooks| !hooks.programs.is_empty())
+    }
+
+    fn run_pdf_hooks(
+        &mut self,
+        input: &[u8],
+        context: PdfHookContext<'_>,
+    ) -> io::Result<HookControl> {
+        let mut control = HookControl::Continue;
+        if let Some(hooks) = self.pdf_hooks {
+            for program in hooks.programs {
+                match program.run_pdf(
+                    input,
+                    context,
+                    hooks.debug,
+                    hooks.timeout,
+                    &mut *self.check,
+                )? {
+                    PdfHookResult::Found(name) if self.report_hook_detection(name) => {
+                        return Ok(HookControl::Found);
+                    }
+                    PdfHookResult::Found(_) | PdfHookResult::Continue => (),
+                    PdfHookResult::Break => control = HookControl::Break,
+                }
+            }
+        }
+        Ok(control)
+    }
+
+    fn run_pe_all_hooks(&mut self, bytes: &[u8]) -> io::Result<HookControl> {
+        let Some(hooks) = self.pe_hooks.filter(|_| !self.pe_hook_hits.is_empty()) else {
+            return Ok(HookControl::Continue);
+        };
+        let mut control = HookControl::Continue;
+        self.pe_hook_hits.sort_unstable();
+        for (id, program) in hooks.programs {
+            if self.pe_hook_hits.binary_search(id).is_err() {
+                continue;
+            }
+            match program.run_pe_all(bytes, hooks.debug, hooks.timeout, &mut *self.check)? {
+                PdfHookResult::Found(name) if self.report_hook_detection(name) => {
+                    return Ok(HookControl::Found);
+                }
+                PdfHookResult::Break => control = HookControl::Break,
+                PdfHookResult::Continue | PdfHookResult::Found(_) => (),
+            }
+        }
+        Ok(control)
+    }
+
+    fn run_pe_unpackers(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        let Some(hooks) = self.pe_hooks else {
+            return Ok(false);
+        };
+        // PE_ALL sorted the matched prefilter IDs before the native unpacker phase.
+        for (condition, program) in hooks.unpackers {
+            if condition.is_some_and(|id| self.pe_hook_hits.binary_search(&id).is_err()) {
+                continue;
+            }
+            let output = self.bytecode_output();
+            let directory = self.temporary_directory;
+            let session = std::cell::RefCell::new((&mut *self, None));
+            let result = program.run_pe_unpacker(
+                bytes,
+                crate::bytecode::UnpackerInput {
+                    output: &output,
+                    directory,
+                    extract: &|| {
+                        let mut state = session.borrow_mut();
+                        let (walk, first) = &mut *state;
+                        walk.extract_bytecode(&output, first)
+                    },
+                },
+                hooks.debug,
+                hooks.timeout,
+                || session.borrow_mut().0.check(),
+            )?;
+            let (_, extracted) = session.into_inner();
+            let output = output.into_inner();
+            if let Some(reason) = output.rejected {
+                self.first_limit.get_or_insert(reason);
+            }
+            if let Some(snapshot) = output.snapshot {
+                self.bytecode_child(snapshot, output.size)?;
+                if self.stopped.is_some() {
+                    if let Some(first) = extracted {
+                        self.stopped = Some(Verdict::Found(first));
+                    }
+                    return Ok(true);
+                }
+            }
+            if let PdfHookResult::Found(name) = result
+                && self.report_hook_detection(name)
+            {
+                return Ok(true);
+            }
+            if let Some(first) = extracted {
+                self.stopped = Some(Verdict::Found(first));
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn at_root(&self) -> bool {
         self.parents.len() == 1
     }
@@ -649,25 +1038,28 @@ impl ChildSink for Traversal<'_> {
             name: None,
             size: bytes.len(),
         };
-        let object = Object {
-            bytes,
-            context: &context,
-            parents: &self.parents,
-            layer: &layer,
-            normalized: false,
-            body_only: false,
-            logical_rescan: false,
-            logical: LogicalObject {
-                parents: &self.parents,
-                recursion_level: self.parents.len() + self.normalized_depth,
-                file_size: bytes.len(),
-                unmapped_script: false,
-                mapped_source_size: None,
-            },
-            handled_format: true,
-        };
-        let verdict = (self.matcher)(object, self.check)?;
-        self.apply_verdict(bytes, verdict)?;
+        self.match_steps(bytes, Some(&layer), |walk, step| {
+            let object = Object {
+                logical_step: step,
+                bytes,
+                context: &context,
+                parents: &walk.parents,
+                layer: &layer,
+                normalized: false,
+                body_only: false,
+                logical_rescan: false,
+                logical: LogicalObject {
+                    parents: &walk.parents,
+                    recursion_level: walk.parents.len() + walk.normalized_depth,
+                    file_size: bytes.len(),
+                    unmapped_script: false,
+                    script_source: None,
+                },
+                handled_format: true,
+                pe_hook_hits: None,
+            };
+            (walk.matcher)(object, walk.check)
+        })?;
         Ok(self.stopped.is_some())
     }
 
@@ -705,6 +1097,26 @@ impl ChildSink for Traversal<'_> {
 
     fn max_partitions(&self) -> usize {
         self.options.max_partitions
+    }
+
+    fn check_partition_intersections(&self) -> bool {
+        self.options.alert_partition_intersection
+    }
+
+    fn report_heuristic(&mut self, name: &str) -> bool {
+        if self.options.heuristic_scan_precedence {
+            self.stopped = Some(Verdict::Found(name.to_owned()));
+            true
+        } else {
+            match &self.deferred_heuristic {
+                None => self.deferred_heuristic = Some(Verdict::Found(name.to_owned())),
+                Some(Verdict::Found(existing)) if existing != name => {
+                    self.deferred_heuristic = Some(Verdict::Incomplete)
+                }
+                _ => (),
+            }
+            false
+        }
     }
 
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling> {
@@ -844,10 +1256,7 @@ impl ChildSink for Traversal<'_> {
         let view =
             text::NormalizedText::new(source).into_bytes(self.temporary_directory, self.check)?;
         let bytes = view.as_ref();
-        let (owner, parents) = self
-            .parents
-            .split_last()
-            .expect("view has an owning object");
+        let owner = self.parents.last().expect("view has an owning object");
         let context = ObjectContext::typed(Target::Ascii, bytes);
         let layer = Layer {
             normalized: true,
@@ -856,25 +1265,32 @@ impl ChildSink for Traversal<'_> {
             size: bytes.len(),
             name: owner.name.clone(),
         };
-        let object = Object {
-            bytes,
-            context: &context,
-            layer: &layer,
-            parents: if mapped { &self.parents } else { parents },
-            normalized: true,
-            body_only: !mapped,
-            logical_rescan: false,
-            logical: LogicalObject {
-                parents: Layer::logical_parents(&self.parents),
-                recursion_level: parents.len() + self.normalized_depth + usize::from(mapped),
-                file_size: if mapped { bytes.len() } else { owner.size },
-                unmapped_script: !mapped,
-                mapped_source_size: mapped.then_some(owner.size),
-            },
-            handled_format: true,
-        };
-        let verdict = (self.matcher)(object, self.check)?;
-        self.apply_verdict(bytes, verdict)?;
+        self.match_steps(bytes, mapped.then_some(&layer), |walk, step| {
+            let (owner, parents) = walk
+                .parents
+                .split_last()
+                .expect("view has an owning object");
+            let object = Object {
+                logical_step: step,
+                bytes,
+                context: &context,
+                layer: &layer,
+                parents: if mapped { &walk.parents } else { parents },
+                normalized: true,
+                body_only: !mapped,
+                logical_rescan: false,
+                logical: LogicalObject {
+                    parents: Layer::logical_parents(&walk.parents),
+                    recursion_level: parents.len() + walk.normalized_depth + usize::from(mapped),
+                    file_size: if mapped { bytes.len() } else { owner.size },
+                    unmapped_script: !mapped,
+                    script_source: Some(source),
+                },
+                handled_format: true,
+                pe_hook_hits: None,
+            };
+            (walk.matcher)(object, walk.check)
+        })?;
         Ok(self.stopped.is_some())
     }
 

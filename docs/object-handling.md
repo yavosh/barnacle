@@ -406,6 +406,19 @@ Stock scans stored carriers and stored streams as ciphertext.
 
 When the empty user password fails, stock does not decrypt. Its Flate stage then fails on the ciphertext and it scans each stream's physical bytes.
 Barnacle does the same only when both of stock's inflate attempts must fail at the zlib header. Other locked layouts yield incomplete coverage.
+
+With `AlertEncryptedDoc yes`, both daemons report `Heuristics.Encrypted.PDF` for the password-protected fixture.
+A whole-file signature wins first. A ciphertext stream signature wins with default precedence.
+`HeuristicScanPrecedence yes` reports the PDF alert before scanning those streams, including when `HeuristicAlerts no` is set.
+The alert requires `ScanPDF yes`. Documents that open with an empty user password remain eligible for ordinary stream scanning.
+The controls include documents with extraction restrictions. A deferred PDF alert and a deferred limit can win on different daemon starts.
+Barnacle reports incomplete when that winner is ambiguous. [PDF alert comparisons](../tests/object_pdf_security.rs)
+
+With `HeuristicAlerts yes` and `ScanPDF yes`, Barnacle reports `Heuristics.PDF.ObfuscatedNameObject` for escaped common dictionary names.
+The check covers ordinary dictionaries and decoded object streams within supported PDF layouts.
+Supported escaped filter values still decode their streams. A child signature wins even with `HeuristicScanPrecedence yes`.
+PDF layouts that require unsupported extraction remain incomplete. [Name alert comparisons](../tests/object_pdf.rs) · [Packed dictionary comparison](../tests/object_pdf_streams.rs)
+
 Stock sets its attachment flag only when `/EmbeddedFile` appears before the filter list.
 Without that flag, a stream whose only filters are LZW or run-length is not scanned. The flag also selects the `/EFF` crypt filter.
 In encrypted documents, stock decrypts a stream before its LZW chain. A leading DCT stage keeps the ciphertext.
@@ -507,8 +520,11 @@ The MBR boot sector also consumes a file slot. An oversized first APM partition 
 Stock finds the legacy APM with a map at byte 512. It misses the same payload with a native map at byte 2048.
 ZIP ancestry, container signatures, recursion, scan size, and file-count limits have paired controls. [Partition comparisons](../tests/object_partition.rs)
 
-Stock-only controls record the three intersection heuristic names and their order against a matching partition signature.
-Barnacle's heuristic matcher still needs that coverage. Vendor-specific extended layouts and non-ASCII partition names need additional comparisons.
+With `AlertPartitionIntersection yes`, both daemons report intersections in the primary MBR table, GPT tables, and APM entries.
+A matching member wins by default. With `HeuristicScanPrecedence yes`, the intersection wins before members.
+An MBR whole-image or boot-sector match still wins first. The partition setting remains effective with `HeuristicAlerts no`.
+When different deferred heuristic names compete, stock can report different names across daemon starts. Barnacle returns an incomplete scan.
+Vendor-specific extended layouts and non-ASCII partition names need additional comparisons. [Partition comparisons](../tests/object_partition.rs)
 
 ### HFS+ and HFSX partitions
 

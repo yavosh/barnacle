@@ -1,7 +1,9 @@
 //! The byte-for-byte signed archives verified for the pinned ClamAV comparison.
 use super::invalid;
+use barnacle::bytecode::{PINNED_ARCHIVE, visit_verified_members};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,17 +20,14 @@ pub(super) const PINNED: [(&str, u64, &str); 3] = [
         89_072_577,
         "0b2182d229f46981ec8f535382222f7c9dfdd656b250ad47988b910a8d302365",
     ),
-    (
-        "bytecode.cvd",
-        281_702,
-        "6d4aa01f219e988060fc419f495d07f27e0cdf1a2cccc065971da922c76f7ffb",
-    ),
+    PINNED_ARCHIVE,
 ];
 
 pub(super) fn extract(
     source: &Path,
     dir: &Path,
     paths: &mut Vec<(PathBuf, bool)>,
+    bytecode: Option<&mut HashMap<PathBuf, Box<[u8]>>>,
 ) -> io::Result<()> {
     let &(name, length, digest) = PINNED
         .iter()
@@ -57,6 +56,23 @@ pub(super) fn extract(
         )));
     }
     // Parse exactly the bytes just authenticated, even if FreshClam replaced the source.
+    if name == PINNED_ARCHIVE.0 {
+        if let Some(members) = bytecode {
+            snapshot.rewind()?;
+            visit_verified_members(snapshot, |path, contents| {
+                let output = dir.join(path);
+                if members.insert(output.clone(), contents.into()).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "duplicate bytecode archive member",
+                    ));
+                }
+                paths.push((output, true));
+                Ok(())
+            })?;
+        }
+        return Ok(());
+    }
     snapshot.seek(SeekFrom::Start(512))?;
     let mut archive = tar::Archive::new(GzDecoder::new(snapshot));
     let stem = name.trim_end_matches(".cvd");
@@ -94,4 +110,33 @@ pub(super) fn extract(
         paths.push((output, true));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "set BARNACLE_CVD_DIR to the verified FreshClam snapshot"]
+    fn verified_bytecode_keeps_members_off_disk() -> io::Result<()> {
+        let source =
+            PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap()).join(PINNED_ARCHIVE.0);
+        let scratch = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        let mut members = HashMap::new();
+        extract(&source, scratch.path(), &mut paths, Some(&mut members))?;
+        assert_eq!(paths.len(), 85);
+        assert_eq!(members.len(), paths.len());
+        assert!(
+            paths
+                .iter()
+                .all(|(path, official)| *official && members.contains_key(path))
+        );
+        assert_eq!(
+            members.values().map(|data| data.len()).sum::<usize>(),
+            1_274_849
+        );
+        assert!(scratch.path().read_dir()?.next().is_none());
+        Ok(())
+    }
 }

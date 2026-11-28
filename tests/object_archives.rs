@@ -22,6 +22,7 @@ use sevenz_rust2::{
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::process::Command;
 
 const FIRST: &[u8] = b"ordinary first archive marker";
 const SECOND: &[u8] = b"ordinary second archive marker";
@@ -589,9 +590,100 @@ fn nested_archive_children() -> io::Result<()> {
 #[test]
 #[ignore = "requires Debian clamd 1.4.3+dfsg-1"]
 fn stock_archive_children() -> io::Result<()> {
-    let package = std::process::Command::new("dpkg-query")
+    verify_stock_package()?;
+    compare(Path::new("/usr/sbin/clamd"))
+}
+
+fn verify_stock_package() -> io::Result<()> {
+    let package = Command::new("dpkg-query")
         .args(["-W", "-f=${Version}", "clamav-daemon"])
         .output()?;
     assert_eq!(package.stdout, b"1.4.3+dfsg-1");
-    compare(Path::new("/usr/sbin/clamd"))
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Debian clamd 1.4.3+dfsg-1 and Linux prlimit"]
+fn stock_xz_dictionary_limit() -> io::Result<()> {
+    verify_stock_package()?;
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let db = dir.path().join("db");
+    let socket = dir.path().join("socket");
+    let config = dir.path().join("clamd.conf");
+    let pid_file = dir.path().join("clamd.pid");
+    fs::create_dir(&db)?;
+    let receipt_hash = barnacle::hash_reader(FIRST)?;
+    fs::write(
+        db.join("local.hdb"),
+        format!(
+            "{}:{}:Archive.Receipt\n",
+            receipt_hash.md5_hex(),
+            FIRST.len()
+        ),
+    )?;
+    fs::write(
+        &config,
+        format!(
+            "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nPidFile {}\nSelfCheck 0\nDisableCache yes\nMaxThreads 1\nIdleTimeout 60\nBytecode no\nHeuristicAlerts no\nHeuristicScanPrecedence no\n",
+            db.display(),
+            socket.display(),
+            pid_file.display(),
+        ),
+    )?;
+    let _daemon = Daemon::start(Path::new("/usr/sbin/clamd"), &config, &socket)?;
+    assert_eq!(
+        unix_request(&socket, &stream_frame(b"ordinary plain control")?)?,
+        "stream: OK\0"
+    );
+    let pid = fs::read_to_string(&pid_file)?;
+    let pid = pid.trim();
+    let process = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let data_kib = process
+        .lines()
+        .find_map(|line| line.strip_prefix("VmData:"))
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|size| size.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::other("cannot read daemon data size"))?;
+    let limit = Command::new("prlimit")
+        .args([
+            "--pid",
+            pid,
+            "--data",
+            "--noheadings",
+            "--output",
+            "SOFT",
+            "--raw",
+        ])
+        .output()?;
+    assert!(
+        limit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&limit.stderr)
+    );
+    let soft_limit = String::from_utf8(limit.stdout).map_err(io::Error::other)?;
+    let set_limit = |bytes: &str| -> io::Result<()> {
+        let output = Command::new("prlimit")
+            .args(["--pid", pid, &format!("--data={bytes}:")])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+
+    // Keep 4 MiB of headroom for the warmed daemon. The ordinary receipt uses an 8 MiB dictionary.
+    let receipt = stream_frame(include_bytes!("fixtures/archive-child.xz"))?;
+    set_limit(&((data_kib + 4096) * 1024).to_string())?;
+    assert_eq!(
+        unix_request(&socket, &receipt)?,
+        "stream: Heuristics.XZ.DicSizeLimit FOUND\0"
+    );
+    set_limit(soft_limit.trim())?;
+    assert_eq!(
+        unix_request(&socket, &receipt)?,
+        "stream: Archive.Receipt.UNOFFICIAL FOUND\0"
+    );
+    Ok(())
 }

@@ -7,15 +7,19 @@ use super::logical_pcre::{PcreLimits, RegexChild};
 use super::search::{STOCK_WINDOW, SearchEvent};
 use super::{ObjectContext, Offset, Pattern, Rule, SearchIndex, Target, invalid, level};
 use crate::IgnoreSet;
+use crate::bytecode::{LogicalInput, MAX_MEMBER_BYTES, Program};
 use crate::objects::Layer;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::time::Duration;
 
 const MAX_LINE: usize = 32768;
 const MAX_CHILDREN: usize = 64;
+const NO_MATCH_OFFSET: u32 = 0xffff_fffe;
+const NO_MATCH_OFFSETS: [u32; MAX_CHILDREN] = [NO_MATCH_OFFSET; MAX_CHILDREN];
 
 /// File-map and container information used by the pinned logical matcher.
 #[derive(Clone, Copy)]
@@ -28,8 +32,8 @@ pub struct LogicalObject<'a> {
     pub file_size: usize,
     /// An in-memory script view has no generic relative-offset table.
     pub unmapped_script: bool,
-    /// A mapped script also evaluates empty counts against its restored source map.
-    pub mapped_source_size: Option<usize>,
+    /// The owning map for a normalized script view.
+    pub script_source: Option<&'a [u8]>,
 }
 
 struct Conditions {
@@ -50,6 +54,8 @@ pub enum HandlerType {
 pub struct LogicalMatches<'a> {
     pub handlers: Vec<(Result<Option<&'a str>, String>, HandlerType)>,
     pub finding: Result<Option<&'a str>, String>,
+    /// Logical IDs whose prefilters enabled a later PE_ALL hook on this object.
+    pub pe_hooks: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -153,6 +159,13 @@ pub struct LogicalIndex {
     icons: IconDatabase,
     max_icons: usize,
     search: SearchIndex,
+    bytecode: HashMap<u32, Program>,
+    pdf_bytecode: Vec<Program>,
+    pe_bytecode: Vec<(u32, Program)>,
+    pe_unpackers: Vec<(Option<u32>, Program)>,
+    pe_prefilters: Vec<u32>,
+    bytecode_debug: bool,
+    bytecode_timeout: Duration,
 }
 
 impl LogicalIndex {
@@ -160,12 +173,97 @@ impl LogicalIndex {
         paths: &[(&Path, bool)],
         flevel: u32,
         ignored: &IgnoreSet,
-        mut open: impl FnMut(&Path) -> io::Result<File>,
+        open: impl FnMut(&Path) -> io::Result<File>,
+    ) -> io::Result<Self> {
+        Self::load_with_bytecode(paths, flevel, ignored, Duration::from_secs(10), open)
+    }
+
+    /// Compile ordinary logical signatures and bytecode triggers in source order.
+    pub fn load_with_bytecode<R: Read>(
+        paths: &[(&Path, bool)],
+        flevel: u32,
+        ignored: &IgnoreSet,
+        bytecode_timeout: Duration,
+        mut open: impl FnMut(&Path) -> io::Result<R>,
     ) -> io::Result<Self> {
         let mut builder = Builder::default();
+        let mut bytecode = HashMap::new();
+        let mut pdf_bytecode = Vec::new();
+        let mut pe_bytecode = Vec::new();
+        let mut pe_unpackers = Vec::new();
+        let mut pe_prefilters = Vec::new();
         for &(path, official) in paths {
             let file = open(path)
                 .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cbc"))
+            {
+                let located =
+                    |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+                let mut contents = Vec::new();
+                file.take(MAX_MEMBER_BYTES + 1)
+                    .read_to_end(&mut contents)
+                    .map_err(located)?;
+                if let Some(program) =
+                    Program::compile(&contents, u64::from(flevel)).map_err(located)?
+                {
+                    if program.is_pdf_hook() {
+                        pdf_bytecode.push(program);
+                        continue;
+                    }
+                    if program.is_pe_unpacker() && !program.trigger().contains(';') {
+                        pe_unpackers.push((None, program));
+                        continue;
+                    }
+                    let id = builder.records.len();
+                    let first_binding = builder.bindings.len();
+                    builder
+                        .add(program.trigger(), true, flevel, ignored)
+                        .map_err(located)?;
+                    if let Some(record) = builder.records.get(id) {
+                        let pe_hook = program.is_pe_all_hook() || program.is_pe_unpacker();
+                        if record
+                            .conditions
+                            .attributes
+                            .as_ref()
+                            .is_some_and(|attributes| {
+                                attributes.handler.is_some()
+                                    || pe_hook && attributes.icon_groups.is_some()
+                            })
+                        {
+                            return Err(located(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "unsupported handler or PE hook icon condition on bytecode trigger",
+                            )));
+                        }
+                        if !pe_hook
+                            && program.uses_match_offsets()
+                            && (0..record.children).any(|slot| {
+                                !builder.bindings[first_binding..]
+                                    .iter()
+                                    .any(|binding| usize::from(binding.slot) == slot)
+                            })
+                        {
+                            return Err(located(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "bytecode match offsets require indexed pattern subsignatures",
+                            )));
+                        }
+                        if pe_hook {
+                            pe_prefilters.push(id as u32);
+                            if program.is_pe_unpacker() {
+                                pe_unpackers.push((Some(id as u32), program));
+                            } else {
+                                pe_bytecode.push((id as u32, program));
+                            }
+                        } else {
+                            bytecode.insert(id as u32, program);
+                        }
+                    }
+                }
+                continue;
+            }
             let mut reader = BufReader::new(file);
             let mut line = String::new();
             for number in 1.. {
@@ -215,11 +313,45 @@ impl LogicalIndex {
             image_fuzzy_enabled: true,
             icons: IconDatabase::default(),
             max_icons: 100,
+            bytecode,
+            pdf_bytecode,
+            pe_bytecode,
+            pe_unpackers,
+            pe_prefilters,
+            bytecode_debug: false,
+            bytecode_timeout,
             regexes: builder.regexes,
             zero_triggers: builder.zero_triggers,
             pcre_limits: PcreLimits::default(),
             search,
         })
+    }
+
+    /// Use the daemon's debug setting for bytecode diagnostics.
+    pub fn with_bytecode_debug(mut self, enabled: bool) -> Self {
+        self.bytecode_debug = enabled;
+        self
+    }
+
+    /// Return the PDF hooks pinned to this generation.
+    pub fn pdf_hooks(&self) -> Option<crate::objects::PdfHooks<'_>> {
+        (!self.pdf_bytecode.is_empty()).then_some(crate::objects::PdfHooks {
+            programs: &self.pdf_bytecode,
+            debug: self.bytecode_debug,
+            timeout: self.bytecode_timeout,
+        })
+    }
+
+    /// Return both PE hook phases in database order.
+    pub fn pe_hooks(&self) -> Option<crate::objects::PeHooks<'_>> {
+        (!self.pe_bytecode.is_empty() || !self.pe_unpackers.is_empty()).then_some(
+            crate::objects::PeHooks {
+                programs: &self.pe_bytecode,
+                unpackers: &self.pe_unpackers,
+                debug: self.bytecode_debug,
+                timeout: self.bytecode_timeout,
+            },
+        )
     }
 
     /// Use the daemon's PCRE limits for this generation.
@@ -271,6 +403,10 @@ impl LogicalIndex {
         self.children
             .iter()
             .any(|r| r.target == Target::Ascii && r.offset.is_relative())
+            || self
+                .bytecode
+                .keys()
+                .any(|&id| self.records[id as usize].conditions.target == Target::Ascii)
     }
 
     /// Return the first eligible logical signature without a reference digest.
@@ -295,7 +431,191 @@ impl LogicalIndex {
         rescan: bool,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<LogicalMatches<'_>> {
-        let mut evidence = ObjectEvidence::default();
+        self.match_step(bytes, context, object, rescan, None, &mut check)
+    }
+
+    /// Resume at the first unevaluated rule after a bytecode child or handler scan.
+    pub fn match_step(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: LogicalObject<'_>,
+        rescan: bool,
+        mut step: Option<crate::objects::LogicalStep<'_>>,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<LogicalMatches<'_>> {
+        let mut cursor = match step.as_mut().and_then(|step| step.cursor.take()) {
+            Some(cursor) => *cursor,
+            None => {
+                let evidence = self.evidence(bytes, context, &object, &mut *check)?;
+                self.candidates(
+                    context,
+                    &object,
+                    evidence,
+                    rescan && !object.unmapped_script,
+                    check,
+                )?
+            }
+        };
+        let mut matches = LogicalMatches {
+            finding: Ok(None),
+            handlers: Vec::new(),
+            pe_hooks: Vec::new(),
+        };
+        loop {
+            let (view_bytes, view_object) = if cursor.restored {
+                let source = object.script_source.expect("restored source");
+                (
+                    source,
+                    LogicalObject {
+                        file_size: source.len(),
+                        recursion_level: object.recursion_level.saturating_sub(1),
+                        script_source: None,
+                        ..object
+                    },
+                )
+            } else {
+                (bytes, object)
+            };
+            let mut paused = false;
+            while let Some(&(key, pe_hook)) = cursor.pending.last() {
+                let id = key.1;
+                let program = self.bytecode.get(&id);
+                if step.is_some()
+                    && !matches.handlers.is_empty()
+                    && program.is_some_and(|program| program.writes_output)
+                {
+                    paused = true;
+                    break;
+                }
+                cursor.pending.pop();
+                if pe_hook {
+                    if !cursor.restored {
+                        matches.pe_hooks.push(id);
+                    }
+                    continue;
+                }
+                let rule = &self.records[id as usize];
+                let attributes = rule.conditions.attributes.as_deref();
+                let icon_matches = match attributes.and_then(|a| a.icon_groups.as_deref()) {
+                    None => Ok(true),
+                    Some(groups) => {
+                        if context.is_valid_pe()
+                            && let Some(ids) = self
+                                .icons
+                                .select([groups[0].as_deref(), groups[1].as_deref()])
+                        {
+                            let samples = match &mut cursor.icons {
+                                Some(samples) => samples,
+                                empty => empty.insert(context.icon_metrics(
+                                    view_bytes,
+                                    self.max_icons,
+                                    check,
+                                )?),
+                            };
+                            if self.icons.matches(ids, &samples.values, check)? {
+                                Ok(true)
+                            } else {
+                                samples
+                                    .unsupported
+                                    .as_ref()
+                                    .map_or(Ok(false), |error| Err(error.clone()))
+                            }
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                };
+                let result = match icon_matches {
+                    Err(error) => Err(error),
+                    Ok(false) => Ok(None),
+                    Ok(true) => {
+                        if let Some(program) = program {
+                            let input = if view_object.unmapped_script {
+                                view_object.script_source.unwrap_or(view_bytes)
+                            } else {
+                                view_bytes
+                            };
+                            let offsets = cursor
+                                .evidence
+                                .first_offsets
+                                .get(&id)
+                                .unwrap_or(&NO_MATCH_OFFSETS);
+                            let counts = cursor
+                                .evidence
+                                .matches
+                                .get(&id)
+                                .map_or(&[][..], |e| e.counts.as_slice());
+                            if let Some(step) = step.as_mut() {
+                                *step.restored_output = cursor.restored;
+                            }
+                            Ok(program.run_logical(
+                                input,
+                                LogicalInput {
+                                    offsets,
+                                    counts,
+                                    has_entry: Some(context.has_entry()),
+                                    output: step.as_ref().map(|step| (step.output, step.directory)),
+                                },
+                                self.bytecode_debug,
+                                self.bytecode_timeout,
+                                &mut *check,
+                            )?)
+                        } else {
+                            Ok(Some(rule.name.as_ref()))
+                        }
+                    }
+                };
+                if cursor.rescan
+                    && let Some(handler) = attributes.and_then(|a| a.handler)
+                {
+                    matches.handlers.push((result, handler));
+                } else if result != Ok(None) {
+                    matches.finding = result;
+                    return Ok(matches);
+                }
+                if step
+                    .as_ref()
+                    .is_some_and(|step| step.output.borrow().snapshot.is_some())
+                {
+                    paused = true;
+                    break;
+                }
+            }
+            if paused {
+                *step.as_mut().expect("traversal session").cursor = Some(Box::new(cursor));
+                return Ok(matches);
+            }
+            if let Some(key) = cursor.winner {
+                matches.finding = match cursor.evidence.image_error {
+                    Some((unresolved, error)) if unresolved == key => Err(error),
+                    _ => Ok(Some(self.records[key.1 as usize].name.as_ref())),
+                };
+                return Ok(matches);
+            }
+            if cursor.restored || object.unmapped_script || object.script_source.is_none() {
+                return Ok(matches);
+            }
+            // The mapped script view is followed by a pass with the owning map and empty counters.
+            let restored = LogicalObject {
+                file_size: object.script_source.expect("mapped script source").len(),
+                recursion_level: object.recursion_level.saturating_sub(1),
+                script_source: None,
+                ..object
+            };
+            cursor = self.candidates(context, &restored, ScanEvidence::default(), false, check)?;
+            cursor.restored = true;
+        }
+    }
+
+    fn evidence(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: &LogicalObject<'_>,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<ScanEvidence> {
+        let mut evidence = ScanEvidence::default();
         self.search.run_events(
             &self.children,
             bytes,
@@ -315,7 +635,7 @@ impl LogicalIndex {
                                 if i % 256 == 0 {
                                     check()?;
                                 }
-                                let Some(e) = evidence.records.get_mut(owner) else {
+                                let Some(e) = evidence.matches.get_mut(owner) else {
                                     continue;
                                 };
                                 if e.counts
@@ -333,7 +653,7 @@ impl LogicalIndex {
                 let child = hit.rule_id as usize;
                 let binding = &self.bindings[child];
                 let record = &self.records[binding.owner as usize];
-                if !record.conditions.accepts(context, &object)
+                if !record.conditions.accepts(context, object)
                     || object.unmapped_script
                         && record.conditions.target == Target::Generic
                         && self.children[child].offset.is_relative()
@@ -342,12 +662,24 @@ impl LogicalIndex {
                 }
                 let slot = usize::from(binding.slot);
                 let e = evidence
-                    .records
+                    .matches
                     .entry(binding.owner)
                     .or_insert_with(|| Evidence {
                         counts: vec![0; record.children],
                         last: vec![0; record.children],
                     });
+                if e.counts[slot] == 0
+                    && self
+                        .bytecode
+                        .get(&binding.owner)
+                        .is_some_and(Program::uses_match_offsets)
+                {
+                    let offsets = evidence
+                        .first_offsets
+                        .entry(binding.owner)
+                        .or_insert(NO_MATCH_OFFSETS);
+                    offsets[slot] = u32::try_from(hit.start).unwrap_or(NO_MATCH_OFFSET);
+                }
                 // Stock counts repeated multipart completions at the same first-part
                 // position. It suppresses earlier positions for every subsignature.
                 let partial = self.children[child].pattern.parts().len() > 1;
@@ -362,51 +694,22 @@ impl LogicalIndex {
             },
         )?;
         let image_error =
-            self.scan_image(bytes, context, &object, &mut evidence.records, &mut check)?;
-        self.scan_regexes(bytes, context, &object, &mut evidence.records, &mut check)?;
+            self.scan_image(bytes, context, object, &mut evidence.matches, &mut check)?;
+        self.scan_regexes(bytes, context, object, &mut evidence.matches, &mut check)?;
         if let Some(error) = image_error {
             let regex_enabled = self.pcre_limits.max_file_size == 0
                 || bytes.len() as u64 <= self.pcre_limits.max_file_size;
             if let Some(key) = self.unresolved_image(
                 context,
-                &object,
-                &evidence.records,
+                object,
+                &evidence.matches,
                 regex_enabled,
                 &mut check,
             )? {
                 evidence.image_error = Some((key, error.to_string()));
             }
         }
-        let mut matches = self.evaluate(
-            bytes,
-            context,
-            &object,
-            &evidence,
-            rescan && !object.unmapped_script,
-            &mut check,
-        )?;
-        if matches.finding == Ok(None)
-            && let Some(size) = object.mapped_source_size
-        {
-            // cli_scanscript restores the source map after scanning the mapped view,
-            // then checks the caller's initially empty logical counters.
-            let restored = LogicalObject {
-                file_size: size,
-                recursion_level: object.recursion_level.saturating_sub(1),
-                ..object
-            };
-            matches.finding = self
-                .evaluate(
-                    bytes,
-                    context,
-                    &restored,
-                    &ObjectEvidence::default(),
-                    false,
-                    &mut check,
-                )?
-                .finding;
-        }
-        Ok(matches)
+        Ok(evidence)
     }
 
     fn image_owner_accepts(
@@ -416,7 +719,13 @@ impl LogicalIndex {
         object: &LogicalObject<'_>,
     ) -> bool {
         let conditions = &self.records[id as usize].conditions;
-        context.accepts(conditions.target) && conditions.accepts(context, object)
+        context.accepts(conditions.target)
+            && conditions.accepts(context, object)
+            && conditions
+                .attributes
+                .as_ref()
+                .is_none_or(|a| a.icon_groups.is_none())
+            && self.pe_prefilters.binary_search(&id).is_err()
     }
 
     fn scan_image(
@@ -524,7 +833,17 @@ impl LogicalIndex {
                     }
                 }
             }
-            if expr.matches_with_unknown(&alternate, unknown) != Some(expr.matches(known)) {
+            let matched = expr.matches(known);
+            // A triggered logical program can also inspect counts outside its expression.
+            let changed_input = matched
+                && self.bytecode.get(&id).is_some_and(|program| {
+                    let slots = program.match_count_slots;
+                    slots & unknown != 0
+                        || known.iter().enumerate().any(|(slot, count)| {
+                            slots & (1u64 << slot) != 0 && *count != alternate[slot]
+                        })
+                });
+            if changed_input || expr.matches_with_unknown(&alternate, unknown) != Some(matched) {
                 earliest = Some(key);
             }
         }
@@ -581,24 +900,23 @@ impl LogicalIndex {
         Ok(())
     }
 
-    fn evaluate(
+    fn candidates(
         &self,
-        bytes: &[u8],
         context: &ObjectContext,
         object: &LogicalObject<'_>,
-        evidence: &ObjectEvidence,
+        evidence: ScanEvidence,
         rescan: bool,
         check: &mut impl FnMut() -> io::Result<()>,
-    ) -> io::Result<LogicalMatches<'_>> {
+    ) -> io::Result<LogicalCursor> {
         // Each target's logical table is evaluated in load order after scanning.
         // The specific target precedes generic. Only touched records and those
         // known to pass with all-zero counts can win.
         let mut winner = evidence.image_error.as_ref().map(|(key, _)| *key);
         let mut pending = Vec::new();
-        let candidates = evidence.records.iter().map(|(&id, e)| (id, Some(e))).chain(
+        let candidates = evidence.matches.iter().map(|(&id, e)| (id, Some(e))).chain(
             self.zero_matches
                 .iter()
-                .filter(|id| !evidence.records.contains_key(id))
+                .filter(|id| !evidence.matches.contains_key(id))
                 .map(|&id| (id, None)),
         );
         for (n, (id, e)) in candidates.enumerate() {
@@ -616,80 +934,55 @@ impl LogicalIndex {
             if e.is_some_and(|e| !self.expressions[rule.expression].matches(&e.counts)) {
                 continue;
             }
-            if rule
-                .conditions
-                .attributes
-                .as_deref()
-                .is_some_and(|a| a.icon_groups.is_some() || rescan && a.handler.is_some())
+            let pe_hook = self.pe_prefilters.binary_search(&id).is_ok();
+            if pe_hook && !context.is_valid_pe() {
+                continue;
+            }
+            if pe_hook
+                || (!self.bytecode.is_empty() && self.bytecode.contains_key(&id))
+                || rule
+                    .conditions
+                    .attributes
+                    .as_deref()
+                    .is_some_and(|a| a.icon_groups.is_some() || rescan && a.handler.is_some())
             {
-                pending.push(key);
+                pending.push((key, pe_hook));
             } else {
                 winner = Some(key);
             }
         }
-        pending.retain(|key| winner.is_none_or(|earlier| *key < earlier));
-        pending.sort_unstable();
-        let mut finding = match &evidence.image_error {
-            Some((key, error)) if Some(*key) == winner => Err(error.clone()),
-            _ => Ok(winner.map(|(_, id)| self.records[id as usize].name.as_ref())),
-        };
-        let mut handlers = Vec::new();
-        let mut icon_samples = None;
-        for (_, id) in pending {
-            let rule = &self.records[id as usize];
-            let attributes = rule
-                .conditions
-                .attributes
-                .as_deref()
-                .expect("pending conditions");
-            let icon_matches = match attributes.icon_groups.as_deref() {
-                None => Ok(true),
-                Some(groups) => {
-                    if context.is_valid_pe()
-                        && let Some(ids) = self
-                            .icons
-                            .select([groups[0].as_deref(), groups[1].as_deref()])
-                    {
-                        let samples = match &mut icon_samples {
-                            Some(samples) => samples,
-                            empty => {
-                                empty.insert(context.icon_metrics(bytes, self.max_icons, check)?)
-                            }
-                        };
-                        if self.icons.matches(ids, &samples.values, check)? {
-                            Ok(true)
-                        } else {
-                            samples
-                                .unsupported
-                                .as_ref()
-                                .map_or(Ok(false), |error| Err(error.clone()))
-                        }
-                    } else {
-                        Ok(false)
-                    }
-                }
-            };
-            let result = icon_matches.map(|matched| matched.then_some(rule.name.as_ref()));
-            if rescan && let Some(handler) = attributes.handler {
-                handlers.push((result, handler));
-            } else if result != Ok(None) {
-                finding = result;
-                break;
-            }
-        }
-        Ok(LogicalMatches { handlers, finding })
+        pending.retain(|(key, _)| winner.is_none_or(|earlier| *key < earlier));
+        pending.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(LogicalCursor {
+            evidence,
+            pending,
+            winner,
+            icons: None,
+            rescan,
+            restored: false,
+        })
     }
 }
 
-#[derive(Default)]
-struct ObjectEvidence {
-    records: HashMap<u32, Evidence>,
-    image_error: Option<((bool, u32), String)>,
+pub(crate) struct LogicalCursor {
+    evidence: ScanEvidence,
+    pending: Vec<((bool, u32), bool)>,
+    winner: Option<(bool, u32)>,
+    icons: Option<super::target::IconSamples>,
+    rescan: bool,
+    restored: bool,
 }
 
 struct Evidence {
     counts: Vec<u32>,
     last: Vec<usize>,
+}
+
+#[derive(Default)]
+struct ScanEvidence {
+    matches: HashMap<u32, Evidence>,
+    first_offsets: HashMap<u32, [u32; MAX_CHILDREN]>,
+    image_error: Option<((bool, u32), String)>,
 }
 
 impl Builder {
@@ -1104,7 +1397,7 @@ mod tests {
                         recursion_level: 0,
                         file_size: bytes.len(),
                         unmapped_script: false,
-                        mapped_source_size: None,
+                        script_source: None,
                     },
                     || Ok(())
                 )?,
@@ -1145,7 +1438,7 @@ mod tests {
                         recursion_level: layers.as_slice().len(),
                         file_size: size,
                         unmapped_script: false,
-                        mapped_source_size: None,
+                        script_source: None,
                     },
                     || Ok(())
                 )?,

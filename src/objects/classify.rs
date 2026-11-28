@@ -1,10 +1,12 @@
 use super::udf;
 use super::{
-    ChildSink, Handling, InputKind, Options, archive, iso, office, ole, onenote, partition, pdf,
-    rtf, swf, text, xml,
+    ChildSink, Handling, HookControl, InputKind, Options, archive, iso, office, ole, onenote,
+    partition, pdf, rtf, swf, text, xml,
 };
 use crate::body::{HandlerType, ObjectContext, Target};
 use std::io;
+
+mod kriz;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Parser {
@@ -31,7 +33,7 @@ pub(super) enum Parser {
     HfsPlus,
     UniversalMachO,
     ThinMachO,
-    Pe { overlay: Option<usize> },
+    Pe,
     Elf { has_layout: bool },
     PartitionMap(&'static str),
     Xml(xml::Format),
@@ -56,6 +58,29 @@ pub(super) fn ignored(bytes: &[u8]) -> bool {
 }
 
 impl FileType {
+    pub fn before_raw(
+        &self,
+        bytes: &[u8],
+        options: &Options,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Handling> {
+        if options.heuristic_alerts
+            && self.name == "CL_TYPE_RIFF"
+            && super::riff::irregular_header(bytes, || sink.check())?
+            && sink.report_heuristic("Heuristics.Exploit.W32.MS05-002")
+        {
+            return Ok(Handling::Stopped);
+        }
+        if options.heuristic_alerts
+            && matches!(self.name, "CL_TYPE_BINARY_DATA" | "CL_TYPE_TEXT_UTF16BE")
+            && mydoom_log(bytes)
+            && sink.report_heuristic("Heuristics.Worm.Mydoom.M.log")
+        {
+            return Ok(Handling::Stopped);
+        }
+        self.parser.before_raw(bytes, options, sink)
+    }
+
     pub fn classify(bytes: &[u8], kind: InputKind, sink: &mut dyn ChildSink) -> io::Result<Self> {
         match kind {
             InputKind::Normalized(target) => return Ok(Self::typed(bytes, target, Parser::None)),
@@ -86,13 +111,7 @@ impl FileType {
             return Ok(Self::generic(bytes, name, Parser::PartitionMap(name)));
         }
         if bytes.starts_with(b"RIFF") || bytes.starts_with(b"RIFX") {
-            // Stock has an additional pre-match pass for animated cursors.
-            let parser = if bytes.get(8..12) == Some(b"ACON") {
-                Parser::None
-            } else {
-                Parser::Raw
-            };
-            return Ok(Self::generic(bytes, "CL_TYPE_RIFF", parser));
+            return Ok(Self::generic(bytes, "CL_TYPE_RIFF", Parser::Raw));
         }
         if let Some(layout) = iso::Layout::recognize(bytes) {
             return Ok(Self::generic(
@@ -173,9 +192,7 @@ impl FileType {
                 Parser::Udf
             }
             Target::Pdf => Parser::Pdf,
-            Target::Pe if context.is_valid_pe() => Parser::Pe {
-                overlay: context.pe_overlay(),
-            },
+            Target::Pe if context.is_valid_pe() => Parser::Pe,
             Target::MachO if context.has_executable_layout() => Parser::ThinMachO,
             Target::Elf => Parser::Elf {
                 has_layout: context.has_executable_layout(),
@@ -263,6 +280,25 @@ impl Disk {
     }
 }
 
+fn mydoom_log(bytes: &[u8]) -> bool {
+    let Some(records) = bytes.get(..64) else {
+        return false;
+    };
+    // The reference screens up to five leading words as the file grows.
+    let screened = (bytes.len() / 32).min(5);
+    let (words, _) = records.as_chunks::<4>();
+    if words[..screened].contains(&[0xff; 4]) {
+        return false;
+    }
+    words.as_chunks::<8>().0.iter().all(|record| {
+        let header = u32::from_be_bytes(record[0]);
+        let sum = record[1..].iter().fold(0u32, |sum, &word| {
+            sum.wrapping_add(u32::from_be_bytes(word) ^ !header)
+        });
+        sum == header
+    })
+}
+
 impl Parser {
     pub fn disk_descriptor(self) -> Option<(usize, Disk)> {
         match self {
@@ -272,7 +308,7 @@ impl Parser {
         }
     }
 
-    pub fn before_raw(
+    fn before_raw(
         self,
         bytes: &[u8],
         options: &Options,
@@ -315,7 +351,7 @@ impl Parser {
             | Self::Script
             | Self::AutoIt
             | Self::ThinMachO
-            | Self::Pe { .. }
+            | Self::Pe
             | Self::Elf { .. }
             | Self::Rtf
             | Self::Ole2
@@ -340,32 +376,184 @@ impl Parser {
             Self::Text | Self::None => Ok(Handling::Unrecognized),
         }
     }
+}
 
+impl FileType {
     pub fn after_raw(
-        self,
+        &self,
         bytes: &[u8],
         options: &Options,
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
-        match self {
-            Self::Pe { overlay } if options.scan_pe => {
-                let installer = match overlay {
+        match self.parser {
+            Parser::Pe if options.scan_pe => {
+                let Some(header) = pe32_header(bytes) else {
+                    return Ok(Handling::Unrecognized);
+                };
+                let earlier = match self.context.pe_overlay() {
                     Some(start) => super::installer::legacy(&bytes[start..], sink)?,
                     None => Handling::Unrecognized,
                 };
-                if matches!(installer, Handling::Stopped | Handling::Incomplete) {
-                    return Ok(installer);
+                if matches!(earlier, Handling::Incomplete | Handling::Stopped) {
+                    return Ok(earlier);
+                }
+                match sink.run_pe_all_hooks(bytes)? {
+                    HookControl::Found => return Ok(Handling::Stopped),
+                    HookControl::Break => return Ok(Handling::Complete),
+                    HookControl::Continue => (),
+                }
+                if options.heuristic_alerts {
+                    let dll = u16::from_le_bytes([header[22], header[23]]) & 0x2000 != 0;
+                    let parite = || {
+                        if dll {
+                            return None;
+                        }
+                        self.context
+                            .last_section_entry()
+                            .filter(|&ep| parite(&bytes[ep..]))
+                            .map(|_| "Heuristics.W32.Parite.B")
+                    };
+                    let kriz = || kriz::detect(&self.context, bytes);
+                    let magistr = || {
+                        if dll {
+                            return None;
+                        }
+                        self.context
+                            .last_pe_section()
+                            .and_then(|section| magistr(bytes, header, section))
+                    };
+                    // Immediate reporting takes the first PE alert. Prefer the last when deferring.
+                    let earlier_name = if options.heuristic_scan_precedence {
+                        parite().or_else(kriz).or_else(magistr)
+                    } else {
+                        magistr().or_else(kriz).or_else(parite)
+                    };
+                    let name = if !dll
+                        && (!options.heuristic_scan_precedence || earlier_name.is_none())
+                        && super::polipos::matches(bytes, header, sink)?
+                    {
+                        Some("Heuristics.W32.Polipos.A")
+                    } else {
+                        earlier_name
+                    };
+                    if name.is_some_and(|name| sink.report_heuristic(name)) {
+                        return Ok(Handling::Stopped);
+                    }
                 }
                 match super::upx::extract(bytes, sink)? {
-                    Handling::Unrecognized => Ok(installer),
+                    Handling::Unrecognized if sink.run_pe_unpackers(bytes)? => {
+                        Ok(Handling::Stopped)
+                    }
+                    Handling::Unrecognized => Ok(earlier),
                     unpacked => Ok(unpacked),
                 }
             }
-            Self::Pdf if options.scan_pdf => pdf::extract(bytes, sink),
-            Self::Text if options.scan_html && options.scan_normalized_script => {
+            Parser::Pdf if options.scan_pdf => pdf::extract(bytes, options, sink),
+            Parser::Text if options.scan_html && options.scan_normalized_script => {
                 text::after_raw(bytes, sink)
             }
             _ => Ok(Handling::Unrecognized),
+        }
+    }
+}
+
+fn pe32_header(bytes: &[u8]) -> Option<&[u8]> {
+    let pointer = bytes.get(0x3c..)?.first_chunk::<4>()?;
+    let header = bytes.get(u32::from_le_bytes(*pointer) as usize..)?;
+    (header.get(24..26)? == [0x0b, 0x01]).then_some(header)
+}
+
+fn magistr(
+    bytes: &[u8],
+    header: &[u8],
+    (index, raw, size): (usize, usize, usize),
+) -> Option<&'static str> {
+    let table = 24 + usize::from(u16::from_le_bytes([header[20], header[21]]));
+    let section = header.get(table + 40 * index..)?.first_chunk::<40>()?;
+    let (words, _) = section.as_chunks::<4>();
+    if u32::from_le_bytes(words[9]) & 0x80000000 == 0 {
+        return None;
+    }
+    let original_raw = u32::from_le_bytes(words[5]) as usize;
+    let original_size =
+        (u32::from_le_bytes(words[4]) as usize).min(bytes.len().saturating_sub(original_raw));
+    let virtual_size = u32::from_le_bytes(words[2]) as usize;
+    magistr_record(bytes.get(raw..)?, virtual_size, size, original_size)
+}
+
+fn magistr_record(
+    data: &[u8],
+    virtual_size: usize,
+    mapped_size: usize,
+    original_size: usize,
+) -> Option<&'static str> {
+    let size = mapped_size.max(original_size);
+    let damaged = mapped_size < original_size;
+    let (tail, label, name) = match virtual_size & 0xff {
+        0xec if virtual_size >= 0x612c && size >= 0x612c => (
+            0x7000,
+            b"\xe8\x2c\x61\0\0",
+            if damaged {
+                "Heuristics.W32.Magistr.A.dam"
+            } else {
+                "Heuristics.W32.Magistr.A"
+            },
+        ),
+        0xed if virtual_size >= 0x7000 && size >= 0x7000 => (
+            0x8000,
+            b"\xe8\x04\x72\0\0",
+            if damaged {
+                "Heuristics.W32.Magistr.B.dam"
+            } else {
+                "Heuristics.W32.Magistr.B"
+            },
+        ),
+        _ => return None,
+    };
+    let window = data
+        .get(size.saturating_sub(tail)..)?
+        .first_chunk::<4096>()?;
+    memchr::memmem::find(&window[..4091], label).map(|_| name)
+}
+
+fn parite(entry: &[u8]) -> bool {
+    const LABEL: &[u8] = b"GetProcAddress\0";
+    let Some(window) = entry.first_chunk::<4096>() else {
+        return false;
+    };
+    let Some(label) = memchr::memmem::find(&window[..4040], LABEL) else {
+        return false;
+    };
+    // The first label selects the three pairs of little-endian words.
+    let start = label + LABEL.len();
+    let (words, _) = window[start..start + 24].as_chunks::<4>();
+    let (pairs, _) = words.as_chunks::<2>();
+    pairs
+        .iter()
+        .zip([0x505a4f, 0xffffb, 0xb8])
+        .all(|(&[left, right], difference)| {
+            u32::from_le_bytes(left) ^ u32::from_le_bytes(right) == difference
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::magistr_record;
+
+    #[test]
+    fn magistr_damaged_names_use_the_larger_original_size() {
+        let mut data = vec![0; 0x9000];
+        for (virtual_size, start, word, expected) in [
+            (0x61ec, 0x2000, 0x612cu32, "Heuristics.W32.Magistr.A.dam"),
+            (0x70ed, 0x1000, 0x7204, "Heuristics.W32.Magistr.B.dam"),
+        ] {
+            data.fill(0);
+            data[start] = 232;
+            data[start + 1..start + 5].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(
+                magistr_record(&data, virtual_size, 4096, data.len()),
+                Some(expected)
+            );
         }
     }
 }

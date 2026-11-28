@@ -7,6 +7,7 @@ use sha1::Sha1;
 use sha2::Sha256;
 
 pub mod body;
+pub mod bytecode;
 mod feed;
 pub mod index;
 pub mod objects;

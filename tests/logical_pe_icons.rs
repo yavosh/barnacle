@@ -10,9 +10,7 @@ use client::{Daemon, stream_frame, unix_request};
 use pe_icons::{Drawing, image};
 use std::{fs, io, path::Path};
 
-// ClamAV 1.4.3 metrics for the two drawings generated in common/pe_icons.rs.
-const DOCUMENT: &str = "204da000044d0017400000e15c030215c150215c030aea0302ea1502ea030ac20000c8000ec9001767020167160160020f3e050b3e130b3f07173400311c";
-const DIAMOND: &str = "20b7a0c05b7a140cb7a050d8660000866001787216009b0c059b140c9b050d970000970017971600470110461612460603000c0a000000000c120e342164";
+use pe_icons::{DIAMOND, DOCUMENT};
 
 fn compare(executable: &Path, stock: bool) -> io::Result<()> {
     let temp = tempfile::tempdir_in("/tmp")?;

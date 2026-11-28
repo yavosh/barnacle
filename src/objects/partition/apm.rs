@@ -34,6 +34,17 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
         return Ok(Handling::Complete);
     }
     let count = (u32be(map, 4) as usize).min(sink.max_partitions());
+    if sink.check_partition_intersections() {
+        let ranges = (1..=count).map_while(|i| entry(bytes, sector, i)).map(|p| {
+            let start = u64::from(u32be(p, 8));
+            Some((start, start + u64::from(u32be(p, 12))))
+        });
+        if super::intersects(ranges, sink)?
+            && sink.report_heuristic("Heuristics.APMPartitionIntersection")
+        {
+            return Ok(Handling::Stopped);
+        }
+    }
     for index in 2..=count {
         sink.check()?;
         let Some(p) = entry(bytes, sector, index) else {

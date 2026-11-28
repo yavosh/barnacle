@@ -4,10 +4,12 @@ mod raw;
 
 use super::Config;
 use barnacle::body::{BodyIndex, LogicalIndex};
+use barnacle::bytecode::MAX_MEMBER_BYTES;
 use barnacle::index::{self, Index};
 use barnacle::objects::{self, Limit, Options, Snapshot, Verdict};
 use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
 use nix::libc;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -235,12 +237,35 @@ impl Generation {
         let local_dir = temp.path().join("local");
         fs::create_dir(&local_dir)?;
         let mut paths = Vec::new();
+        let mut signed_bytecode = HashMap::new();
+        let mut has_local_bytecode = false;
         for source in &inputs {
             let path = &source.path;
             let ext = extension(path);
             match ext.as_str() {
-                "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
+                "cvd" => cvd::extract(
+                    path,
+                    temp.path(),
+                    &mut paths,
+                    config.bytecode.then_some(&mut signed_bytecode),
+                )?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
+                "cbc" => {
+                    has_local_bytecode = true;
+                    if !config.bytecode || !config.bytecode_unsigned {
+                        continue;
+                    }
+                    if source.length > MAX_MEMBER_BYTES {
+                        return Err(invalid(format!(
+                            "bytecode database exceeds 1 MiB: {}",
+                            path.display()
+                        )));
+                    }
+                    let output =
+                        local_dir.join(path.file_name().expect("directory entry has a name"));
+                    source.copy_to(&output)?;
+                    paths.push((output, false));
+                }
                 "hdb" | "hsb" | "ndb" | "ndu" | "ldb" | "ldu" | "ign" | "ign2" | "fp" | "sfp"
                 | "idb" => {
                     let output =
@@ -258,7 +283,7 @@ impl Generation {
         for (path, official) in &paths {
             let group = match extension(path).as_str() {
                 "ndb" | "ndu" => &mut body_paths,
-                "ldb" | "ldu" => &mut logical_paths,
+                "ldb" | "ldu" | "cbc" => &mut logical_paths,
                 "idb" => {
                     icon_paths.push(path.as_path());
                     continue;
@@ -268,7 +293,10 @@ impl Generation {
             group.push((path.as_path(), *official));
         }
         let (mut feed, ignores) = if hash_paths.is_empty()
-            && (!body_paths.is_empty() || !logical_paths.is_empty() || !icon_paths.is_empty())
+            && (has_local_bytecode
+                || !body_paths.is_empty()
+                || !logical_paths.is_empty()
+                || !icon_paths.is_empty())
         {
             (Feed::default(), IgnoreSet::default())
         } else {
@@ -288,11 +316,28 @@ impl Generation {
             Ok(file)
         };
         let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
-        let logical =
-            LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?
-                .with_pcre_limits(config.pcre)
-                .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
-                .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
+        let logical = LogicalIndex::load_with_bytecode(
+            &logical_paths,
+            PINNED_FLEVEL,
+            &ignores,
+            config.bytecode_timeout,
+            |path| -> io::Result<Box<dyn Read>> {
+                if path.parent() == Some(temp.path())
+                    && path.extension().is_some_and(|s| s == "cbc")
+                {
+                    let bytes = signed_bytecode
+                        .remove(path)
+                        .ok_or_else(|| invalid("missing verified bytecode member"))?;
+                    Ok(Box::new(io::Cursor::new(bytes)))
+                } else {
+                    Ok(Box::new(open_snapshot(path)?))
+                }
+            },
+        )?
+        .with_bytecode_debug(config.debug)
+        .with_pcre_limits(config.pcre)
+        .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
+        .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }
@@ -390,46 +435,54 @@ impl Generation {
             .flatten();
         let mut expired = false;
         let verdict = object.with_bytes(|bytes| {
-            objects::scan(
+            objects::scan_with_hooks(
                 bytes,
                 &self.objects,
                 &self.temporary_directory,
+                self.logical.pdf_hooks(),
+                self.logical.pe_hooks(),
                 |obj, check| {
-                    let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
-                    let eligible = obj.normalized
-                        || obj.handled_format
-                        || raw::eligible(header, obj.layer.file_type);
-                    if !eligible && !obj.context.is_valid_pe() {
-                        return Ok(Verdict::Incomplete);
-                    }
-                    if let Some(name) =
-                        self.body
-                            .first_match_checked(obj.bytes, obj.context, &mut *check)?
-                    {
-                        return Ok(Verdict::Found(name.to_owned()));
-                    }
-                    // The script buffer goes directly to the body matcher. HTML parser
-                    // artifacts are files and also pass through whole-file matching.
-                    if self.has_hash_rules && eligible && !obj.body_only {
-                        let found = if obj.parents.is_empty() && !obj.normalized {
-                            hashes
-                                .as_ref()
-                                .expect("hash rules require root digests")
-                                .lookup(|a, d, s| self.index.lookup(a, d, s))?
-                        } else {
-                            self.index.match_bytes(obj.bytes, check)?
-                        };
-                        if let Some(name) = found {
-                            return Ok(Verdict::Found(name));
+                    if !obj.logical_step.is_resuming() {
+                        let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
+                        let eligible = obj.normalized
+                            || obj.handled_format
+                            || raw::eligible(header, obj.layer.file_type);
+                        if !eligible && !obj.context.is_valid_pe() {
+                            return Ok(Verdict::Incomplete);
+                        }
+                        if let Some(name) =
+                            self.body
+                                .first_match_checked(obj.bytes, obj.context, &mut *check)?
+                        {
+                            return Ok(Verdict::Found(name.to_owned()));
+                        }
+                        // The script buffer goes directly to the body matcher. HTML parser
+                        // artifacts are files and also pass through whole-file matching.
+                        if self.has_hash_rules && eligible && !obj.body_only {
+                            let found = if obj.parents.is_empty() && !obj.normalized {
+                                hashes
+                                    .as_ref()
+                                    .expect("hash rules require root digests")
+                                    .lookup(|a, d, s| self.index.lookup(a, d, s))?
+                            } else {
+                                self.index.match_bytes(obj.bytes, check)?
+                            };
+                            if let Some(name) = found {
+                                return Ok(Verdict::Found(name));
+                            }
                         }
                     }
-                    let matches = self.logical.matches_checked(
+                    let matches = self.logical.match_step(
                         obj.bytes,
                         obj.context,
                         obj.logical,
                         !self.disable_cache && obj.logical_rescan,
-                        &mut *check,
+                        Some(obj.logical_step),
+                        &mut &mut *check,
                     )?;
+                    if let Some(hits) = obj.pe_hook_hits {
+                        hits.extend(matches.pe_hooks);
+                    }
                     if !matches.handlers.is_empty() {
                         return Ok(Verdict::Handlers {
                             rules: matches
@@ -716,7 +769,7 @@ mod tests {
     #[ignore = "set BARNACLE_CVD_DIR to the verified FreshClam snapshot"]
     fn verified_archives_coexist_with_local_sources() {
         let snapshot = PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap());
-        let f = Fixture::new();
+        let mut f = Fixture::new();
         for (name, _, _) in cvd::PINNED {
             std::os::unix::fs::symlink(snapshot.join(name), f.config.database_directory.join(name))
                 .unwrap();
@@ -731,7 +784,7 @@ mod tests {
             "local.ldb",
             "MixedLogical;Target:0;0;6c6f63616c206c6f676963616c20736e617073686f742072656365697074\n",
         );
-        let db = Generation::load(&f.config).unwrap();
+        let mut db = Generation::load(&f.config).unwrap();
         assert!(db.version().starts_with("ClamAV 1.4.3/28187/"));
         let local = hash_reader(&bytes[..])
             .unwrap()
@@ -746,8 +799,11 @@ mod tests {
                 .unwrap(),
             Some("MixedBody.UNOFFICIAL")
         );
-        // The pinned archives contain 312,303 eligible logical records.
-        assert_eq!(db.logical.rule_count(), 312_304);
+        // The pinned archives add 80 indexed CBC prefilters to 312,303 logical records.
+        assert_eq!(db.logical.rule_count(), 312_384);
+        assert_eq!(db.logical.pdf_hooks().unwrap().programs.len(), 2);
+        assert_eq!(db.logical.pe_hooks().unwrap().programs.len(), 2);
+        assert_eq!(db.logical.pe_hooks().unwrap().unpackers.len(), 6);
         assert_eq!(db.logical.icon_rule_count(), 222);
         let logical_control = b"local logical snapshot receipt";
         assert_eq!(
@@ -760,7 +816,7 @@ mod tests {
                         recursion_level: 0,
                         file_size: logical_control.len(),
                         unmapped_script: false,
-                        mapped_source_size: None,
+                        script_source: None,
                     },
                     || Ok(()),
                 )
@@ -772,5 +828,36 @@ mod tests {
             ScanResult::Incomplete
         ));
         assert!(db.scan(&bytes[..]).unwrap().is_none());
+        // Qualify traversal with this attached generation without changing the production CVD gate.
+        // This override is confined to the ignored test; misses still remain incomplete.
+        db.partial_only = false;
+        db.needs_hashes = db.has_hash_rules;
+        for escaped in [false, true] {
+            let key = if escaped { "Ty#70e" } else { "Type" };
+            let mut pdf = format!("%PDF-1.5\n1 0 obj\n<< /{key} /Catalog >>\nendobj\n");
+            let xref = pdf.len();
+            pdf.push_str(&format!(
+                "xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            ));
+            let result = db.scan_checked(pdf.as_bytes(), || Ok(())).unwrap();
+            if escaped {
+                assert!(
+                    matches!(result, ScanResult::Found(hit) if hit.name == "Heuristics.PDF.ObfuscatedNameObject")
+                );
+            } else {
+                assert!(matches!(result, ScanResult::Incomplete));
+            }
+        }
+        drop(db);
+        f.config.bytecode = false;
+        let disabled = Generation::load(&f.config).unwrap();
+        assert_eq!(disabled.logical.rule_count(), 312_304);
+        assert!(disabled.logical.pdf_hooks().is_none());
+        assert!(disabled.logical.pe_hooks().is_none());
+        drop(disabled);
+        // Disabling execution must not bypass authentication of the required archive.
+        fs::remove_file(f.config.database_directory.join("bytecode.cvd")).unwrap();
+        f.write("bytecode.cvd", "unverified archive");
+        assert!(Generation::load(&f.config).is_err());
     }
 }

@@ -345,6 +345,25 @@ fn compare(stock: bool) -> io::Result<()> {
         }
         Ok(())
     };
+    let escaped_name = with_member(
+        true,
+        true,
+        "6 0 R",
+        [8, 6, 7],
+        b"<< /Ty#70e /Metadata /Title (Quarterly report) >>\n",
+        false,
+        false,
+    )?;
+    check(
+        "",
+        &hash(b"unrelated office note", "Unrelated"),
+        "",
+        &[(
+            "packed common name",
+            &escaped_name.file,
+            Some("Heuristics.PDF.ObfuscatedNameObject"),
+        )],
+    )?;
     let page = format!("{PAGE_DICT}6 0 R >>\n");
     let mut rules = std::collections::BTreeSet::new();
     let mut destinations = Vec::new();

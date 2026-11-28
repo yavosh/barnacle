@@ -3,8 +3,9 @@ use std::io;
 use std::ops::RangeInclusive;
 
 mod executable;
+pub(crate) use executable::{PeMetadata, pe_metadata};
 mod icons;
-pub(crate) use icons::IconMetric;
+pub(crate) use icons::{IconMetric, IconSamples};
 mod version_info;
 use executable::Executable;
 
@@ -237,6 +238,10 @@ impl ObjectContext {
         self.target == Target::Pe && self.exe.is_some()
     }
 
+    pub(crate) fn has_entry(&self) -> bool {
+        self.exe.as_ref().is_some_and(|layout| layout.entry != 0)
+    }
+
     pub(crate) fn has_executable_layout(&self) -> bool {
         self.exe.is_some()
     }
@@ -248,6 +253,29 @@ impl ObjectContext {
 
     pub(crate) fn pe_overlay(&self) -> Option<usize> {
         self.exe.as_ref()?.pe_overlay
+    }
+
+    pub(crate) fn last_section_entry(&self) -> Option<usize> {
+        let layout = self.exe.as_ref()?;
+        let last = &layout.sections[usize::from(layout.last_pe_section?)];
+        (last.raw == layout.entry).then_some(layout.entry)
+    }
+
+    pub(crate) fn entry_in_last_pe_section(&self, length: usize) -> Option<usize> {
+        let layout = self.exe.as_ref()?;
+        let last = &layout.sections[usize::from(layout.last_pe_section?)];
+        let offset = layout.entry.checked_sub(last.raw)?;
+        (last.size.checked_sub(offset)? >= length).then_some(layout.entry)
+    }
+
+    /// Table index, mapped offset and size of the last section in a multi-section PE.
+    pub(crate) fn last_pe_section(&self) -> Option<(usize, usize, usize)> {
+        let layout = self.exe.as_ref()?;
+        let index = usize::from(layout.last_pe_section?);
+        let last = &layout.sections[index];
+        layout
+            .multiple_pe_sections
+            .then_some((index, last.raw, last.size))
     }
 
     pub fn accepts(&self, target: Target) -> bool {

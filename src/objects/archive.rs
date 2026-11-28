@@ -119,11 +119,22 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
 }
 
 fn xz(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    const STOCK_LIMIT_KIB: u32 = 1024 * 1024;
-    let history = workspace::history(sink.remaining()).saturating_add(2 << 20);
     // The reader checks every block's model before allocation. Try a quarter
     // of the shared budget first, so ordinary dictionaries can run together.
-    let mut limit_kib = (workspace::BUDGET / 4 / 1024) as u32;
+    let soft_kib = (workspace::BUDGET / 4 / 1024) as u32;
+    // Stock caps a single dictionary allocation at 1 GiB. The Rust reader's
+    // limit also includes its decoder overhead.
+    let hard_kib = lzma_rust2::lzma2_get_memory_usage(1 << 30);
+    xz_with_limits(bytes, sink, soft_kib, hard_kib)
+}
+
+fn xz_with_limits(
+    bytes: &[u8],
+    sink: &mut dyn ChildSink,
+    mut limit_kib: u32,
+    hard_kib: u32,
+) -> io::Result<Handling> {
+    let history = workspace::history(sink.remaining()).saturating_add(2 << 20);
     loop {
         let (snapshot, decoder_failed) = {
             let estimate = history.min(u64::from(limit_kib) * 1024);
@@ -138,12 +149,16 @@ fn xz(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         match snapshot {
             // A concatenated stream may increase its dictionary. Drop the
             // earlier pass before acquiring a larger reservation and replay.
-            Err(e)
-                if decoder_failed
-                    && e.kind() == io::ErrorKind::OutOfMemory
-                    && limit_kib < STOCK_LIMIT_KIB =>
-            {
-                limit_kib = STOCK_LIMIT_KIB;
+            Err(e) if decoder_failed && e.kind() == io::ErrorKind::OutOfMemory => {
+                if limit_kib < hard_kib {
+                    limit_kib = hard_kib;
+                    continue;
+                }
+                return Ok(if sink.report_heuristic("Heuristics.XZ.DicSizeLimit") {
+                    Handling::Stopped
+                } else {
+                    Handling::Complete
+                });
             }
             Err(_) if decoder_failed => return Ok(Handling::Incomplete),
             Err(e) => return Err(e),
@@ -296,4 +311,90 @@ fn tar(mut bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         bytes = next;
     }
     Ok(Handling::Complete)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::objects::{Object, Options, Traversal, Verdict};
+    use lzma_rust2::{XzOptions, XzWriter, lzma2_get_memory_usage};
+    use std::io::Write;
+
+    fn scan_xz(
+        bytes: &[u8],
+        hard_kib: u32,
+        precedence: bool,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<(Handling, Option<Verdict>, usize)> {
+        let directory = tempfile::tempdir()?;
+        let options = Options {
+            heuristic_scan_precedence: precedence,
+            ..Options::default()
+        };
+        let mut visits = 0;
+        let mut matcher = |object: Object<'_>, _: &mut dyn FnMut() -> io::Result<()>| {
+            visits += 1;
+            assert_eq!(object.bytes, b"receipt: ordinary first archive marker");
+            Ok(Verdict::Found("Receipt".into()))
+        };
+        let mut walk = Traversal {
+            options: &options,
+            temporary_directory: directory.path(),
+            parents: Vec::new(),
+            normalized_depth: 0,
+            bytes_scanned: 0,
+            files_scanned: 0,
+            stopped: None,
+            first_limit: None,
+            deferred_heuristic: None,
+            last_handler_hash: [0; 16],
+            pdf_hooks: None,
+            pe_hooks: None,
+            pe_hook_hits: Vec::new(),
+            matcher: &mut matcher,
+            check: &mut check,
+        };
+        let handling = xz_with_limits(bytes, &mut walk, lzma2_get_memory_usage(4 << 10), hard_kib)?;
+        Ok((handling, walk.stopped.or(walk.deferred_heuristic), visits))
+    }
+
+    #[test]
+    fn xz_replays_or_discards_provisional_output_at_the_dictionary_limit() -> io::Result<()> {
+        let mut options = XzOptions::with_preset(0);
+        options.lzma_options.dict_size = 4 << 10;
+        let mut prefix = XzWriter::new(Vec::new(), options)?;
+        prefix.write_all(b"receipt: ")?;
+        let mut joined = prefix.finish()?;
+        joined.extend_from_slice(include_bytes!("../../tests/fixtures/archive-child.xz"));
+        let accepts = lzma2_get_memory_usage(8 << 20);
+        let refuses = lzma2_get_memory_usage(8 << 10);
+
+        assert_eq!(
+            scan_xz(&joined, accepts, false, || Ok(()))?,
+            (Handling::Stopped, Some(Verdict::Found("Receipt".into())), 1)
+        );
+        for (precedence, expected) in [(false, Handling::Complete), (true, Handling::Stopped)] {
+            assert_eq!(
+                scan_xz(&joined, refuses, precedence, || Ok(()))?,
+                (
+                    expected,
+                    Some(Verdict::Found("Heuristics.XZ.DicSizeLimit".into())),
+                    0
+                )
+            );
+        }
+        assert_eq!(
+            scan_xz(&joined[..joined.len() - 4], accepts, false, || Ok(()))?,
+            (Handling::Incomplete, None, 0)
+        );
+        for kind in [io::ErrorKind::OutOfMemory, io::ErrorKind::TimedOut] {
+            let error = scan_xz(&joined, refuses, false, || {
+                Err(io::Error::new(kind, "scan check"))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "scan check");
+        }
+        Ok(())
+    }
 }

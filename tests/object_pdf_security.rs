@@ -583,6 +583,128 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
 fn openable_pdf_streams() -> io::Result<()> {
     check(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
 }
+
+fn compare_encrypted_alert(exe: &Path, stock: bool) -> io::Result<()> {
+    const LOCKED: &[u8] = include_bytes!("fixtures/pdf/open/locked.pdf");
+    const DETECTION: &str = "Heuristics.Encrypted.PDF";
+    let root = tempfile::tempdir_in("/tmp")?;
+    let db = root.path().join("db");
+    fs::create_dir(&db)?;
+    let unrelated = hash(b"Unrelated stationery", "Other")?;
+    let child = hash(physical_stream(LOCKED, b"\n5 0 obj\n"), "Ciphertext")?;
+    let outer = hash(LOCKED, "Outer")? + &child;
+    let config = root.path().join("clamd.conf");
+    let socket = root.path().join("sock");
+    let deferred = "AlertEncryptedDoc yes";
+    let immediate = "AlertEncryptedDoc yes\nHeuristicScanPrecedence yes";
+    let miss = if stock {
+        "OK"
+    } else {
+        "Incomplete scan: unsupported detection coverage. ERROR"
+    };
+    for (options, rules, expected) in [
+        ("AlertEncryptedDoc no", &unrelated, miss),
+        (deferred, &unrelated, DETECTION),
+        (deferred, &child, "Pdf.Ciphertext.UNOFFICIAL"),
+        (immediate, &child, DETECTION),
+        (
+            "AlertEncryptedDoc yes\nHeuristicAlerts no\nHeuristicScanPrecedence yes",
+            &child,
+            DETECTION,
+        ),
+        (immediate, &outer, "Pdf.Outer.UNOFFICIAL"),
+        ("AlertEncryptedDoc yes\nScanPDF no", &unrelated, miss),
+        (
+            "AlertEncryptedDoc yes\nScanPDF no",
+            &outer,
+            "Pdf.Outer.UNOFFICIAL",
+        ),
+        (
+            "AlertEncryptedDoc yes\nMaxRecursion 1",
+            &unrelated,
+            DETECTION,
+        ),
+        (
+            "AlertEncryptedDoc yes\nAlertExceedsMax yes\nMaxFiles 1\nHeuristicScanPrecedence yes",
+            &unrelated,
+            DETECTION,
+        ),
+        (
+            "AlertEncryptedDoc yes\nAlertExceedsMax yes\nMaxFileSize 128",
+            &unrelated,
+            "Heuristics.Limits.Exceeded.MaxFileSize",
+        ),
+        (
+            "AlertEncryptedDoc yes\nAlertExceedsMax yes\nMaxFiles 1",
+            &unrelated,
+            "DeferredPair",
+        ),
+    ] {
+        fs::write(db.join("local.hdb"), rules)?;
+        fs::write(
+            &config,
+            format!(
+                "Foreground yes\nDisableCache yes\nDatabaseDirectory {}\nLocalSocket {}\n{options}\n",
+                db.display(),
+                socket.display()
+            ),
+        )?;
+        let _daemon = Daemon::start(exe, &config, &socket)?;
+        let response = unix_request(&socket, &stream_frame(LOCKED)?)?;
+        if expected == "DeferredPair" {
+            if stock {
+                assert!(
+                    matches!(
+                        response.as_str(),
+                        "stream: Heuristics.Encrypted.PDF FOUND\0"
+                            | "stream: Heuristics.Limits.Exceeded.MaxFiles FOUND\0"
+                    ),
+                    "{response:?}"
+                );
+            } else {
+                assert_eq!(response, format!("stream: {miss}\0"));
+            }
+            continue;
+        }
+        let suffix = if expected == miss { "" } else { " FOUND" };
+        assert_eq!(
+            response,
+            format!("stream: {expected}{suffix}\0"),
+            "{options}"
+        );
+        if options == deferred && rules == &unrelated {
+            for (label, bytes) in FILES.iter().copied().chain([
+                (
+                    "restricted",
+                    include_bytes!("fixtures/pdf/open/restricted.pdf").as_slice(),
+                ),
+                (
+                    "packed restricted",
+                    include_bytes!("fixtures/pdf/open/r6-restricted-packed.pdf").as_slice(),
+                ),
+            ]) {
+                let response = unix_request(&socket, &stream_frame(bytes)?)?;
+                assert_eq!(response, format!("stream: {miss}\0"), "{label}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_pdf_alert() -> io::Result<()> {
+    compare_encrypted_alert(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_encrypted_pdf_alert() -> io::Result<()> {
+    let package = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Version}", "clamav-daemon"])
+        .output()?;
+    assert_eq!(package.stdout, b"1.4.3+dfsg-1");
+    compare_encrypted_alert(Path::new("/usr/sbin/clamd"), true)
+}
 #[test]
 fn decrypted_attachment_metadata() -> io::Result<()> {
     use barnacle::objects::{Options, Verdict, scan};

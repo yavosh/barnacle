@@ -58,7 +58,6 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             data.len()
         ));
     }
-    fs::write(db.join("test.hdb"), rows)?;
     let mut backup = g.clone();
     backup[S + 16] ^= 1;
     let mut broken = backup.clone();
@@ -175,28 +174,78 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             ],
         ),
     ];
-    if stock {
-        profiles.extend([
-            (
-                "inter",
-                "AlertPartitionIntersection yes",
-                inter(["First"; 3]),
-            ),
-            (
-                "interfirst",
-                "AlertPartitionIntersection yes\nHeuristicScanPrecedence yes",
-                inter([
-                    "Heuristics.MBRPartitionnIntersect",
-                    "Heuristics.GPTPartitionIntersection",
-                    "Heuristics.APMPartitionIntersection",
-                ]),
-            ),
-            (
-                "interno",
-                "AlertPartitionIntersection yes\nHeuristicAlerts no",
-                inter(["First"; 3]),
-            ),
-        ]);
+    let intersection_names = [
+        "Heuristics.MBRPartitionnIntersect",
+        "Heuristics.GPTPartitionIntersection",
+        "Heuristics.APMPartitionIntersection",
+    ];
+    let solo = |winners: [Option<&'static str>; 3]| {
+        inter(intersection_names)
+            .into_iter()
+            .zip(winners)
+            .map(|((format, mut bytes, _), winner)| {
+                bytes[8 * S] = b'X';
+                (format, bytes, winner)
+            })
+            .collect()
+    };
+    let enabled = "AlertPartitionIntersection yes";
+    let immediate = "AlertPartitionIntersection yes\nHeuristicScanPrecedence yes";
+    let mut priority = inter(intersection_names);
+    for ((_, bytes, _), name) in priority.iter_mut().zip(["InterM", "InterG", "InterA"]) {
+        // A distinct outer hash for each table. Leave the member hash in place.
+        bytes[20] = 7;
+        rows.push_str(&format!(
+            "{}:{}:Part.{name}\n",
+            barnacle::hash_reader(&bytes[..])?.md5_hex(),
+            bytes.len()
+        ));
+    }
+    priority[0].2 = Some("InterM");
+    let mut boot_first = mbr(&[(0x83, 8, 1), (0x83, 8, 1)]);
+    boot_first[20] = 9;
+    rows.push_str(&format!(
+        "{}:{S}:Part.InterBoot\n",
+        barnacle::hash_reader(&boot_first[..S])?.md5_hex()
+    ));
+    priority.push(("signed boot", boot_first, Some("InterBoot")));
+    fs::write(db.join("test.hdb"), rows)?;
+    let primary = [(8, "First")];
+    let secondary = [(8, "First"), (8, "First also")];
+    priority.push((
+        "secondary GPT checked before primary member",
+        gpt(S, &primary, &secondary),
+        Some(intersection_names[1]),
+    ));
+    let adjacent = [(8, "First"), (7, "Neighbor")];
+    priority.push(("adjacent GPT", gpt(S, &adjacent, &adjacent), Some("First")));
+    priority.push((
+        "adjacent MBR",
+        mbr(&[(0x83, 8, 1), (0x83, 9, 1)]),
+        Some("First"),
+    ));
+    let mut adjacent_apm = apm();
+    adjacent_apm[3 * S + 8..3 * S + 12].copy_from_slice(&7u32.to_be_bytes());
+    priority.push(("adjacent APM", adjacent_apm, Some("First")));
+    profiles.extend([
+        ("inter", enabled, inter(["First"; 3])),
+        ("interfirst", immediate, inter(intersection_names)),
+        ("interorder", immediate, priority),
+        ("interno", "AlertPartitionIntersection yes\nHeuristicAlerts no", inter(["First";3])),
+        ("interalone", enabled, solo(intersection_names.map(Some))),
+        ("intermasterfirst", "AlertPartitionIntersection yes\nHeuristicAlerts no\nHeuristicScanPrecedence yes", inter(intersection_names)),
+        ("interoff","AlertPartitionIntersection no",solo([None;3])),
+        ("intercap","AlertPartitionIntersection yes\nMaxPartitions 2",solo([Some(intersection_names[0]),Some(intersection_names[1]),None])),
+        ("interdepth","AlertPartitionIntersection yes\nMaxRecursion 1\nAlertExceedsMax yes\nHeuristicScanPrecedence yes",
+            solo([Some("Heuristics.Limits.Exceeded.MaxRecursion"),Some(intersection_names[1]),Some(intersection_names[2])])),
+    ]);
+    // The stock name varies across fresh daemons when both deferred alerts apply.
+    if !stock {
+        profiles.push((
+            "intertie",
+            "AlertPartitionIntersection yes\nMaxFiles 1\nAlertExceedsMax yes",
+            solo([Some("Heuristics.Limits.Exceeded.MaxFiles"), None, None]),
+        ));
     }
     for (id, opts, cases) in profiles {
         let sock = dir.join(format!("{id}.sock"));
