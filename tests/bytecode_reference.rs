@@ -549,6 +549,28 @@ fn stock_bytecode_disasm_records() -> io::Result<()> {
 
 fn compare_memory_and_pe_queries(executable: &Path, miss: &str) -> io::Result<()> {
     let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    for source_at_zero in [true, false] {
+        run_program(
+            executable,
+            &scalar::zero_offset_pointer(source_at_zero),
+            options,
+            &[(b"receipt for a pen", true)],
+            miss,
+        )?;
+    }
+    for (offset, byte, pen, pad) in [
+        (34, b'n', true, false),
+        (52, b'd', false, true),
+        (51, b'd', false, false),
+    ] {
+        run_program(
+            executable,
+            &scalar::module_pointer_cell(offset, byte),
+            options,
+            &[(b"receiptPen", pen), (b"receiptLedger", pad)],
+            miss,
+        )?;
+    }
     run_program(
         executable,
         &scalar::heap_pointer_integers(),

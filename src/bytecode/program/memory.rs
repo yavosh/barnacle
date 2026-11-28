@@ -19,19 +19,23 @@ impl Slot {
         types: &[Type],
     ) -> io::Result<Self> {
         let width = Width::new(ty).ok();
-        let size = match (width, user_type(types, ty)) {
-            (Some(w), _) => w.bytes(),
-            (_, Some(Type::Bytes(n))) if addressable => *n,
+        let (size, alignment) = match (width, user_type(types, ty)) {
+            (Some(w), _) => (w.bytes(), w.bytes()),
+            (_, Some(Type::Bytes(n))) if addressable => (*n, 1),
             // The pinned interpreter does not compute general structure alignment.
             (_, Some(Type::Struct { .. }))
                 if addressable && start == 0 && super::host::disasm_record_type(ty, types) =>
             {
-                64
+                (64, 1)
             }
-            (_, _) if pointer_element(types, ty).is_some() && !addressable => 8,
+            (_, _)
+                if ty == super::BYTE_POINTER
+                    || pointer_element(types, ty).is_some() && !addressable =>
+            {
+                (8, 8)
+            }
             _ => return Err(unsupported("frame local type or storage")),
         };
-        let alignment = width.map_or(if addressable { 1 } else { 8 }, Width::bytes);
         let start = start.next_multiple_of(alignment);
         Ok(Self {
             ty,
@@ -152,9 +156,19 @@ impl<'a> Storage<'a> {
 }
 
 const HEAP_TAG: u32 = 1 << 31;
+const MODULE_TAG: u32 = 1 << 30;
 // Stock FLEVEL 213 reserves IDs 1..=6 for host globals and ID 7 for module data.
 const FIRST_HEAP_ID: u32 = 8;
 const HEAP_OBJECT_LIMIT: usize = 4096;
+
+pub(super) fn module_pointer(base: usize, offset: usize) -> io::Result<u64> {
+    let index = u32::try_from(base)
+        .ok()
+        .filter(|&i| i < MODULE_TAG)
+        .ok_or_else(|| unsupported("module object identity budget"))?;
+    let offset = u32::try_from(offset).map_err(|_| unsupported("module pointer offset"))?;
+    Ok((u64::from(MODULE_TAG | index) << 32) | u64::from(offset))
+}
 
 struct Allocation {
     bytes: Vec<u8>,
@@ -162,6 +176,7 @@ struct Allocation {
 }
 
 pub(super) struct Frame<'a> {
+    pub(super) module_globals: &'a [Global],
     current: Storage<'a>,
     parents: Vec<Storage<'a>>,
     next_object: u32,
@@ -173,6 +188,7 @@ pub(super) struct Frame<'a> {
 impl<'a> Frame<'a> {
     pub(super) fn new(slots: &'a [Slot]) -> Self {
         Self {
+            module_globals: &[],
             current: Storage::new(slots, 1),
             parents: Vec::new(),
             next_object: 1 + slots.len() as u32,
@@ -194,7 +210,7 @@ impl<'a> Frame<'a> {
         // Retired objects never reuse their handle during the invocation.
         self.next_object = base
             .checked_add(slots.len() as u32)
-            .filter(|&next| next < HEAP_TAG)
+            .filter(|&next| next < MODULE_TAG)
             .ok_or_else(|| unsupported("frame object identity budget"))?;
         let mut child = Storage::new(slots, base);
         for (i, arg) in args.iter().enumerate() {
@@ -236,6 +252,19 @@ impl<'a> Frame<'a> {
             return Ok(0);
         }
         let id = (encoded >> 32) as u32;
+        if id & MODULE_TAG != 0 {
+            let (bytes, base) = self
+                .module_object(id)
+                .map_err(|_| unsupported("unknown module pointer"))?;
+            let offset = encoded as u32 as usize;
+            if offset > bytes.len() {
+                return Err(unsupported(
+                    "integer conversion outside a module byte array",
+                ));
+            }
+            // Stock registers all private module data under object ID seven.
+            return Ok((7u64 << 32) | (base + offset) as u64);
+        }
         if id & HEAP_TAG == 0 {
             return Err(unsupported("integer conversion of a frame address"));
         }
@@ -253,7 +282,17 @@ impl<'a> Frame<'a> {
             .ok_or(MemoryFault::Bounds)
     }
 
+    fn module_object(&self, id: u32) -> Result<(&[u8], usize), MemoryFault> {
+        match self.module_globals.get((id ^ MODULE_TAG) as usize) {
+            Some(Global::Bytes(bytes, base)) => Ok((bytes, *base)),
+            _ => Err(MemoryFault::Bounds),
+        }
+    }
+
     fn object_len(&self, id: u32) -> Result<usize, MemoryFault> {
+        if id & MODULE_TAG != 0 {
+            return Ok(self.module_object(id)?.0.len());
+        }
         if id & HEAP_TAG != 0 {
             return self
                 .heap
@@ -265,6 +304,13 @@ impl<'a> Frame<'a> {
     }
 
     fn read(&self, id: u32, range: Range<usize>) -> Result<&[u8], MemoryFault> {
+        if id & MODULE_TAG != 0 {
+            return self
+                .module_object(id)?
+                .0
+                .get(range)
+                .ok_or(MemoryFault::Bounds);
+        }
         if id & HEAP_TAG != 0 {
             let h = self
                 .heap
@@ -296,6 +342,9 @@ impl<'a> Frame<'a> {
     ) -> Result<(), MemoryFault> {
         // Validate all source bytes before modifying the destination.
         self.read(src, from.clone())?;
+        if dest & MODULE_TAG != 0 {
+            return Err(MemoryFault::Immutable);
+        }
         if src == dest && src & HEAP_TAG != 0 {
             let h = &mut self.heap[(src ^ HEAP_TAG) as usize];
             h.bytes.copy_within(from, to.start);
@@ -325,6 +374,9 @@ impl<'a> Frame<'a> {
     }
 
     fn writable(&mut self, id: u32, range: Range<usize>) -> Result<&mut [u8], MemoryFault> {
+        if id & MODULE_TAG != 0 {
+            return Err(MemoryFault::Immutable);
+        }
         if id & HEAP_TAG != 0 {
             let h = self
                 .heap
@@ -348,6 +400,7 @@ impl<'a> Frame<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MemoryFault {
     Null,
+    Immutable,
     Bounds,
     OverlappingCopy,
     Uninitialized,
@@ -359,6 +412,7 @@ pub(super) fn outcome<T>(result: Result<T, MemoryFault>) -> io::Result<Option<T>
     match result {
         Ok(value) => Ok(Some(value)),
         Err(MemoryFault::Null) => Ok(None),
+        Err(MemoryFault::Immutable) => Err(unsupported("write to module byte array")),
         Err(MemoryFault::OverlappingCopy) => Err(unsupported("overlapping MEMCPY ranges")),
         Err(MemoryFault::Uninitialized) => Err(unsupported("read from unwritten heap storage")),
         Err(MemoryFault::Environment) => Err(unsupported("read of an unmodeled environment field")),
@@ -387,10 +441,10 @@ impl Address {
             if writable {
                 return Err(unsupported("write to global bytes"));
             }
-            let Global::Pointer { base, offset } = line.global(globals)? else {
+            let Global::Pointer { base, offset, .. } = line.global(globals)? else {
                 return Err(unsupported("non-byte global memory operand"));
             };
-            let Some(Global::Bytes(bytes)) = globals.get(*base) else {
+            let Some(Global::Bytes(bytes, _)) = globals.get(*base) else {
                 return Err(invalid("invalid CBC byte pointer"));
             };
             return Ok(Self::Constant(Arc::clone(bytes), *offset));
@@ -399,6 +453,9 @@ impl Address {
             .map_err(|_| invalid("invalid CBC address index"))?;
         let slot = field(slots.get(i))?;
         if slot.addressable {
+            if slot.ty == super::BYTE_POINTER {
+                return Err(unsupported("byte access to a pointer cell"));
+            }
             Ok(Self::Object(i))
         } else if slot.width.is_none() {
             Ok(Self::Pointer(i))
@@ -450,6 +507,9 @@ impl Address {
             Self::Constant(bytes, off) => bytes.get(*off..).ok_or(MemoryFault::Bounds),
             _ => {
                 let (id, start) = self.span(frame, 0)?;
+                if id & MODULE_TAG != 0 {
+                    return Ok(&frame.module_object(id)?.0[start.start..]);
+                }
                 if id & HEAP_TAG != 0 {
                     let heap = &frame.heap[(id ^ HEAP_TAG) as usize];
                     let available = heap.initialized[start.start..]
@@ -555,6 +615,11 @@ impl MemoryOp {
                     .checked_mul(*stride)
                     .and_then(|n| n.checked_add(offset))
                     .ok_or(MemoryFault::Bounds)?;
+                if object & MODULE_TAG != 0
+                    && (offset < 0 || offset as usize > frame.object_len(object)?)
+                {
+                    return Err(MemoryFault::Bounds);
+                }
                 // A negative heap offset changes the stock object ID through a borrow.
                 if object & HEAP_TAG != 0 && offset < 0 {
                     return Err(MemoryFault::Bounds);
@@ -676,6 +741,34 @@ pub(super) fn gep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_cells_preserve_immutable_array_bounds() -> io::Result<()> {
+        let slots = [
+            Slot::new(8, false, 0, &[])?,
+            Slot::new(65, true, 1, &[])?,
+            Slot::new(65, false, 16, &[])?,
+        ];
+        assert_eq!(slots[1].object(), 8..16);
+        // A pointer cell can only be read or written through typed COPY.
+        assert!(Address::decode(&mut Cursor(b"aa"), &slots, &[], true).is_err());
+        assert!(Address::decode(&mut Cursor(b"aa"), &slots, &[], false).is_err());
+        let globals = [
+            Global::Bytes(Arc::from(*b"pen"), 32),
+            Global::Bytes(Arc::from(*b"pad"), 35),
+        ];
+        let mut frame = Frame::new(&slots);
+        frame.module_globals = &globals;
+        frame.set(2, module_pointer(0, 2)?);
+        let address = Address::Pointer(2);
+        assert_eq!(address.read(&frame, 1), Ok(b"n".as_slice()));
+        assert_eq!(address.read(&frame, 2), Err(MemoryFault::Bounds));
+        assert_eq!(address.write(&mut frame, b"x"), Err(MemoryFault::Immutable));
+        assert_eq!(frame.pointer_integer(2)?, (7 << 32) | 34);
+        let past_end = MemoryOp::Gep(address, Value::Constant(2), 1);
+        assert_eq!(past_end.eval(&mut frame, &[]), Err(MemoryFault::Bounds));
+        Ok(())
+    }
 
     #[test]
     fn environment_bytes_stay_guarded_across_calls_and_transfers() -> io::Result<()> {

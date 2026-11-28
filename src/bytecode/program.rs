@@ -28,6 +28,7 @@ pub struct Program {
     hook: u64,
     trigger: Box<str>,
     functions: Vec<Function>,
+    module_globals: Box<[Global]>,
     uses_match_offsets: bool,
     pub(crate) match_count_slots: u64,
     pub(crate) writes_output: bool,
@@ -208,10 +209,12 @@ impl Program {
             });
         }
         let mut uses_match_offsets = false;
+        let mut uses_module_pointers = false;
         let mut match_count_slots = 0;
         for instruction in functions.iter().flat_map(|f| f.blocks.iter().flatten()) {
             match instruction {
                 Instruction::Write(_, Expression::MatchOffset(_)) => uses_match_offsets = true,
+                Instruction::Write(_, Expression::ModulePointer(_)) => uses_module_pointers = true,
                 Instruction::Write(_, Expression::MatchCount(i)) => match_count_slots |= 1u64 << i,
                 _ => (),
             }
@@ -223,6 +226,11 @@ impl Program {
             match_count_slots,
             writes_output: apis.contains(&host::WRITE),
             functions,
+            module_globals: if uses_module_pointers {
+                globals.into()
+            } else {
+                Box::default()
+            },
         }))
     }
 
@@ -372,6 +380,7 @@ impl Program {
     ) -> io::Result<PdfHookResult<'_>> {
         let mut function = &self.functions[0];
         let mut locals = Frame::new(&function.slots);
+        locals.module_globals = &self.module_globals;
         let mut next = 0;
         let mut stack = Vec::<Caller<'_>>::new();
         let mut frame_bytes = function.frame_bytes;
@@ -672,6 +681,7 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
     Ok(apis)
 }
 
+#[derive(Debug)]
 enum Global {
     FileSize,
     PeField(host::PeField),
@@ -679,8 +689,12 @@ enum Global {
     MatchOffset(usize),
     MatchCount(usize),
     Zero,
-    Bytes(Arc<[u8]>),
-    Pointer { base: usize, offset: usize },
+    Bytes(Arc<[u8]>, usize),
+    Pointer {
+        base: usize,
+        offset: usize,
+        source_at_zero: bool,
+    },
 }
 
 impl Cursor<'_> {
@@ -723,6 +737,7 @@ fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Gl
         return Err(invalid("truncated CBC global table"));
     }
     let mut globals = Vec::new();
+    let mut blob_end = 0usize;
     let mut bytes_left = MAX_MEMBER_BYTES as usize;
     for index in 0..count {
         let id = field(line.number())?;
@@ -799,6 +814,7 @@ fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Gl
             (BYTE_POINTER, _) | (_, Some(Type::Pointer(8))) => Global::Pointer {
                 offset: line.index_literal()?,
                 base: line.index_literal()?,
+                source_at_zero: blob_end == 0,
             },
             (_, Some(Type::Bytes(len))) => {
                 bytes_left = bytes_left
@@ -818,17 +834,29 @@ fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Gl
                         })
                         .collect::<io::Result<Vec<_>>>()?
                 };
-                Global::Bytes(bytes.into())
+                Global::Bytes(bytes.into(), blob_end)
             }
             _ => return Err(unsupported("global type")),
         };
+        // Stock lays out scalars and pointers at their natural alignment. Byte arrays align to one.
+        let (size, align) = match &global {
+            Global::Zero => (0, 1),
+            Global::Bytes(bytes, _) => (bytes.len(), 1),
+            Global::Scalar => {
+                let bytes = id.div_ceil(8) as usize;
+                (bytes, bytes)
+            }
+            _ => (8, 8),
+        };
+        // Counts and array lengths are bounded by the module byte limit.
+        blob_end = blob_end.next_multiple_of(align) + size;
         field(line.expect(b'`'))?;
         globals.push(global);
     }
     field(line.end())?;
     for global in &globals {
-        if let Global::Pointer { base, offset } = global
-            && !matches!(globals.get(*base),Some(Global::Bytes(bytes)) if *offset <= bytes.len())
+        if let Global::Pointer { base, offset, .. } = global
+            && !matches!(globals.get(*base),Some(Global::Bytes(bytes, _)) if *offset <= bytes.len())
         {
             return Err(invalid("CBC global pointer outside its byte array"));
         }
@@ -1002,10 +1030,10 @@ impl Cursor<'_> {
     }
 
     fn const_bytes<'a>(&mut self, globals: &'a [Global]) -> io::Result<(&'a [u8], usize)> {
-        let Global::Pointer { base, offset } = self.global(globals)? else {
+        let Global::Pointer { base, offset, .. } = self.global(globals)? else {
             return Err(unsupported("host call without an immutable byte pointer"));
         };
-        let Some(Global::Bytes(bytes)) = globals.get(*base) else {
+        let Some(Global::Bytes(bytes, _)) = globals.get(*base) else {
             return Err(invalid("invalid CBC byte pointer"));
         };
         let bytes = field(bytes.get(*offset..))?;
@@ -1148,6 +1176,7 @@ enum Expression {
     },
     Select(Value, Value, Value),
     Copy(Value),
+    ModulePointer(u64),
     FileByte(Value),
     Find(Address, Value, Option<Value>),
     Allocate(Value),
@@ -1173,6 +1202,7 @@ impl Expression {
     ) -> io::Result<Option<u64>> {
         let input = scan.input;
         let value = match *self {
+            Self::ModulePointer(pointer) => pointer,
             Self::ExtractNew => {
                 let extract = scan
                     .extract
@@ -1392,6 +1422,32 @@ fn instruction(
     }
     if opcode == 34 {
         // COPY writes its second operand. Its instruction header carries no result.
+        if ty == BYTE_POINTER {
+            let pointer_slot = |line: &mut Cursor<'_>| -> io::Result<usize> {
+                let i = field(usize::try_from(field(line.number())?).ok())?;
+                if field(slots.get(i))?.ty != BYTE_POINTER {
+                    return Err(invalid("CBC pointer COPY operand type mismatch"));
+                }
+                Ok(i)
+            };
+            let source = if matches!(line.first(), Some(b'@'..=b'P')) {
+                match line.global(globals)? {
+                    // Stock's scalar read interprets a source at module offset zero as null.
+                    Global::Zero
+                    | Global::Pointer {
+                        source_at_zero: true,
+                        ..
+                    } => Expression::Copy(Value::Constant(0)),
+                    Global::Pointer { base, offset, .. } => {
+                        Expression::ModulePointer(memory::module_pointer(*base, *offset)?)
+                    }
+                    _ => return Err(unsupported("COPY from a non-byte global pointer")),
+                }
+            } else {
+                Expression::Copy(Value::Local(pointer_slot(line)?))
+            };
+            return Ok(Instruction::Write(pointer_slot(line)?, source));
+        }
         let source = if matches!(line.first(), Some(b'@'..=b'P')) {
             let value = line.literal()?;
             let storage = field(line.fixed(1))?;
@@ -1924,7 +1980,7 @@ mod tests {
         };
         let row = table(1);
         let decoded = globals(Cursor(row.as_bytes()), &[Type::Bytes(7)], LOGICAL_HOOK)?;
-        assert!(matches!(&decoded[..], [Global::Bytes(bytes)] if bytes.as_ref() == [0;7]));
+        assert!(matches!(&decoded[..], [Global::Bytes(bytes, 0)] if bytes.as_ref() == [0;7]));
         let row = table(2);
         assert!(
             globals(

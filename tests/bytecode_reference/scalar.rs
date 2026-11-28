@@ -1324,6 +1324,108 @@ pub fn heap_pointer_integers() -> String {
     )
 }
 
+pub fn module_pointer_cell(expected_offset: u64, expected_byte: u8) -> String {
+    let mut globals = name_globals(0, 8, 71);
+    // Stock lays out "pen" at 32. Its aligned pointer and an i16 precede "pad" at 50.
+    global_array(&mut globals, 72, b"pen");
+    global_pointer(&mut globals, 65, 3, 1);
+    globals += &(number(16) + &immediate(0, 0) + "`");
+    global_array(&mut globals, 72, b"pad");
+    global_pointer(&mut globals, 65, 6, 1);
+    let copy = |source, dest| op(65, 0, 34, &[source, number(dest)]);
+    let jump = |block| format!("T{}{}", fixed(18, 2), number(block));
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32]),
+            array(NAME.len() + 1, 8),
+            array(3, 8),
+        ],
+        &[(SET_NAME, 69, "setvirusname"), (BYTE_AT, 70, "file_byteat")],
+        globals,
+        &[8, ADDRESSABLE | 65, 65, 65, 64, 32, 1, 1],
+        &[
+            vec![
+                call(5, BYTE_AT, &[immediate(7, 4)]),
+                op(
+                    1,
+                    6,
+                    21,
+                    &[number(32), number(5), immediate(u64::from(b'P'), 4)],
+                ),
+                branch(6, 1, 2),
+            ],
+            vec![copy(pointer(4), 1), jump(3)],
+            vec![copy(pointer(7), 1), jump(3)],
+            vec![
+                copy(number(1), 2),
+                op(65, 3, 35, &[number(65), number(2), immediate(1, 4)]),
+                op(64, 4, 50, &[number(3)]),
+                op(
+                    1,
+                    6,
+                    21,
+                    &[
+                        number(64),
+                        number(4),
+                        immediate((7 << 32) | expected_offset, 8),
+                    ],
+                ),
+                op(8, 0, 39, &[number(3)]),
+                op(
+                    1,
+                    7,
+                    21,
+                    &[number(8), number(0), immediate(u64::from(expected_byte), 1)],
+                ),
+                op(1, 6, 11, &[number(6), number(7)]),
+                branch(6, 4, 5),
+            ],
+            vec![report(5), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
+pub fn zero_offset_pointer(source_at_zero: bool) -> String {
+    let mut globals = format!("G{}{}{}@`", number(0), number(5), number(0));
+    let (source, expected) = if source_at_zero {
+        global_pointer(&mut globals, 65, 3, 0);
+        global_pointer(&mut globals, 65, 4, 0);
+        global_array(&mut globals, 71, b"pen");
+        (1, 0)
+    } else {
+        global_array(&mut globals, 71, b"pen");
+        global_pointer(&mut globals, 65, 4, 0);
+        global_pointer(&mut globals, 65, 1, 0);
+        (3, 7 << 32)
+    };
+    global_array(&mut globals, 70, &[NAME.as_bytes(), &[0]].concat());
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(3, 8),
+        ],
+        &[(SET_NAME, 69, "setvirusname")],
+        globals,
+        &[ADDRESSABLE | 65, 65, 64, 1, 32],
+        &[
+            vec![
+                op(65, 0, 34, &[pointer(source), number(0)]),
+                op(65, 0, 34, &[number(0), number(1)]),
+                op(64, 2, 50, &[number(1)]),
+                op(1, 3, 21, &[number(64), number(2), immediate(expected, 8)]),
+                branch(3, 1, 2),
+            ],
+            vec![report(4), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
 pub fn heap_search() -> String {
     let mut globals = name_globals(0, 5, 73);
     global_array(&mut globals, 74, b"!AY");
