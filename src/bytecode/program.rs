@@ -121,7 +121,7 @@ impl Program {
         }
         let types = types(line()?, type_count)?;
         let apis = api(line()?, &types)?;
-        let globals = globals(line()?, &types)?;
+        let globals = globals(line()?, &types, hook)?;
         // Calls name functions by index and may target a later definition.
         let mut signatures = Vec::new();
         let mut bodies = Vec::new();
@@ -577,8 +577,7 @@ fn api(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<u64>> {
 
 enum Global {
     FileSize,
-    PeEntry,
-    PeSectionCount,
+    PeField(host::PeField),
     Scalar,
     MatchOffset(usize),
     MatchCount(usize),
@@ -609,7 +608,7 @@ impl Cursor<'_> {
     }
 }
 
-fn globals(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<Global>> {
+fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Global>> {
     field(line.expect(b'G'))?;
     const MATCH_COUNTS: u64 = 0x8000;
     const PE_DATA: u64 = 0x8003;
@@ -644,7 +643,12 @@ fn globals(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<Global>> {
                         Global::MatchCount(offset / 4)
                     }
                     FILE_SIZE if offset == 0 && max_host >= FILE_SIZE => Global::FileSize,
-                    PE_DATA if offset == 4 && max_host >= PE_DATA => Global::PeEntry,
+                    PE_DATA if max_host >= PE_DATA => Global::PeField(match offset {
+                        4 => host::PeField::RawEntry,
+                        52 | 280 if hook == PE_ALL_HOOK => host::PeField::EntryRva,
+                        632 if hook == PE_ALL_HOOK => host::PeField::HeaderOffset,
+                        _ => return Err(unsupported("i32 pointer outside supported host globals")),
+                    }),
                     MATCH_OFFSETS
                         if max_host == MATCH_OFFSETS && offset % 4 == 0 && offset < 256 =>
                     {
@@ -656,10 +660,17 @@ fn globals(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<Global>> {
             (66, _) | (_, Some(Type::Pointer(16))) => {
                 let offset = line.index_literal()?;
                 let base = line.literal()?;
-                if base != PE_DATA || offset != 8 || max_host < PE_DATA {
-                    return Err(unsupported("i16 pointer outside supported host globals"));
-                }
-                Global::PeSectionCount
+                let field = match (base, offset) {
+                    (PE_DATA, 8) if max_host >= PE_DATA => host::PeField::SectionCount,
+                    (PE_DATA, 32) if max_host >= PE_DATA && hook == PE_ALL_HOOK => {
+                        host::PeField::OptionalSize
+                    }
+                    (PE_DATA, 264) if max_host >= PE_DATA && hook == PE_ALL_HOOK => {
+                        host::PeField::OptionalMagic
+                    }
+                    _ => return Err(unsupported("i16 pointer outside supported host globals")),
+                };
+                Global::PeField(field)
             }
             (BYTE_POINTER, _) | (_, Some(Type::Pointer(8))) => Global::Pointer {
                 offset: line.index_literal()?,
@@ -1332,12 +1343,10 @@ fn instruction(
                     Global::MatchCount(i) => Some((Expression::MatchCount(*i), Width::WORD)),
                     Global::MatchOffset(i) => Some((Expression::MatchOffset(*i), Width::WORD)),
                     Global::FileSize => Some((Expression::FileSize, Width::WORD)),
-                    Global::PeEntry => {
-                        Some((Expression::Host(host::Operation::PeEntry), Width::WORD))
-                    }
-                    Global::PeSectionCount => {
-                        Some((Expression::Host(host::Operation::PeSectionCount), Width(16)))
-                    }
+                    Global::PeField(field) => Some((
+                        Expression::Host(host::Operation::PeField(*field)),
+                        field.width(),
+                    )),
                     _ => None,
                 }
             } else {
@@ -1756,13 +1765,14 @@ mod tests {
             row
         };
         let row = table(1);
-        let decoded = globals(Cursor(row.as_bytes()), &[Type::Bytes(7)])?;
+        let decoded = globals(Cursor(row.as_bytes()), &[Type::Bytes(7)], LOGICAL_HOOK)?;
         assert!(matches!(&decoded[..], [Global::Bytes(bytes)] if bytes.as_ref() == [0;7]));
         let row = table(2);
         assert!(
             globals(
                 Cursor(row.as_bytes()),
-                &[Type::Bytes(MAX_MEMBER_BYTES as usize / 2 + 1)]
+                &[Type::Bytes(MAX_MEMBER_BYTES as usize / 2 + 1)],
+                LOGICAL_HOOK,
             )
             .is_err()
         );

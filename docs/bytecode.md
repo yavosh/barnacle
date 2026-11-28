@@ -39,10 +39,10 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 70 eligible modules, including 68 logical modules and both PDF hooks.
-The archive test loads those modules into one generation's logical index and PDF hook list.
-The inventory groups the remaining 12 eligible modules by the first compiler rejection.
-Six use the PE unpacker hook. Five declare unsupported host APIs. One uses an unsupported PE global.
+The compiler accepts 71 eligible modules, including 68 logical modules, both PDF hooks, and one `PE_ALL` hook.
+The archive test loads those modules into one generation and verifies each hook count.
+The inventory groups the remaining 11 eligible modules by the first compiler rejection.
+Six use the PE unpacker hook. Five declare unsupported host APIs.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -125,8 +125,9 @@ The completion phase requires remaining parser flags. The post-extraction phase 
 [Pinned PE scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c) · [Pinned PDF scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pdf.c)
 
 Barnacle runs supported `PE_ALL` programs after overlay scanning. A matching logical prefilter enables the hook for that PE object.
+`PE_ALL` programs can read the entry RVA, PE header offset, optional header size, and optional header magic.
 The comparison covers earlier raw and overlay findings, sibling archive members, PE32+, and the `ScanPE` and unsigned bytecode options.
-The signed PE modules still require unsupported host globals or APIs. `PE_UNPACKER` is unsupported.
+One signed `PE_ALL` module loads in the archive test. The other requires unsupported host APIs. `PE_UNPACKER` is unsupported.
 
 Both signed PDF hooks query the current phase and configuration functionality level, which is 213.
 One queries document flags. The other uses discovery order, object offsets, and object spans.
@@ -158,9 +159,14 @@ Use the effective daemon options and engine module flags together to determine w
 | PE heuristics for Parite, Kriz, Magistr, and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
 | PDF obfuscated names | Stock comparisons cover physical and packed dictionaries, escaped Flate filters, and competing child signatures. |
 | RIFF and Mydoom log checks | Named finding parity is open. |
-| XZ dictionary limit | Barnacle bounds XZ reads. The `Heuristics.XZ.DicSizeLimit` verdict remains open. |
+| XZ dictionary limit | A final decoder memory refusal reports `Heuristics.XZ.DicSizeLimit` and discards the decoded prefix. The stock test forces a refusal on an ordinary receipt. |
 | URL phishing checks | Verified URL rule loading and detection are tracked in [issue #10](https://github.com/yavosh/barnacle/issues/10). |
 
 The pinned profile disables the encrypted-document, partition-intersection, and scan-limit alerts.
 Separate opt-in fixtures verify encrypted PDF and partition-intersection precedence against stock.
 [PDF alert tests](../tests/object_pdf_security.rs) · [Partition alert tests](../tests/object_partition.rs)
+
+The [XZ stock test](../tests/object_archives.rs) lowers the data limit of a private Debian clamd process after startup.
+The receipt's 8 MiB dictionary then triggers the alert even with `HeuristicAlerts no`.
+Restoring the limit lets stock scan the child and report its hash signature.
+Barnacle's reduced-limit test covers retry, refusal, and both `HeuristicScanPrecedence` settings.

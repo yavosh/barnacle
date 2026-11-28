@@ -608,7 +608,10 @@ fn stock_pdf_hook_execution() -> io::Result<()> {
 fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
     let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
     let mut marked = pe::benign_pe();
+    marked[168..172].copy_from_slice(&0x1020u32.to_le_bytes());
     marked[544..552].copy_from_slice(b"receiptY");
+    let mut other_entry = marked.clone();
+    other_entry[168..172].copy_from_slice(&0x1030u32.to_le_bytes());
     let mut prefilter_only = marked.clone();
     prefilter_only[551] = b'N';
     let mut hook_only = marked.clone();
@@ -648,6 +651,7 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
         options,
         &[
             (&marked, true),
+            (&other_entry, false),
             (&prefilter_only, false),
             (&hook_only, false),
             (&pe64, false),

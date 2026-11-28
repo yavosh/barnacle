@@ -360,11 +360,40 @@ fn name_globals(max_host: u64, globals_count: u64, name_type: u64) -> String {
 }
 
 pub fn pe_all_hook() -> String {
-    let mut globals = name_globals(0x8005, 5, 71);
+    let mut globals = name_globals(0x8005, 11, 71);
     global_pointer(&mut globals, 67, 0x8000, 0);
     global_pointer(&mut globals, 67, 0x8005, 0);
+    for offset in [4, 52, 280, 632] {
+        global_pointer(&mut globals, 67, 0x8003, offset);
+    }
+    for offset in [32, 264] {
+        global_pointer(&mut globals, 66, 0x8003, offset);
+    }
     let equals = |dest, value| op(1, dest, 21, &[number(32), number(0), immediate(value, 4)]);
     let combine = || op(1, 1, 11, &[number(1), number(2)]);
+    let mut checks = vec![
+        call(0, PE_RAW_OFFSET, &[immediate(0x1020, 4)]),
+        equals(1, 544),
+        call(0, BYTE_AT, &[immediate(551, 4)]),
+        equals(2, u64::from(b'Y')),
+        combine(),
+    ];
+    // Match count, match offset, raw entry, both entry RVAs, and PE header offset.
+    for (index, expected) in [(3, 0), (4, 0), (5, 544), (6, 0x1020), (7, 0x1020), (8, 128)] {
+        checks.extend([
+            op(32, 0, 39, &[pointer(index)]),
+            equals(2, expected),
+            combine(),
+        ]);
+    }
+    for (index, expected) in [(9, 224), (10, 0x10b)] {
+        checks.extend([
+            op(16, 3, 39, &[pointer(index)]),
+            op(1, 2, 21, &[number(16), number(3), immediate(expected, 2)]),
+            combine(),
+        ]);
+    }
+    checks.push(branch(1, 1, 2));
     program(
         259,
         "Local.Receipt.Prefilter.{};Target:1;0;544:72656365697074",
@@ -382,25 +411,8 @@ pub fn pe_all_hook() -> String {
         globals,
         &[Function {
             args: 0,
-            slots: &[32, 1, 1],
-            blocks: &[
-                vec![
-                    call(0, PE_RAW_OFFSET, &[immediate(0x1020, 4)]),
-                    equals(1, 544),
-                    call(0, BYTE_AT, &[immediate(551, 4)]),
-                    equals(2, u64::from(b'Y')),
-                    combine(),
-                    op(32, 0, 39, &[pointer(3)]),
-                    equals(2, 0),
-                    combine(),
-                    op(32, 0, 39, &[pointer(4)]),
-                    equals(2, 0),
-                    combine(),
-                    branch(1, 1, 2),
-                ],
-                vec![report(0), ret()],
-                vec![ret()],
-            ],
+            slots: &[32, 1, 1, 16],
+            blocks: &[checks, vec![report(0), ret()], vec![ret()]],
         }],
     )
 }

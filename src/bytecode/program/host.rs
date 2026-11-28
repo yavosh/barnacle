@@ -50,11 +50,29 @@ pub(super) enum TextMode {
     Bytes,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PeField {
+    RawEntry,
+    SectionCount,
+    EntryRva,
+    HeaderOffset,
+    OptionalSize,
+    OptionalMagic,
+}
+
+impl PeField {
+    pub(super) fn width(self) -> Width {
+        match self {
+            Self::SectionCount | Self::OptionalSize | Self::OptionalMagic => Width(16),
+            _ => Width::WORD,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum Operation {
     Number(Value),
-    PeEntry,
-    PeSectionCount,
+    PeField(PeField),
     PeRawOffset(Value),
     PeSection(Address, Value),
     RuntimeError(Value),
@@ -104,16 +122,19 @@ impl Operation {
                 let radix = radix.get(frame) as u32;
                 read_number(scan.input, &mut frame.cursor, radix, check)?
             }
-            Self::PeEntry | Self::PeSectionCount => {
+            Self::PeField(field) => {
                 let pe = scan
                     .pe
                     .get_or_init(|| pe_metadata(scan.input))
                     .as_ref()
                     .ok_or_else(|| unsupported("PE globals for this object"))?;
-                if matches!(self, Self::PeEntry) {
-                    pe.entry()
-                } else {
-                    u32::from(pe.section_count())
+                match field {
+                    PeField::RawEntry => pe.entry(),
+                    PeField::SectionCount => u32::from(pe.section_count()),
+                    PeField::EntryRva => pe.entry_rva(),
+                    PeField::HeaderOffset => pe.header_offset(),
+                    PeField::OptionalSize => u32::from(pe.optional_size()),
+                    PeField::OptionalMagic => u32::from(pe.optional_magic()),
                 }
             }
             Self::PeRawOffset(rva) => scan

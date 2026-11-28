@@ -63,16 +63,40 @@ pub(super) fn pe(bytes: &[u8]) -> Option<Executable> {
     read_pe(bytes, |_, _, _, _| Some(())).map(|(executable, _)| executable)
 }
 
+struct PeHeaders {
+    size: usize,
+    entry_rva: u32,
+    offset: u32,
+    optional_size: u16,
+    optional_magic: u16,
+}
+
 pub(crate) struct PeMetadata {
     sections: Vec<[u32; 9]>,
     entry: u32,
-    headers: usize,
+    headers: PeHeaders,
     file_size: usize,
 }
 
 impl PeMetadata {
     pub(crate) fn entry(&self) -> u32 {
         self.entry
+    }
+
+    pub(crate) fn entry_rva(&self) -> u32 {
+        self.headers.entry_rva
+    }
+
+    pub(crate) fn header_offset(&self) -> u32 {
+        self.headers.offset
+    }
+
+    pub(crate) fn optional_size(&self) -> u16 {
+        self.headers.optional_size
+    }
+
+    pub(crate) fn optional_magic(&self) -> u16 {
+        self.headers.optional_magic
     }
 
     pub(crate) fn section_count(&self) -> u16 {
@@ -84,7 +108,7 @@ impl PeMetadata {
     }
 
     pub(crate) fn raw_offset(&self, rva: u32) -> Option<u32> {
-        if (rva as usize) < self.headers {
+        if (rva as usize) < self.headers.size {
             return ((rva as usize) < self.file_size).then_some(rva);
         }
         self.sections
@@ -146,12 +170,13 @@ pub(crate) fn pe_metadata(bytes: &[u8]) -> Option<PeMetadata> {
 fn read_pe(
     bytes: &[u8],
     mut record: impl FnMut(&[u8; 40], usize, usize, &Section) -> Option<()>,
-) -> Option<(Executable, usize)> {
+) -> Option<(Executable, PeHeaders)> {
     let e = Endian::Little;
     if !bytes.starts_with(b"MZ") {
         return None;
     }
-    let header = bytes.get(e.u32(bytes, 60)?..)?;
+    let offset = e.u32(bytes, 60)?;
+    let header = bytes.get(offset..)?;
     if !header.starts_with(b"PE\0\0") {
         return None;
     }
@@ -161,7 +186,8 @@ fn read_pe(
     }
     let opt_size = e.u16(header, 20)?;
     let (opt, table) = header.get(24..)?.split_at_checked(opt_size)?;
-    let standard = match e.u16(opt, 0)? {
+    let optional_magic = e.u16(opt, 0)?;
+    let standard = match optional_magic {
         0x10b => 96,
         0x20b => 112,
         _ => return None,
@@ -225,18 +251,24 @@ fn read_pe(
         result.push(section);
     }
 
-    let entry = if entry < header_bytes {
+    let raw_entry = if entry < header_bytes {
         (entry < bytes.len()).then_some(entry)?
     } else {
         mapped_entry?
     };
     Some((
         Executable {
-            entry,
+            entry: raw_entry,
             sections: result,
             pe_overlay,
         },
-        header_bytes,
+        PeHeaders {
+            size: header_bytes,
+            entry_rva: entry as u32,
+            offset: offset as u32,
+            optional_size: opt_size as u16,
+            optional_magic: optional_magic as u16,
+        },
     ))
 }
 
