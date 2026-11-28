@@ -39,10 +39,10 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 68 of the 72 logical modules in the signed archive.
-The archive test loads their triggers together through the logical index.
-The inventory groups the remaining 14 eligible modules by the first compiler rejection.
-Ten require nonlogical hooks. Four logical modules declare unsupported APIs.
+The compiler accepts 70 eligible modules, including 68 logical modules and both PDF hooks.
+The archive test loads those modules into one generation's logical index and PDF hook list.
+The inventory groups the remaining 12 eligible modules by the first compiler rejection.
+Eight require PE hooks. Four logical modules declare unsupported APIs.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -128,6 +128,12 @@ Both signed PDF hooks query the current phase and configuration functionality le
 One queries document flags. The other uses discovery order, object offsets, and object spans.
 Post-extraction calls retain the parent object table while reading extracted bytes.
 [Pinned bytecode host APIs](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.c)
+
+Local unconditional PDF hooks run at all four phases under the daemon's bytecode policy.
+The stock comparison checks prefixed offsets, object sizes, child precedence, and `BREAK`.
+Conditional PDF hooks and unverified parser metadata remain unsupported.
+Unsupported metadata produces an explicit error when a hook queries it.
+An uncertain END phase leaves the scan incomplete. [PDF hook comparisons](../tests/bytecode_reference.rs)
 
 The reference enables `HeuristicAlerts` and disables `HeuristicScanPrecedence`.
 Default precedence lets later detections win over a deferred heuristic finding.

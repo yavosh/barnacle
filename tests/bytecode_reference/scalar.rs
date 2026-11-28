@@ -171,13 +171,31 @@ fn module(
     globals: String,
     functions: &[Function<'_>],
 ) -> String {
+    program(
+        256,
+        &format!("Local.Receipt.Trigger.{{}};Target:0;{trigger}"),
+        types,
+        apis,
+        globals,
+        functions,
+    )
+}
+
+fn program(
+    hook: u64,
+    title: &str,
+    types: &[String],
+    apis: &[(u64, u64, &str)],
+    globals: String,
+    functions: &[Function<'_>],
+) -> String {
     let mut head = String::from("ClamBC");
     for field in [
         number(7),
         number(0),
         string("Barnacle"),
         number(0),
-        number(256),
+        number(hook),
         number(56),
         number(0),
         number(0),
@@ -198,7 +216,7 @@ fn module(
         api += &(number(id) + &number(type_id) + &string(name));
     }
     let mut cbc = format!(
-        "{head}:4096\nLocal.Receipt.Trigger.{{}};Target:0;{trigger}\nT{}{}\n{api}\n{globals}\n",
+        "{head}:4096\n{title}\nT{}{}\n{api}\n{globals}\n",
         fixed(69, 2),
         types.concat()
     );
@@ -233,6 +251,99 @@ fn module(
     }
     cbc += "S\n";
     cbc
+}
+
+pub struct PdfProbe {
+    pub phase: u64,
+    pub flags: u64,
+    pub first_offset: Option<usize>,
+    pub first_size: usize,
+    pub first_byte: u8,
+    pub stop_pdf: bool,
+}
+
+pub fn pdf_hook(probe: PdfProbe) -> String {
+    const DCONF_LEVEL: u64 = 67;
+    const PDF_FLAGS: u64 = 78;
+    const PDF_LOOKUP: u64 = 80;
+    const PDF_SIZE: u64 = 81;
+    const PDF_OFFSET: u64 = 86;
+    const PDF_PHASE: u64 = 87;
+    let equals = |dest, value| op(1, dest, 21, &[number(32), number(0), immediate(value, 4)]);
+    let invalid = u64::from(u32::MAX);
+    let mut checks = Vec::new();
+    for (api, arg, value) in [
+        (DCONF_LEVEL, None, 213),
+        (PDF_FLAGS, None, probe.flags),
+        (
+            PDF_LOOKUP,
+            Some(1 << 8),
+            if probe.first_offset.is_some() {
+                0
+            } else {
+                invalid
+            },
+        ),
+        (PDF_LOOKUP, Some(120 << 8), invalid),
+        (PDF_SIZE, Some(0), probe.first_size as u64),
+        (
+            PDF_OFFSET,
+            Some(0),
+            probe.first_offset.map_or(invalid, |i| i as u64),
+        ),
+        (BYTE_AT, Some(0), u64::from(probe.first_byte)),
+    ] {
+        let args = arg.map(|value| immediate(value, 4));
+        checks.push(call(0, api, args.as_slice()));
+        checks.push(equals(2, value));
+        checks.push(op(1, 1, 11, &[number(1), number(2)]));
+    }
+    checks.push(branch(1, 2, 3));
+    let success = if probe.stop_pdf {
+        vec![format!(
+            "T{}{}{}",
+            fixed(19, 2),
+            number(32),
+            immediate(0xcea5e, 4)
+        )]
+    } else {
+        vec![report(0), ret()]
+    };
+    program(
+        258,
+        "Local.Receipt.PdfHook",
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32]),
+            callable(&[32, 32]),
+            array(NAME.len() + 1, 8),
+        ],
+        &[
+            (SET_NAME, 69, "setvirusname"),
+            (BYTE_AT, 71, "file_byteat"),
+            (DCONF_LEVEL, 70, "engine_dconf_level"),
+            (PDF_FLAGS, 70, "pdf_get_flags"),
+            (PDF_LOOKUP, 71, "pdf_lookupobj"),
+            (PDF_SIZE, 71, "pdf_getobjsize"),
+            (PDF_OFFSET, 71, "pdf_get_offset"),
+            (PDF_PHASE, 70, "pdf_get_phase"),
+        ],
+        name_globals(0, 3, 72),
+        &[Function {
+            args: 0,
+            slots: &[32, 1, 1],
+            blocks: &[
+                vec![
+                    call(0, PDF_PHASE, &[]),
+                    equals(1, probe.phase),
+                    branch(1, 1, 3),
+                ],
+                checks,
+                success,
+                vec![ret()],
+            ],
+        }],
+    )
 }
 
 fn name_globals(max_host: u64, globals_count: u64, name_type: u64) -> String {

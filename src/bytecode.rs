@@ -9,6 +9,43 @@ use std::path::Path;
 mod program;
 pub use program::Program;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PdfPhase {
+    Parsed = 1,
+    PostDump = 2,
+    End = 3,
+    Pre = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdfHookObject {
+    /// The object ID used by the stock lookup API, including its generation.
+    pub id: u32,
+    /// Body offset relative to the PDF or its decoded object stream.
+    pub start: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PdfHookContext<'a> {
+    pub phase: PdfPhase,
+    /// None when the parser cannot establish the complete flag word.
+    pub flags: Option<u32>,
+    /// Objects in discovery order. None means that the table is incomplete.
+    pub objects: Option<&'a [PdfHookObject]>,
+    /// Offset of the PDF in the original input map.
+    pub start: usize,
+    /// Length of the PDF region in the original map.
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdfHookResult<'a> {
+    Continue,
+    Break,
+    Found(&'a str),
+}
+
 pub const PINNED_ARCHIVE: (&str, u64, &str) = (
     "bytecode.cvd",
     281_702,
@@ -404,8 +441,8 @@ mod tests {
         assert_eq!(found.instructions, 15_034);
         assert_eq!(found.opcodes.len(), 44);
         assert_eq!(found.apis.len(), 28);
-        assert_eq!(found.compiled, 68);
-        assert_eq!(found.compile_errors.values().sum::<usize>(), 14);
+        assert_eq!(found.compiled, 70);
+        assert_eq!(found.compile_errors.values().sum::<usize>(), 12);
 
         let scratch = tempfile::tempdir()?;
         let mut sources = Vec::new();
@@ -424,7 +461,9 @@ mod tests {
             &crate::IgnoreSet::default(),
             |path| File::open(path),
         )?;
-        assert_eq!(index.rule_count(), found.compiled);
+        assert_eq!(sources.len(), 70);
+        assert_eq!(index.rule_count(), 68);
+        assert_eq!(index.pdf_hooks().unwrap().programs.len(), 2);
         Ok(())
     }
 }

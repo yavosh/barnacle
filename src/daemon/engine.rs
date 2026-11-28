@@ -417,10 +417,11 @@ impl Generation {
             .flatten();
         let mut expired = false;
         let verdict = object.with_bytes(|bytes| {
-            objects::scan(
+            objects::scan_with_pdf_hooks(
                 bytes,
                 &self.objects,
                 &self.temporary_directory,
+                self.logical.pdf_hooks(),
                 |obj, check| {
                     let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
                     let eligible = obj.normalized

@@ -1,4 +1,4 @@
-//! Compare harmless logical bytecode programs against pinned clamd.
+//! Compare harmless bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
 #[path = "common/pe.rs"]
@@ -11,7 +11,7 @@ mod zip;
 use daemon::{Daemon, stream_frame, unix_request};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const MARKER: &[u8] = b"CLAMAV-TEST-STRING-NOT-EICAR";
@@ -449,4 +449,157 @@ fn barnacle_bytecode_memory_and_pe_queries() -> io::Result<()> {
 fn stock_bytecode_memory_and_pe_queries() -> io::Result<()> {
     verify_stock()?;
     compare_memory_and_pe_queries(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
+const PDF_ATTACHMENT: &[u8] = b"Receipt for ordinary office stationery";
+
+fn receipt_pdf(escaped_name: bool) -> (Vec<u8>, usize, usize) {
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = [0; 3];
+    let mut starts = [0; 3];
+    for index in 0..3 {
+        offsets[index] = pdf.len();
+        write!(pdf, "{} 0 obj", index + 1).unwrap();
+        starts[index] = pdf.len();
+        match index {
+            0 => {
+                let key = if escaped_name { "Ty#70e" } else { "Type" };
+                write!(pdf, "\n<< /{key} /Catalog /Pages 2 0 R >>").unwrap();
+            }
+            1 => pdf.extend_from_slice(b"\n<< /Type /Pages /Count 0 /Kids [] >>"),
+            _ => {
+                write!(
+                    pdf,
+                    "\n<< /Type /EmbeddedFile /Length {} >>\nstream\n",
+                    PDF_ATTACHMENT.len()
+                )
+                .unwrap();
+                pdf.extend_from_slice(PDF_ATTACHMENT);
+                pdf.extend_from_slice(b"\nendstream");
+            }
+        }
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        pdf,
+        "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    )
+    .unwrap();
+    (pdf, starts[0], starts[1] - starts[0] - 4)
+}
+
+fn compare_pdf_hooks(executable: &Path, miss: &str) -> io::Result<()> {
+    let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    let (receipt, first, size) = receipt_pdf(false);
+    let (escaped, end_first, end_size) = receipt_pdf(true);
+    let prefix = b" \n";
+    let prefixed = [prefix, receipt.as_slice()].concat();
+    for (phase, flags, offset, len, first_byte, doc) in [
+        (4, 0, None, 0, b'%', receipt.as_slice()),
+        (1, 0, Some(first), size, b'%', receipt.as_slice()),
+        (
+            1,
+            2,
+            Some(prefix.len() + first),
+            size,
+            b' ',
+            prefixed.as_slice(),
+        ),
+        (2, 0, Some(first), 0, b'R', receipt.as_slice()),
+        (
+            3,
+            1 << 11,
+            Some(end_first),
+            end_size,
+            b'%',
+            escaped.as_slice(),
+        ),
+    ] {
+        let hook = scalar::pdf_hook(scalar::PdfProbe {
+            phase,
+            flags,
+            first_offset: offset,
+            first_size: len,
+            first_byte,
+            stop_pdf: false,
+        });
+        let control = if phase == 3 {
+            &receipt
+        } else {
+            b"Ordinary plain text receipt".as_slice()
+        };
+        run_program(
+            executable,
+            &hook,
+            options,
+            &[(doc, true), (control, false)],
+            miss,
+        )
+        .map_err(|error| io::Error::new(error.kind(), format!("phase {phase}: {error}")))?;
+    }
+
+    let stop_hook = scalar::pdf_hook(scalar::PdfProbe {
+        phase: 1,
+        flags: 0,
+        first_offset: Some(first),
+        first_size: size,
+        first_byte: b'%',
+        stop_pdf: true,
+    });
+    let post_hook = scalar::pdf_hook(scalar::PdfProbe {
+        phase: 2,
+        flags: 0,
+        first_offset: Some(first),
+        first_size: 0,
+        first_byte: b'R',
+        stop_pdf: false,
+    });
+    let trailing_line = [PDF_ATTACHMENT, b"\n"].concat();
+    let rules: String = [PDF_ATTACHMENT, trailing_line.as_slice()]
+        .iter()
+        .map(|input| {
+            let md5: String = md5::Md5::digest(input)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{md5}:{}:Pdf.HookReceipt\n", input.len())
+        })
+        .collect();
+    let child = "stream: Pdf.HookReceipt.UNOFFICIAL FOUND\0";
+    for (hook, settings, expected) in [
+        (&stop_hook, options, miss),
+        (&stop_hook, "BytecodeUnsigned no\n", child),
+        (&stop_hook, "Bytecode no\nBytecodeUnsigned yes\n", child),
+        (&post_hook, options, child),
+    ] {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let db = dir.path().join("db");
+        fs::create_dir(&db)?;
+        fs::write(db.join(CBC), hook)?;
+        fs::write(db.join("receipt.hdb"), &rules)?;
+        let (_daemon, socket) = start(dir.path(), executable, settings)?;
+        assert_eq!(
+            unix_request(&socket, &stream_frame(&receipt)?)?,
+            expected,
+            "{settings}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn barnacle_pdf_hook_execution() -> io::Result<()> {
+    compare_pdf_hooks(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_pdf_hook_execution() -> io::Result<()> {
+    verify_stock()?;
+    compare_pdf_hooks(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }

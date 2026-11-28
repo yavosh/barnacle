@@ -1,8 +1,10 @@
 //! Object traversal for one scan against one immutable database generation.
 use crate::body::{HandlerType, LogicalObject, ObjectContext, Target};
+use crate::bytecode::{PdfHookContext, PdfHookResult, Program};
 use md5::{Digest, Md5};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 mod archive;
 mod autoit;
@@ -33,6 +35,21 @@ enum Handling {
     Complete,
     Incomplete,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PdfHookControl {
+    Continue,
+    Break,
+    Found,
+}
+
+/// Scan-time settings for the generation's PDF bytecode programs.
+#[derive(Clone, Copy)]
+pub struct PdfHooks<'a> {
+    pub programs: &'a [Program],
+    pub debug: bool,
+    pub timeout: Duration,
 }
 
 trait ChildSink {
@@ -73,6 +90,12 @@ trait ChildSink {
     }
     fn partition_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
     fn script_view(&mut self, source: &[u8]) -> io::Result<bool>;
+    fn pdf_hooks_enabled(&self) -> bool;
+    fn run_pdf_hooks(
+        &mut self,
+        input: &[u8],
+        context: PdfHookContext<'_>,
+    ) -> io::Result<PdfHookControl>;
 
     fn check(&mut self) -> io::Result<()>;
     fn at_root(&self) -> bool;
@@ -86,7 +109,7 @@ trait ChildSink {
     fn recorded_limit(&self) -> Option<Limit>;
     fn max_partitions(&self) -> usize;
     fn check_partition_intersections(&self) -> bool;
-    fn report_heuristic(&mut self, name: &'static str) -> bool;
+    fn report_heuristic(&mut self, name: &str) -> bool;
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool;
     fn size_limit(&self, size: u64) -> Option<Limit>;
     fn skip_declared_size(&mut self, size: u64) -> bool;
@@ -335,6 +358,7 @@ struct Traversal<'a> {
     first_limit: Option<Limit>,
     deferred_heuristic: Option<Verdict>,
     last_handler_hash: [u8; 16],
+    pdf_hooks: Option<PdfHooks<'a>>,
     matcher: &'a mut Matcher<'a>,
     check: &'a mut dyn FnMut() -> io::Result<()>,
 }
@@ -352,6 +376,18 @@ pub fn scan(
     bytes: &[u8],
     options: &Options,
     temporary_directory: &Path,
+    matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
+    check: impl FnMut() -> io::Result<()>,
+) -> io::Result<Verdict> {
+    scan_with_pdf_hooks(bytes, options, temporary_directory, None, matcher, check)
+}
+
+/// Scan objects with the PDF hooks from the same database generation.
+pub fn scan_with_pdf_hooks(
+    bytes: &[u8],
+    options: &Options,
+    temporary_directory: &Path,
+    pdf_hooks: Option<PdfHooks<'_>>,
     mut matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
     mut check: impl FnMut() -> io::Result<()>,
 ) -> io::Result<Verdict> {
@@ -366,6 +402,7 @@ pub fn scan(
         first_limit: None,
         deferred_heuristic: None,
         last_handler_hash: [0; 16],
+        pdf_hooks,
         matcher: &mut matcher,
         check: &mut check,
     };
@@ -620,6 +657,44 @@ impl Traversal<'_> {
 }
 
 impl ChildSink for Traversal<'_> {
+    fn pdf_hooks_enabled(&self) -> bool {
+        self.pdf_hooks
+            .is_some_and(|hooks| !hooks.programs.is_empty())
+    }
+
+    fn run_pdf_hooks(
+        &mut self,
+        input: &[u8],
+        context: PdfHookContext<'_>,
+    ) -> io::Result<PdfHookControl> {
+        let mut control = PdfHookControl::Continue;
+        if let Some(hooks) = self.pdf_hooks {
+            for program in hooks.programs {
+                match program.run_pdf(
+                    input,
+                    context,
+                    hooks.debug,
+                    hooks.timeout,
+                    &mut *self.check,
+                )? {
+                    PdfHookResult::Found(name) => {
+                        if name.starts_with("BC.Heuristics") {
+                            if self.report_heuristic(name) {
+                                return Ok(PdfHookControl::Found);
+                            }
+                        } else {
+                            self.stopped = Some(Verdict::Found(name.to_owned()));
+                            return Ok(PdfHookControl::Found);
+                        }
+                    }
+                    PdfHookResult::Break => control = PdfHookControl::Break,
+                    PdfHookResult::Continue => (),
+                }
+            }
+        }
+        Ok(control)
+    }
+
     fn at_root(&self) -> bool {
         self.parents.len() == 1
     }
@@ -730,7 +805,7 @@ impl ChildSink for Traversal<'_> {
         self.options.alert_partition_intersection
     }
 
-    fn report_heuristic(&mut self, name: &'static str) -> bool {
+    fn report_heuristic(&mut self, name: &str) -> bool {
         if self.options.heuristic_scan_precedence {
             self.stopped = Some(Verdict::Found(name.to_owned()));
             true

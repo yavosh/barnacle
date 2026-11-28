@@ -1,13 +1,16 @@
-//! A typed scalar interpreter for a single logical bytecode entry point.
-use super::{Cursor, MAX_MEMBER_BYTES, invalid};
+//! A typed CBC interpreter for logical signatures and PDF hooks.
+use super::{Cursor, MAX_MEMBER_BYTES, PdfHookContext, PdfHookResult, invalid};
 use std::time::{Duration, Instant};
 use std::{io, str, sync::Arc};
 
 mod host;
 mod memory;
+mod pdf;
 use memory::{Address, Frame, MemoryOp, Slot};
 
 const LOGICAL_HOOK: u64 = 256;
+const PDF_HOOK: u64 = 258;
+const BREAK_RESULT: u64 = 0xcea5e;
 const SET_VIRUS_NAME: u64 = 5;
 const I32: u64 = 32;
 const BYTE_POINTER: u64 = 65;
@@ -18,6 +21,7 @@ const MAX_CALL_DEPTH: usize = 64;
 
 #[derive(Debug)]
 pub struct Program {
+    pdf_hook: bool,
     trigger: Box<str>,
     functions: Vec<Function>,
     uses_match_offsets: bool,
@@ -54,7 +58,7 @@ fn unsupported(feature: &str) -> io::Error {
 }
 
 impl Program {
-    /// Compile one logical entry point, or skip a module outside the format or engine window.
+    /// Compile a logical or PDF entry point inside the supported format and engine window.
     pub fn compile(contents: &[u8], engine_level: u64) -> io::Result<Option<Self>> {
         if contents.len() as u64 > MAX_MEMBER_BYTES {
             return Err(invalid("CBC exceeds the module size limit"));
@@ -76,7 +80,7 @@ impl Program {
         if engine_level < min || max != 0 && engine_level > max {
             return Ok(None);
         }
-        if hook != LOGICAL_HOOK || exclude != 0 {
+        if !matches!(hook, LOGICAL_HOOK | PDF_HOOK) || exclude != 0 {
             return Err(unsupported("hook or target exclusion"));
         }
         if field(h.number())? != 0 {
@@ -105,7 +109,10 @@ impl Program {
         };
         let trigger = str::from_utf8(line()?.0).map_err(|_| invalid("invalid CBC trigger text"))?;
         if trigger.is_empty() || trigger.bytes().any(|b| b.is_ascii_control()) {
-            return Err(invalid("invalid CBC logical trigger"));
+            return Err(invalid("invalid CBC trigger text"));
+        }
+        if hook == PDF_HOOK && trigger.contains(';') {
+            return Err(unsupported("conditional PDF hook"));
         }
         let types = types(line()?, type_count)?;
         let apis = api(line()?, &types)?;
@@ -191,6 +198,7 @@ impl Program {
             .flat_map(|f| f.blocks.iter().flatten())
             .any(|op| matches!(op, Instruction::Write(_, Expression::MatchOffset(_))));
         Ok(Some(Self {
+            pdf_hook: hook == PDF_HOOK,
             trigger: trigger.into(),
             uses_match_offsets,
             functions,
@@ -199,6 +207,10 @@ impl Program {
 
     pub fn trigger(&self) -> &str {
         &self.trigger
+    }
+
+    pub fn is_pdf_hook(&self) -> bool {
+        self.pdf_hook
     }
 
     pub fn uses_match_offsets(&self) -> bool {
@@ -213,15 +225,54 @@ impl Program {
         counts: &[u32],
         debug: bool,
         timeout: Duration,
-        mut check: impl FnMut() -> io::Result<()>,
+        check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
+        if self.pdf_hook {
+            return Err(unsupported("PDF hook outside its PDF phase"));
+        }
         let scan = Scan {
             input,
             offsets,
             counts,
             debug,
+            pdf: None,
             pe: Default::default(),
         };
+        Ok(match self.execute(scan, timeout, check)? {
+            PdfHookResult::Found(name) => Some(name),
+            _ => None,
+        })
+    }
+
+    /// Run one hook on its phase input. PostDump receives the extracted object's bytes.
+    pub fn run_pdf(
+        &self,
+        input: &[u8],
+        context: PdfHookContext<'_>,
+        debug: bool,
+        timeout: Duration,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<PdfHookResult<'_>> {
+        if !self.pdf_hook {
+            return Err(unsupported("logical entry in a PDF phase"));
+        }
+        let scan = Scan {
+            input,
+            counts: &[],
+            offsets: &[0; 64],
+            debug,
+            pdf: Some(context),
+            pe: Default::default(),
+        };
+        self.execute(scan, timeout, check)
+    }
+
+    fn execute(
+        &self,
+        scan: Scan<'_>,
+        timeout: Duration,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<PdfHookResult<'_>> {
         let mut function = &self.functions[0];
         let mut locals = Frame::new(&function.slots);
         let mut next = 0;
@@ -239,7 +290,7 @@ impl Program {
                 if operations == CLOCK_INTERVAL {
                     operations = 0;
                     if start.elapsed() >= timeout {
-                        return Ok(None);
+                        return Ok(PdfHookResult::Continue);
                     }
                 }
                 match instruction {
@@ -247,13 +298,13 @@ impl Program {
                         let Some(value) =
                             expression.eval(&mut locals, &scan, &mut name, &mut check)?
                         else {
-                            return Ok(None);
+                            return Ok(PdfHookResult::Continue);
                         };
                         locals.set(*dest, value);
                     }
                     Instruction::Effect(op) => {
-                        if memory::outcome(op.eval(&mut locals, input))?.is_none() {
-                            return Ok(None);
+                        if memory::outcome(op.eval(&mut locals, scan.input))?.is_none() {
+                            return Ok(PdfHookResult::Continue);
                         }
                     }
                     Instruction::Branch(value, yes, no) => {
@@ -289,7 +340,15 @@ impl Program {
                     }
                     Instruction::Return(result) => {
                         let Some(caller) = stack.pop() else {
-                            return Ok(name);
+                            return Ok(match name {
+                                Some(name) => PdfHookResult::Found(name),
+                                None if self.pdf_hook
+                                    && result.is_some_and(|v| v.get(&locals) == BREAK_RESULT) =>
+                                {
+                                    PdfHookResult::Break
+                                }
+                                None => PdfHookResult::Continue,
+                            });
                         };
                         let value = result.map(|v| v.get(&locals));
                         locals.leave();
@@ -302,7 +361,7 @@ impl Program {
                         next = caller.next;
                         break;
                     }
-                    Instruction::Abort => return Ok(None),
+                    Instruction::Abort => return Ok(PdfHookResult::Continue),
                 }
             }
         }
@@ -321,6 +380,7 @@ struct Scan<'a> {
     offsets: &'a [u32; 64],
     counts: &'a [u32],
     debug: bool,
+    pdf: Option<PdfHookContext<'a>>,
     pe: std::cell::OnceCell<Option<crate::body::PeMetadata>>,
 }
 
@@ -433,6 +493,8 @@ const FILE_FIND: u64 = 16;
 const FILE_BYTEAT: u64 = 17;
 const FILE_FIND_LIMIT: u64 = 65;
 const ENGINE_LEVEL: u64 = 66;
+const DCONF_LEVEL: u64 = 67;
+const PINNED_DCONF_LEVEL: u64 = 213;
 
 fn api(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<u64>> {
     field(line.expect(b'E'))?;
@@ -452,7 +514,10 @@ fn api(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<u64>> {
             FILE_BYTEAT => (b"file_byteat\0", &[I32, I32]),
             FILE_FIND_LIMIT => (b"file_find_limit\0", &[I32, BYTE_POINTER, I32, I32]),
             ENGINE_LEVEL => (b"engine_functionality_level\0", &[I32]),
-            _ => host::declaration(id).ok_or_else(|| unsupported("API declaration"))?,
+            DCONF_LEVEL => (b"engine_dconf_level\0", &[I32]),
+            _ => host::declaration(id)
+                .or_else(|| pdf::declaration(id))
+                .ok_or_else(|| unsupported("API declaration"))?,
         };
         let ty = user_type(types, field(line.number())?);
         if id > max_id
@@ -924,6 +989,7 @@ enum Expression {
     FileSize,
     SetName(Box<str>),
     Host(host::Operation),
+    Pdf(pdf::Query),
 }
 
 impl Expression {
@@ -937,6 +1003,7 @@ impl Expression {
         let input = scan.input;
         let value = match *self {
             Self::Host(ref op) => return op.eval(locals, scan, check),
+            Self::Pdf(ref query) => u64::from(query.eval(locals, scan.pdf, check)?),
             Self::Allocate(size) => locals.allocate(size.get(locals) as usize)?,
             Self::MemStr(ref haystack, hlen, ref needle, nlen) => {
                 let Some(h) = memory::outcome(haystack.read(locals, hlen.get(locals) as usize))?
@@ -1379,6 +1446,10 @@ fn host_call(
             };
             Expression::Find(from, len, limit)
         }
+        (DCONF_LEVEL, 0) => Expression::Copy(Value::Constant(PINNED_DCONF_LEVEL)),
+        _ if pdf::declaration(id).is_some() => {
+            Expression::Pdf(pdf::Query::decode(id, count, line, slots)?)
+        }
         (ENGINE_LEVEL, 0) => {
             Expression::Copy(Value::Constant(ctx.engine_level & u64::from(u32::MAX)))
         }
@@ -1519,6 +1590,44 @@ mod tests {
                         io::Error::other("cancelled")
                     ))
                     .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pdf_hook_requires_an_unconditional_name_and_preserves_return_status() -> io::Result<()> {
+        let context = PdfHookContext {
+            phase: super::super::PdfPhase::Pre,
+            flags: None,
+            objects: Some(&[]),
+            start: 0,
+            size: 0,
+        };
+        for calls in [false, true] {
+            let mut module = sample(calls);
+            module[0] =
+                module[0].replacen(&number(LOGICAL_HOOK, false), &number(PDF_HOOK, false), 1);
+            assert_eq!(
+                Program::compile(module.join("\n").as_bytes(), 213)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+            module[1] = "ReceiptPdfHook".into();
+            module[6] = module[6].replace(
+                &(number(9, true) + &fixed(4, 1) + "E"),
+                &(number(BREAK_RESULT, true) + &fixed(4, 1) + "E"),
+            );
+            let program = Program::compile(module.join("\n").as_bytes(), 213)?.unwrap();
+            assert!(program.is_pdf_hook());
+            assert_eq!(
+                program.run_pdf(&[], context, false, TEST_TIMEOUT, || Ok(()))?,
+                if calls {
+                    PdfHookResult::Found("Local.Receipt")
+                } else {
+                    PdfHookResult::Break
+                }
             );
         }
         Ok(())
@@ -1762,6 +1871,7 @@ mod tests {
                         offsets: &[0; 64],
                         counts: &[],
                         debug: false,
+                        pdf: None,
                         pe: Default::default(),
                     },
                     &mut None,
@@ -1801,6 +1911,7 @@ mod tests {
                     offsets: &offsets,
                     counts: &[],
                     debug: false,
+                    pdf: None,
                     pe: Default::default(),
                 },
                 &mut None,
@@ -1842,6 +1953,7 @@ mod tests {
                     offsets: &[0; 64],
                     counts: &[],
                     debug: false,
+                    pdf: None,
                     pe: Default::default(),
                 },
                 &mut None,

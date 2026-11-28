@@ -156,6 +156,7 @@ pub struct LogicalIndex {
     max_icons: usize,
     search: SearchIndex,
     bytecode: HashMap<u32, Program>,
+    pdf_bytecode: Vec<Program>,
     bytecode_debug: bool,
     bytecode_timeout: Duration,
 }
@@ -180,6 +181,7 @@ impl LogicalIndex {
     ) -> io::Result<Self> {
         let mut builder = Builder::default();
         let mut bytecode = HashMap::new();
+        let mut pdf_bytecode = Vec::new();
         for &(path, official) in paths {
             let file = open(path)
                 .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
@@ -196,6 +198,10 @@ impl LogicalIndex {
                 if let Some(program) =
                     Program::compile(&contents, u64::from(flevel)).map_err(located)?
                 {
+                    if program.is_pdf_hook() {
+                        pdf_bytecode.push(program);
+                        continue;
+                    }
                     let id = builder.records.len();
                     let first_binding = builder.bindings.len();
                     builder
@@ -281,6 +287,7 @@ impl LogicalIndex {
             icons: IconDatabase::default(),
             max_icons: 100,
             bytecode,
+            pdf_bytecode,
             bytecode_debug: false,
             bytecode_timeout,
             regexes: builder.regexes,
@@ -294,6 +301,15 @@ impl LogicalIndex {
     pub fn with_bytecode_debug(mut self, enabled: bool) -> Self {
         self.bytecode_debug = enabled;
         self
+    }
+
+    /// Return the PDF hooks pinned to this generation.
+    pub fn pdf_hooks(&self) -> Option<crate::objects::PdfHooks<'_>> {
+        (!self.pdf_bytecode.is_empty()).then_some(crate::objects::PdfHooks {
+            programs: &self.pdf_bytecode,
+            debug: self.bytecode_debug,
+            timeout: self.bytecode_timeout,
+        })
     }
 
     /// Use the daemon's PCRE limits for this generation.

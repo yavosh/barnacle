@@ -1,10 +1,13 @@
 //! Scan PDF streams after the raw PDF matcher, in physical indirect-object order.
-use super::{ChildSink, Handling, Limit, ObjectBytes, Snapshot};
+use super::{ChildSink, Handling, Limit, ObjectBytes, PdfHookControl, Snapshot};
+use crate::bytecode::PdfPhase;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 mod destination;
 mod filters;
+mod hooks;
+use hooks::Hooks;
 mod object_stream;
 mod security;
 use filters::{Filter, Output};
@@ -517,6 +520,7 @@ fn trim_eol(bytes: &[u8]) -> &[u8] {
 fn parse<'a>(
     data: &'a [u8],
     heuristic_alerts: bool,
+    mut hooks: Option<&mut Hooks<'_>>,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Option<Pdf<'a>>> {
     let mut input = Tokens { data, pos: 0 };
@@ -580,6 +584,12 @@ fn parse<'a>(
                 return Ok(None);
             };
             dictionary.observe(tok, input.pos - obj.start);
+            if let Some(hooks) = hooks.as_deref_mut()
+                && !hooks::passive_token(tok)
+            {
+                hooks.unknown_flags();
+            }
+
             match tok {
                 b"endobj" => {
                     if obj.encoded.is_none()
@@ -699,6 +709,18 @@ fn parse<'a>(
                 _ => (),
             }
         }
+        if let Some(hooks) = hooks.as_deref_mut() {
+            hooks.physical(obj.id, obj.start, input.pos, sink)?;
+            if obj.unsupported
+                || obj.object_stream
+                || obj.xref
+                || standard_filter
+                || encrypt_entry
+                || dictionary.depth != 0
+            {
+                hooks.unknown_flags();
+            }
+        }
         if encrypt_entry {
             // A cross-reference stream dictionary holds the trailer entries.
             if !obj.xref || encrypted {
@@ -732,6 +754,15 @@ fn parse<'a>(
     if !destination::resolve(data, &mut pdf.objects, &requests, sink)? {
         return Ok(None);
     }
+    if let Some(hooks) = hooks {
+        hooks.finish_discovery(sink)?;
+        if pdf.obfuscated_name {
+            hooks.obfuscated_name();
+        }
+        if encrypted {
+            hooks.unknown_flags();
+        }
+    }
     pdf.count = count;
     Ok(Some(pdf))
 }
@@ -753,8 +784,24 @@ pub(super) fn extract(
     else {
         return Ok(Handling::Complete);
     };
+    let mut hooks = sink.pdf_hooks_enabled().then(|| Hooks::new(data, start));
+    if let Some(hooks) = &hooks {
+        if data.len().min(1032) - start < 8 {
+            return Ok(Handling::Incomplete);
+        }
+        if let Some(result) = hooks.parent_phase(PdfPhase::Pre, sink)? {
+            return Ok(result);
+        }
+    }
     let data = &data[start..];
-    let Some(mut pdf) = parse(data, options.heuristic_alerts, sink)? else {
+
+    let Some(mut pdf) = parse(
+        data,
+        options.heuristic_alerts || hooks.is_some(),
+        hooks.as_mut(),
+        sink,
+    )?
+    else {
         return Ok(Handling::Incomplete);
     };
     sink.check()?;
@@ -763,6 +810,11 @@ pub(super) fn extract(
         && sink.report_heuristic("Heuristics.Encrypted.PDF")
     {
         return Ok(Handling::Stopped);
+    }
+    if let Some(hooks) = &hooks
+        && let Some(result) = hooks.parent_phase(PdfPhase::Parsed, sink)?
+    {
+        return Ok(result);
     }
     let directories = pdf
         .objects
@@ -777,17 +829,23 @@ pub(super) fn extract(
             sink.temporary_directory(),
             sink.remaining(),
             pdf.count,
-            options.heuristic_alerts,
+            options.heuristic_alerts || hooks.is_some(),
             pdf.objects
                 .iter()
                 .filter(|obj| obj.unsupported || obj.encoded.is_some() && !obj.raw_destination)
                 .map(|obj| obj.id),
         )
     });
-    'objects: for mut obj in pdf.objects {
+    'objects: for mut obj in std::mem::take(&mut pdf.objects) {
         sink.check()?;
         if obj.unsupported {
             return Ok(Handling::Incomplete);
+        }
+        if obj.object_stream
+            && obj.directory.is_none()
+            && let Some(hooks) = &mut hooks
+        {
+            hooks.unknown_objects();
         }
         let Some(bytes) = obj.encoded else { continue };
         if obj.raw_destination {
@@ -797,7 +855,7 @@ pub(super) fn extract(
             {
                 continue;
             }
-            if sink.child_bytes(bytes, None)? {
+            if visit_dump(bytes, hooks.as_ref(), sink)? {
                 return Ok(Handling::Stopped);
             }
             continue;
@@ -857,7 +915,7 @@ pub(super) fn extract(
             }
             // A leading DCT stage stops stock's chain before the decrypted bytes are kept.
             if name.is_none() && matches!(obj.filters.as_slice(), [] | [Filter::Jpeg]) {
-                if physical_stream(&bytes[..end], content, sink)? {
+                if physical_stream(&bytes[..end], content, hooks.as_ref(), sink)? {
                     return Ok(Handling::Stopped);
                 }
                 continue;
@@ -880,7 +938,7 @@ pub(super) fn extract(
                     Output::Decoded(file) => decoded = Some(file),
                     Output::StageLimit(0, required) => {
                         sink.skip_declared_size(required);
-                        if physical_stream(&bytes[..end], content, sink)? {
+                        if physical_stream(&bytes[..end], content, hooks.as_ref(), sink)? {
                             return Ok(Handling::Stopped);
                         }
                         continue;
@@ -907,7 +965,9 @@ pub(super) fn extract(
                 loop {
                     match handler.decode(&obj, name, stream.bytes, retain, sink)? {
                         Output::Decoded(file) => {
-                            if file.with_bytes(|b| visit_stream(b, content, sink))? {
+                            if file
+                                .with_bytes(|b| visit_stream(b, content, hooks.as_ref(), sink))?
+                            {
                                 return Ok(Handling::Stopped);
                             }
                         }
@@ -922,7 +982,7 @@ pub(super) fn extract(
                         Output::StageLimit(index, required) => {
                             sink.skip_declared_size(required);
                             if index == 0 {
-                                if physical_stream(&bytes[..end], content, sink)? {
+                                if physical_stream(&bytes[..end], content, hooks.as_ref(), sink)? {
                                     return Ok(Handling::Stopped);
                                 }
                             } else {
@@ -940,6 +1000,11 @@ pub(super) fn extract(
         }
         if obj.filters.contains(&Filter::Crypt) {
             return Ok(Handling::Incomplete);
+        }
+        if let Some(hooks) = &mut hooks
+            && (!obj.filters.is_empty() || (length > 0 && bytes.len() > length.saturating_add(20)))
+        {
+            hooks.unknown_flags();
         }
         let input_bytes = ObjectBytes::Borrowed(&bytes[..end]);
         let mut directory = obj.directory;
@@ -977,7 +1042,7 @@ pub(super) fn extract(
                 };
                 if let Output::UseInput = result {
                     // The current stage still owns this borrowed input, including earlier filters' output.
-                    input_verdict = Some(visit_stream(data, content, sink)?);
+                    input_verdict = Some(visit_stream(data, content, hooks.as_ref(), sink)?);
                 }
                 Ok(result)
             };
@@ -1019,15 +1084,15 @@ pub(super) fn extract(
                     directory,
                     directories == 1,
                     &source,
-                    &mut pdf.lengths,
-                    &mut pdf.contents,
+                    &mut pdf,
+                    hooks.as_mut(),
                     sink,
                 )?;
                 (retain, sink.skip_declared_size(data.len() as u64))
             } else {
                 (false, false)
             };
-        if !skipped && visit_stream(data, content, sink)? {
+        if !skipped && visit_stream(data, content, hooks.as_ref(), sink)? {
             return Ok(Handling::Stopped);
         }
         if retain {
@@ -1035,23 +1100,41 @@ pub(super) fn extract(
         }
     }
     if let Some(packed) = packed {
+        if packed.obfuscated_name
+            && let Some(hooks) = &mut hooks
+        {
+            hooks.obfuscated_name();
+        }
         pdf.obfuscated_name |= packed.obfuscated_name;
-        let result = packed.finish(retained.as_ref().map(AsRef::as_ref), sink)?;
+        let result = packed.finish(retained.as_ref().map(AsRef::as_ref), hooks.as_ref(), sink)?;
         if result != Handling::Complete {
             return Ok(result);
         }
     }
-    if pdf.obfuscated_name && sink.report_heuristic("Heuristics.PDF.ObfuscatedNameObject") {
+    if let Some(hooks) = &hooks
+        && let Some(result) = hooks.finish(sink)?
+    {
+        return Ok(result);
+    }
+    if options.heuristic_alerts
+        && pdf.obfuscated_name
+        && sink.report_heuristic("Heuristics.PDF.ObfuscatedNameObject")
+    {
         return Ok(Handling::Stopped);
     }
     Ok(Handling::Complete)
 }
 
-fn physical_stream(data: &[u8], content: bool, sink: &mut dyn ChildSink) -> io::Result<bool> {
+fn physical_stream(
+    data: &[u8],
+    content: bool,
+    hooks: Option<&Hooks<'_>>,
+    sink: &mut dyn ChildSink,
+) -> io::Result<bool> {
     if sink.skip_declared_size(data.len() as u64) {
         return Ok(false);
     }
-    visit_stream(data, content, sink)
+    visit_stream(data, content, hooks, sink)
 }
 
 fn record_child_limit(size: u64, sink: &mut dyn ChildSink) {
@@ -1060,16 +1143,43 @@ fn record_child_limit(size: u64, sink: &mut dyn ChildSink) {
     }
 }
 
-fn visit_stream(data: &[u8], content: bool, sink: &mut dyn ChildSink) -> io::Result<bool> {
+fn visit_stream(
+    data: &[u8],
+    content: bool,
+    hooks: Option<&Hooks<'_>>,
+    sink: &mut dyn ChildSink,
+) -> io::Result<bool> {
     if sink.child_limit().is_some() {
         record_child_limit(data.len() as u64, sink);
         return Ok(false);
     }
-    if sink.child_bytes(data, None)? {
+    if visit_dump(data, hooks, sink)? {
         return Ok(true);
     }
     if content {
         return scan_page_text(data, sink);
+    }
+    Ok(false)
+}
+
+fn visit_dump(
+    data: &[u8],
+    hooks: Option<&Hooks<'_>>,
+    sink: &mut dyn ChildSink,
+) -> io::Result<bool> {
+    let post = hooks.filter(|_| {
+        sink.child_limit().is_none() && !data.is_empty() && (data.len() as u64) <= sink.remaining()
+    });
+    if sink.child_bytes(data, None)? {
+        return Ok(true);
+    }
+    if let Some(hooks) = post
+        && matches!(
+            hooks.run(PdfPhase::PostDump, data, sink)?,
+            PdfHookControl::Found
+        )
+    {
+        return Ok(true);
     }
     Ok(false)
 }

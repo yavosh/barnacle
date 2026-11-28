@@ -253,14 +253,29 @@ impl Packed {
         directory: Directory,
         sole_directory: bool,
         source: &ObjectBytes<'_>,
-        lengths: &mut HashMap<Id, usize>,
-        contents: &mut HashSet<Id>,
+        pdf: &mut super::Pdf<'_>,
+        mut hooks: Option<&mut super::Hooks<'_>>,
         sink: &mut dyn ChildSink,
     ) -> io::Result<bool> {
         let data = source.as_ref();
         let Some((index, body)) = data.split_at_checked(directory.first) else {
+            if let Some(hooks) = hooks {
+                hooks.unknown_objects();
+            }
             return Ok(false);
         };
+        // Packed starts refer to the decoded carrier. Verify its simple numeric
+        // directory before exposing these offsets to the bytecode API.
+        if let Some(hooks) = hooks.as_deref_mut() {
+            for chunk in index.chunks(super::TOKEN_BLOCK) {
+                sink.check()?;
+                if !chunk.iter().all(|b| b.is_ascii_digit() || white(*b)) {
+                    hooks.unknown_objects();
+                    break;
+                }
+            }
+        }
+        let initial_count = self.count;
         let available = MAX_OBJECTS - self.count;
         let opening = directory.opening(index, body, available, sink)?;
         // The PDF already owns stored carriers. Keep a decoded carrier only
@@ -284,6 +299,9 @@ impl Packed {
             if n >= available {
                 self.defer(&[], Deferred::Unsupported, None, sink)?;
                 break;
+            }
+            if let Some(hooks) = hooks.as_deref_mut() {
+                hooks.add_object((id, 0), directory.first + start);
             }
             let selected = opening.is_some_and(|open| open.child == n);
             let source_offset = retain.then_some(directory.first + start);
@@ -322,7 +340,7 @@ impl Packed {
                     value.next_checked(&mut budget, sink)?;
                 }
                 if let Some(size) = value.integer_checked(&mut budget, sink)? {
-                    lengths.entry((id, 0)).or_insert(size);
+                    pdf.lengths.entry((id, 0)).or_insert(size);
                 }
                 continue;
             }
@@ -343,7 +361,7 @@ impl Packed {
                         }
                         match value.reference_checked(&mut budget, sink)? {
                             Some(id) if self.physical.contains(&id) => {
-                                contents.insert(id);
+                                pdf.contents.insert(id);
                             }
                             Some(id) if self.arrays.contains_key(&id) => {
                                 let item = &mut self.deferred[self.arrays[&id]];
@@ -375,6 +393,11 @@ impl Packed {
             if let Some(kind) = dump {
                 self.defer(bytes, kind, source_offset, sink)?;
             }
+        }
+        if self.count - initial_count != directory.members
+            && let Some(hooks) = hooks
+        {
+            hooks.unknown_objects();
         }
         Ok(retain)
     }
@@ -417,6 +440,7 @@ impl Packed {
     pub(super) fn finish(
         self,
         retained: Option<&[u8]>,
+        hooks: Option<&super::Hooks<'_>>,
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
         if self.deferred.is_empty() {
@@ -437,7 +461,7 @@ impl Packed {
                     return Ok(Handling::Incomplete);
                 };
                 let bytes = &data[start..start + item.size];
-                if sink.child_bytes(bytes, None)? {
+                if super::visit_dump(bytes, hooks, sink)? {
                     return Ok(Handling::Stopped);
                 }
                 if !matches!(item.kind, Deferred::Raw) && scan_page_text(bytes, sink)? {
