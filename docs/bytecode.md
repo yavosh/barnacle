@@ -41,7 +41,13 @@ The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
 The compiler accepts all 82 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and six `PE_UNPACKER` hooks.
 The archive test loads those modules into one generation and verifies each hook count.
-Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
+It also checks harmless PDF traversal with that generation using a test-only override of the official-feed gate.
+The daemon loads CBC members from the exact verified bytecode archive when `Bytecode yes` is enabled.
+It compiles the authenticated member bytes directly from memory.
+Local CBC files still require `BytecodeUnsigned yes`.
+`Bytecode no` skips CBC activation but still authenticates the pinned archive.
+The existing CVD scan policy returns an incomplete verdict before executing any matcher, including these modules.
+Broader verdict qualification remains open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
 ## Harmless stock control
@@ -166,9 +172,11 @@ Unsupported metadata produces an explicit error when a hook queries it.
 An uncertain END phase leaves the scan incomplete. [PDF hook comparisons](../tests/bytecode_reference.rs)
 
 The test invokes both verified modules directly at the PRE phase on an ordinary PDF.
-The daemon smoke comparison uses the signed archive in stock clamd and the extracted PDF modules in both daemons.
-All profiles report the escaped common-name alert and preserve their expected replies on ordinary documents and plain text.
-The Barnacle profile loads local CBCs under `BytecodeUnsigned yes`. Signed-feed activation remains open.
+The daemon smoke comparison uses all three signed archives in both daemons, plus separate profiles with extracted PDF modules.
+Local profiles report the escaped common-name alert and preserve their expected replies on ordinary documents and plain text.
+Full-archive qualification remains open: Barnacle's CVD policy prevents matching and suppresses this stock heuristic verdict.
+The daemon test asserts this existing policy with bytecode both enabled and disabled.
+Signed profiles use `BytecodeUnsigned no`; local profiles use `BytecodeUnsigned yes`.
 
 ```sh
 BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --test bytecode_reference stock_and_barnacle_run_verified_pdf_modules -- --ignored

@@ -179,12 +179,12 @@ impl LogicalIndex {
     }
 
     /// Compile ordinary logical signatures and bytecode triggers in source order.
-    pub fn load_with_bytecode(
+    pub fn load_with_bytecode<R: Read>(
         paths: &[(&Path, bool)],
         flevel: u32,
         ignored: &IgnoreSet,
         bytecode_timeout: Duration,
-        mut open: impl FnMut(&Path) -> io::Result<File>,
+        mut open: impl FnMut(&Path) -> io::Result<R>,
     ) -> io::Result<Self> {
         let mut builder = Builder::default();
         let mut bytecode = HashMap::new();

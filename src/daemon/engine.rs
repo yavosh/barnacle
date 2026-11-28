@@ -9,6 +9,7 @@ use barnacle::index::{self, Index};
 use barnacle::objects::{self, Limit, Options, Snapshot, Verdict};
 use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
 use nix::libc;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -236,12 +237,18 @@ impl Generation {
         let local_dir = temp.path().join("local");
         fs::create_dir(&local_dir)?;
         let mut paths = Vec::new();
+        let mut signed_bytecode = HashMap::new();
         let mut has_local_bytecode = false;
         for source in &inputs {
             let path = &source.path;
             let ext = extension(path);
             match ext.as_str() {
-                "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
+                "cvd" => cvd::extract(
+                    path,
+                    temp.path(),
+                    &mut paths,
+                    config.bytecode.then_some(&mut signed_bytecode),
+                )?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
                 "cbc" => {
                     has_local_bytecode = true;
@@ -314,7 +321,18 @@ impl Generation {
             PINNED_FLEVEL,
             &ignores,
             config.bytecode_timeout,
-            open_snapshot,
+            |path| -> io::Result<Box<dyn Read>> {
+                if path.parent() == Some(temp.path())
+                    && path.extension().is_some_and(|s| s == "cbc")
+                {
+                    let bytes = signed_bytecode
+                        .remove(path)
+                        .ok_or_else(|| invalid("missing verified bytecode member"))?;
+                    Ok(Box::new(io::Cursor::new(bytes)))
+                } else {
+                    Ok(Box::new(open_snapshot(path)?))
+                }
+            },
         )?
         .with_bytecode_debug(config.debug)
         .with_pcre_limits(config.pcre)
@@ -751,7 +769,7 @@ mod tests {
     #[ignore = "set BARNACLE_CVD_DIR to the verified FreshClam snapshot"]
     fn verified_archives_coexist_with_local_sources() {
         let snapshot = PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap());
-        let f = Fixture::new();
+        let mut f = Fixture::new();
         for (name, _, _) in cvd::PINNED {
             std::os::unix::fs::symlink(snapshot.join(name), f.config.database_directory.join(name))
                 .unwrap();
@@ -766,7 +784,7 @@ mod tests {
             "local.ldb",
             "MixedLogical;Target:0;0;6c6f63616c206c6f676963616c20736e617073686f742072656365697074\n",
         );
-        let db = Generation::load(&f.config).unwrap();
+        let mut db = Generation::load(&f.config).unwrap();
         assert!(db.version().starts_with("ClamAV 1.4.3/28187/"));
         let local = hash_reader(&bytes[..])
             .unwrap()
@@ -781,8 +799,11 @@ mod tests {
                 .unwrap(),
             Some("MixedBody.UNOFFICIAL")
         );
-        // The pinned archives contain 312,303 eligible logical records.
-        assert_eq!(db.logical.rule_count(), 312_304);
+        // The pinned archives add 80 indexed CBC prefilters to 312,303 logical records.
+        assert_eq!(db.logical.rule_count(), 312_384);
+        assert_eq!(db.logical.pdf_hooks().unwrap().programs.len(), 2);
+        assert_eq!(db.logical.pe_hooks().unwrap().programs.len(), 2);
+        assert_eq!(db.logical.pe_hooks().unwrap().unpackers.len(), 6);
         assert_eq!(db.logical.icon_rule_count(), 222);
         let logical_control = b"local logical snapshot receipt";
         assert_eq!(
@@ -807,5 +828,36 @@ mod tests {
             ScanResult::Incomplete
         ));
         assert!(db.scan(&bytes[..]).unwrap().is_none());
+        // Qualify traversal with this attached generation without changing the production CVD gate.
+        // This override is confined to the ignored test; misses still remain incomplete.
+        db.partial_only = false;
+        db.needs_hashes = db.has_hash_rules;
+        for escaped in [false, true] {
+            let key = if escaped { "Ty#70e" } else { "Type" };
+            let mut pdf = format!("%PDF-1.5\n1 0 obj\n<< /{key} /Catalog >>\nendobj\n");
+            let xref = pdf.len();
+            pdf.push_str(&format!(
+                "xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            ));
+            let result = db.scan_checked(pdf.as_bytes(), || Ok(())).unwrap();
+            if escaped {
+                assert!(
+                    matches!(result, ScanResult::Found(hit) if hit.name == "Heuristics.PDF.ObfuscatedNameObject")
+                );
+            } else {
+                assert!(matches!(result, ScanResult::Incomplete));
+            }
+        }
+        drop(db);
+        f.config.bytecode = false;
+        let disabled = Generation::load(&f.config).unwrap();
+        assert_eq!(disabled.logical.rule_count(), 312_304);
+        assert!(disabled.logical.pdf_hooks().is_none());
+        assert!(disabled.logical.pe_hooks().is_none());
+        drop(disabled);
+        // Disabling execution must not bypass authentication of the required archive.
+        fs::remove_file(f.config.database_directory.join("bytecode.cvd")).unwrap();
+        f.write("bytecode.cvd", "unverified archive");
+        assert!(Generation::load(&f.config).is_err());
     }
 }

@@ -56,7 +56,8 @@ pub const PINNED_ARCHIVE: (&str, u64, &str) = (
 );
 pub const MAX_MEMBER_BYTES: u64 = 1024 * 1024;
 
-fn visit_verified_members(
+/// Visit CBC members only after authenticating the exact pinned archive generation.
+pub fn visit_verified_members(
     input: impl Read,
     mut visit: impl FnMut(&Path, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {

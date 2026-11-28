@@ -1115,23 +1115,44 @@ fn stock_and_barnacle_run_verified_pdf_modules() -> io::Result<()> {
     let prefixed = [b" \n".as_slice(), &ordinary].concat();
     let stock = Path::new("/usr/sbin/clamd");
     let barnacle = Path::new(env!("CARGO_BIN_EXE_barnacle"));
-    for (label, executable, signed, miss) in [
-        ("stock archive", stock, true, STOCK_MISS),
-        ("stock local PDF modules", stock, false, STOCK_MISS),
-        ("Barnacle local PDF modules", barnacle, false, PARTIAL_MISS),
+    for (label, executable, signed, enabled, miss) in [
+        ("stock archive disabled", stock, true, false, STOCK_MISS),
+        (
+            "Barnacle archive disabled",
+            barnacle,
+            true,
+            false,
+            PARTIAL_MISS,
+        ),
+        ("stock archive", stock, true, true, STOCK_MISS),
+        ("Barnacle archive", barnacle, true, true, PARTIAL_MISS),
+        ("stock local PDF modules", stock, false, true, STOCK_MISS),
+        (
+            "Barnacle local PDF modules",
+            barnacle,
+            false,
+            true,
+            PARTIAL_MISS,
+        ),
     ] {
         let root = tempfile::tempdir_in("/tmp")?;
         let db = root.path().join("db");
         fs::create_dir(&db)?;
         if signed {
             fs::write(db.join(archive_name), &archive)?;
+            for name in ["daily.cvd", "main.cvd"] {
+                std::os::unix::fs::symlink(Path::new(&snapshot).join(name), db.join(name))?;
+            }
         } else {
             for (index, contents) in modules.iter().enumerate() {
                 fs::write(db.join(format!("module-{index}.cbc")), contents)?;
             }
         }
         let unsigned = if signed { "no" } else { "yes" };
-        let options = format!("BytecodeUnsigned {unsigned}\nBytecodeMode ForceInterpreter\n");
+        let bytecode = if enabled { "yes" } else { "no" };
+        let options = format!(
+            "Bytecode {bytecode}\nBytecodeUnsigned {unsigned}\nBytecodeMode ForceInterpreter\n"
+        );
         let (_daemon, socket) = start(root.path(), executable, &options)?;
         for (case, bytes, expected) in [
             ("ordinary PDF", ordinary.as_slice(), miss),
@@ -1140,11 +1161,16 @@ fn stock_and_barnacle_run_verified_pdf_modules() -> io::Result<()> {
             (
                 "escaped common name",
                 escaped.as_slice(),
-                "stream: Heuristics.PDF.ObfuscatedNameObject FOUND\0",
+                if signed && executable == barnacle {
+                    // The production CVD policy stops before all matchers, with either bytecode policy.
+                    PARTIAL_MISS
+                } else {
+                    "stream: Heuristics.PDF.ObfuscatedNameObject FOUND\0"
+                },
             ),
         ] {
             let reply = unix_request(&socket, &stream_frame(bytes)?)?;
-            assert!(reply == expected, "{label}: unexpected verdict for {case}");
+            assert_eq!(reply, expected, "{label}: {case}");
         }
     }
     Ok(())
