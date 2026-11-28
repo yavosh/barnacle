@@ -9,9 +9,10 @@ mod scalar;
 mod zip;
 
 use daemon::{Daemon, stream_frame, unix_request};
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MARKER: &[u8] = b"CLAMAV-TEST-STRING-NOT-EICAR";
@@ -602,4 +603,102 @@ fn barnacle_pdf_hook_execution() -> io::Result<()> {
 fn stock_pdf_hook_execution() -> io::Result<()> {
     verify_stock()?;
     compare_pdf_hooks(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd and BARNACLE_CVD_DIR"]
+fn stock_and_barnacle_run_verified_pdf_modules() -> io::Result<()> {
+    use barnacle::PINNED_FLEVEL;
+    use barnacle::bytecode::{PINNED_ARCHIVE, PdfHookContext, PdfHookResult, PdfPhase, Program};
+    use std::time::Duration;
+
+    verify_stock()?;
+    let snapshot = std::env::var_os("BARNACLE_CVD_DIR")
+        .ok_or_else(|| io::Error::other("set BARNACLE_CVD_DIR to the verified snapshot"))?;
+    let (archive_name, size, digest) = PINNED_ARCHIVE;
+    let mut archive = Vec::new();
+    fs::File::open(Path::new(&snapshot).join(archive_name))?
+        .take(size + 1)
+        .read_to_end(&mut archive)?;
+    let actual: String = Sha256::digest(&archive)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(archive.len() as u64, size);
+    assert_eq!(actual, digest);
+
+    let (ordinary, _, _) = receipt_pdf(false);
+    let before_discovery = PdfHookContext {
+        phase: PdfPhase::Pre,
+        flags: Some(0),
+        objects: Some(&[]),
+        start: 0,
+        size: ordinary.len(),
+    };
+    let mut modules = Vec::new();
+    let mut tar = tar::Archive::new(GzDecoder::new(&archive[512..]));
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.extension().and_then(|s| s.to_str()) != Some("cbc") {
+            continue;
+        }
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents)?;
+        if let Ok(Some(program)) = Program::compile(&contents, u64::from(PINNED_FLEVEL))
+            && program.is_pdf_hook()
+        {
+            let mut entered = false;
+            let outcome = program.run_pdf(
+                &ordinary,
+                before_discovery,
+                false,
+                Duration::from_secs(10),
+                || {
+                    entered = true;
+                    Ok(())
+                },
+            )?;
+            assert!(entered && matches!(outcome, PdfHookResult::Continue));
+            modules.push(contents);
+        }
+    }
+    assert_eq!(modules.len(), 2);
+
+    let (escaped, _, _) = receipt_pdf(true);
+    let prefixed = [b" \n".as_slice(), &ordinary].concat();
+    let stock = Path::new("/usr/sbin/clamd");
+    let barnacle = Path::new(env!("CARGO_BIN_EXE_barnacle"));
+    for (label, executable, signed, miss) in [
+        ("stock archive", stock, true, STOCK_MISS),
+        ("stock local PDF modules", stock, false, STOCK_MISS),
+        ("Barnacle local PDF modules", barnacle, false, PARTIAL_MISS),
+    ] {
+        let root = tempfile::tempdir_in("/tmp")?;
+        let db = root.path().join("db");
+        fs::create_dir(&db)?;
+        if signed {
+            fs::write(db.join(archive_name), &archive)?;
+        } else {
+            for (index, contents) in modules.iter().enumerate() {
+                fs::write(db.join(format!("module-{index}.cbc")), contents)?;
+            }
+        }
+        let unsigned = if signed { "no" } else { "yes" };
+        let options = format!("BytecodeUnsigned {unsigned}\nBytecodeMode ForceInterpreter\n");
+        let (_daemon, socket) = start(root.path(), executable, &options)?;
+        for (case, bytes, expected) in [
+            ("ordinary PDF", ordinary.as_slice(), miss),
+            ("prefixed PDF", prefixed.as_slice(), miss),
+            ("plain text", b"ordinary office stationery".as_slice(), miss),
+            (
+                "escaped common name",
+                escaped.as_slice(),
+                "stream: Heuristics.PDF.ObfuscatedNameObject FOUND\0",
+            ),
+        ] {
+            let reply = unix_request(&socket, &stream_frame(bytes)?)?;
+            assert!(reply == expected, "{label}: unexpected verdict for {case}");
+        }
+    }
+    Ok(())
 }

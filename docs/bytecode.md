@@ -42,7 +42,7 @@ It also checks the Rust compiler against every eligible module.
 The compiler accepts 70 eligible modules, including 68 logical modules and both PDF hooks.
 The archive test loads those modules into one generation's logical index and PDF hook list.
 The inventory groups the remaining 12 eligible modules by the first compiler rejection.
-Eight require PE hooks. Four logical modules declare unsupported APIs.
+Eight require PE hooks with logical prefilters. Four logical modules declare unsupported APIs.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -134,6 +134,15 @@ The stock comparison checks prefixed offsets, object sizes, child precedence, an
 Conditional PDF hooks and unverified parser metadata remain unsupported.
 Unsupported metadata produces an explicit error when a hook queries it.
 An uncertain END phase leaves the scan incomplete. [PDF hook comparisons](../tests/bytecode_reference.rs)
+
+The test invokes both verified modules directly at the PRE phase on an ordinary PDF.
+The daemon smoke comparison uses the signed archive in stock clamd and the extracted PDF modules in both daemons.
+All profiles report the escaped common-name alert and preserve their expected replies on ordinary documents and plain text.
+The Barnacle profile loads local CBCs under `BytecodeUnsigned yes`. Signed-feed activation remains open.
+
+```sh
+BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --test bytecode_reference stock_and_barnacle_run_verified_pdf_modules -- --ignored
+```
 
 The reference enables `HeuristicAlerts` and disables `HeuristicScanPrecedence`.
 Default precedence lets later detections win over a deferred heuristic finding.
