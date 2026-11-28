@@ -76,6 +76,7 @@ struct PeHeaders {
 pub(crate) struct PeMetadata {
     sections: Vec<[u32; 9]>,
     entry: u32,
+    pub(crate) base_of_data: Option<u32>,
     headers: PeHeaders,
     file_size: usize,
 }
@@ -161,8 +162,16 @@ pub(crate) fn pe_metadata(bytes: &[u8]) -> Option<PeMetadata> {
         sections.push(section);
         Some(())
     })?;
+    // The PE32+ header places ImageBase where PE32 stores BaseOfData.
+    let base_of_data = if headers.optional_magic == 0x10b {
+        let header = bytes.get(headers.offset as usize..)?;
+        Some(Endian::Little.u32(header, 24 + 24)? as u32)
+    } else {
+        None
+    };
     Some(PeMetadata {
         sections,
+        base_of_data,
         entry: u32::try_from(executable.entry).ok()?,
         headers,
         file_size: bytes.len(),

@@ -730,6 +730,9 @@ fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Gl
                         52 | 280 if matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) => {
                             host::PeField::EntryRva
                         }
+                        60 if matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) => {
+                            host::PeField::BaseOfData
+                        }
                         632 if matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) => {
                             host::PeField::HeaderOffset
                         }

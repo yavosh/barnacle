@@ -89,6 +89,7 @@ pub(super) enum PeField {
     RawEntry,
     SectionCount,
     EntryRva,
+    BaseOfData,
     HeaderOffset,
     OptionalSize,
     OptionalMagic,
@@ -252,6 +253,9 @@ impl Operation {
                     PeField::RawEntry => pe.entry(),
                     PeField::SectionCount => u32::from(pe.section_count()),
                     PeField::EntryRva => pe.entry_rva(),
+                    PeField::BaseOfData => pe
+                        .base_of_data
+                        .ok_or_else(|| unsupported("BaseOfData outside PE32"))?,
                     PeField::HeaderOffset => pe.header_offset(),
                     PeField::OptionalSize => u32::from(pe.optional_size()),
                     PeField::OptionalMagic => u32::from(pe.optional_magic()),

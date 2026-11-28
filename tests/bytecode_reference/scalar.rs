@@ -510,8 +510,8 @@ pub fn output_probe(hook: u64, title: &str, finish: WriteFinish) -> String {
     )
 }
 
-pub fn pe_all_hook() -> String {
-    let mut globals = name_globals(0x8005, 11, 71);
+pub fn pe_fields(hook: u64) -> String {
+    let mut globals = name_globals(0x8005, 12, 71);
     global_pointer(&mut globals, 67, 0x8000, 0);
     global_pointer(&mut globals, 67, 0x8005, 0);
     for offset in [4, 52, 280, 632] {
@@ -520,6 +520,7 @@ pub fn pe_all_hook() -> String {
     for offset in [32, 264] {
         global_pointer(&mut globals, 66, 0x8003, offset);
     }
+    global_pointer(&mut globals, 67, 0x8003, 60);
     let equals = |dest, value| op(1, dest, 21, &[number(32), number(0), immediate(value, 4)]);
     let combine = || op(1, 1, 11, &[number(1), number(2)]);
     let mut checks = vec![
@@ -529,8 +530,16 @@ pub fn pe_all_hook() -> String {
         equals(2, u64::from(b'Y')),
         combine(),
     ];
-    // Match count, match offset, raw entry, both entry RVAs, and PE header offset.
-    for (index, expected) in [(3, 0), (4, 0), (5, 544), (6, 0x1020), (7, 0x1020), (8, 128)] {
+    // Match count, match offset, raw entry, both entry RVAs, PE header offset, and BaseOfData.
+    for (index, expected) in [
+        (3, 0),
+        (4, 0),
+        (5, 544),
+        (6, 0x1020),
+        (7, 0x1020),
+        (8, 128),
+        (11, 0x2000),
+    ] {
         checks.extend([
             op(32, 0, 39, &[pointer(index)]),
             equals(2, expected),
@@ -546,7 +555,7 @@ pub fn pe_all_hook() -> String {
     }
     checks.push(branch(1, 1, 2));
     program(
-        259,
+        hook,
         "Local.Receipt.Prefilter.{};Target:1;0;544:72656365697074",
         &[
             callable(&[32, 65, 32]),

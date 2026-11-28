@@ -39,9 +39,9 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 77 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and one `PE_UNPACKER`.
+The compiler accepts 78 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and two `PE_UNPACKER` hooks.
 The archive test loads those modules into one generation and verifies each hook count.
-Three remaining modules first require `extract_new`. One requires `get_environment`. One reads an unsupported 32-bit PE field at offset 60.
+Three remaining modules first require `extract_new`. One requires `get_environment`.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -136,7 +136,7 @@ The completion phase requires remaining parser flags. The post-extraction phase 
 [Pinned PE scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c) · [Pinned PDF scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pdf.c)
 
 Barnacle runs supported `PE_ALL` programs after overlay scanning. A matching logical prefilter enables the hook for that PE object.
-`PE_ALL` programs can read the entry RVA, PE header offset, optional header size, and optional header magic.
+PE hooks can read the entry RVA, PE header offset, optional header size and magic, and the PE32 `BaseOfData` field.
 The comparison covers earlier raw and overlay findings, sibling archive members, PE32+, and the `ScanPE` and unsigned bytecode options.
 On PE32+, the scan skips the overlay and hook phase. A `PE_ALL` break skips later PE checks.
 Barnacle runs supported `PE_UNPACKER` hooks when native UPX does not unpack the PE.
