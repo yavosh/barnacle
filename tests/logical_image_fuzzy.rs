@@ -162,6 +162,41 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         ],
     )?;
 
+    let large_png = encode(&DynamicImage::new_luma8(140_000, 1), ImageFormat::Png)?;
+    let header = "Logical.Header;Target:5;0;0:89504e470d0a1a0a\n";
+    let fuzzy = format!("Logical.Fuzzy;Engine:150-255,Target:5;0;{rule}\n");
+    let restricted =
+        format!("Logical.ZipImage;Engine:150-255,Target:5,Container:CL_TYPE_ZIP;0;{rule}\n");
+    let mixed = format!("Logical.Mixed;Engine:150-255,Target:5;0|1;0:89504e470d0a1a0a;{rule}\n");
+    let mixed_regex = format!(
+        "Logical.MixedRegex;Engine:150-255,Target:5;0|2;0:89504e470d0a1a0a;{rule};1/office/\n"
+    );
+    let impossible = format!("Logical.RequireBoth;Engine:150-255,Target:5;0&1;0:41424344;{rule}\n");
+    for (records, winner) in [
+        (format!("{restricted}{header}"), "Header"),
+        (format!("{header}{fuzzy}"), "Header"),
+        (mixed, "Mixed"),
+        (mixed_regex, "MixedRegex"),
+        (format!("{impossible}{header}"), "Header"),
+    ] {
+        fs::write(db.join("local.ldb"), &records)?;
+        let _daemon = Daemon::start(executable, &config, &socket)?;
+        assert_eq!(
+            unix_request(&socket, &stream_frame(&large_png)?)?,
+            format!("stream: Logical.{winner}.UNOFFICIAL FOUND\0"),
+            "{records}"
+        );
+    }
+    if !stock {
+        let generic_header = header.replace("Target:5", "Target:0");
+        fs::write(db.join("local.ldb"), format!("{generic_header}{fuzzy}"))?;
+        let _daemon = Daemon::start(executable, &config, &socket)?;
+        assert_eq!(
+            unix_request(&socket, &stream_frame(&large_png)?)?,
+            "stream: image fuzzy hash exceeds the decoded image budget. ERROR\0"
+        );
+    }
+
     fs::write(
         db.join("local.ldb"),
         format!("Logical.Image;Engine:150-255,Target:0;0;fuzzy_img#{HASH}#1\n"),

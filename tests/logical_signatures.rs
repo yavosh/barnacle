@@ -283,6 +283,25 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         )?;
     }
     modifiers(|rules, cases| scan(rules, "", "", cases, RAW_OPTIONS))?;
+    if !stock {
+        // Pinned clamd's LDB tokenizer rejects this valid PCRE child before PCRE sees it.
+        scan(
+            &logical(
+                "RegexBackslash",
+                ANY,
+                "1&2",
+                &format!(r"{LEDGER};0/credit\\/;{DEBIT}"),
+            ),
+            "",
+            "",
+            &[
+                (&binary(b"ledger credit\\ debit"), Some("RegexBackslash")),
+                (&binary(b"ledger credit debit"), None),
+                (&binary(b"ledger credit\\"), None),
+            ],
+            RAW_OPTIONS,
+        )?;
+    }
     pcre(|rules, cases, options| scan(rules, "", "", cases, options))
 }
 
@@ -499,6 +518,22 @@ fn pcre(run: impl Fn(&str, &[(&[u8], Option<&str>)], &str) -> io::Result<()>) ->
         &[
             (&binary(b"ledger credit;note debit"), Some("RegexSemicolon")),
             (&binary(b"ledger credit note debit"), None),
+        ],
+        RAW_OPTIONS,
+    )?;
+    run(
+        &logical(
+            "RegexEscapedSlash",
+            ANY,
+            "1&2",
+            &format!(r"{LEDGER};0/credit\/note;paid/;{DEBIT}"),
+        ),
+        &[
+            (
+                &binary(b"ledger credit/note;paid debit"),
+                Some("RegexEscapedSlash"),
+            ),
+            (&binary(b"ledger credit/note;paid"), None),
         ],
         RAW_OPTIONS,
     )?;
