@@ -15,7 +15,7 @@ The raw engine inventory lists individual submodules, including disabled entries
 | Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, AutoIt EA05 and EA06, InstallShield, and embedded PE resources. [AutoIt comparisons](../tests/object_autoit.rs) · [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
-| Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Image heuristics and executable unpacking remain open. [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
+| Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover UPX NRV PE32, Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Other unpackers and image heuristics remain open. [UPX comparisons](../tests/object_upx.rs) · [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
 
 The engine also enables password support for archives and format-specific detection heuristics.
 The reference image lacks an installed UnRAR helper even though its engine configuration lists RAR.
@@ -142,9 +142,70 @@ Both also match an outer PE hash before processing a nested PE resource.
 `ScanPE no` disables nested PE extraction. `MaxEmbeddedPE` includes an exact-size resource, and zero disables the size cap.
 [ELF comparisons](../tests/object_macho.rs) · [Embedded PE comparisons](../tests/object_embedded.rs)
 
-Barnacle does not unpack executables. Stock runs its UPX, FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
-Those stages belong to [#4](https://github.com/yavosh/barnacle/issues/4). A packed executable without an earlier match returns incomplete coverage, never a clean result.
-Matching stock's unpacked bytes also depends on the licensing review in [#17](https://github.com/yavosh/barnacle/issues/17). [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
+Barnacle unpacks UPX 4.2.4 PE32 executables that use NRV2B, NRV2D, or NRV2E.
+Before decoding, stock rounds the UPX0 and UPX1 virtual sizes up to 0x1000 and adds them.
+It checks that sum against `MaxFileSize` and the remaining `MaxScanSize`. Barnacle applies the same check.
+Barnacle rebuilds only the layout that the tests verify. It scans the rebuilt image as a child object.
+In that layout, the file alignment is 0x200, and UPX1's raw pointer is a multiple of it.
+UPX0 starts at RVA 0x1000, and the stream starts 0x15 bytes into UPX1.
+The original sections are contiguous, so stock's sequential layout and the RVA layout agree.
+Other layouts return incomplete coverage.
+A whole-file hash of the packed file wins over the unpacked child. `ScanPE no` disables unpacking.
+For a crafted NRV2D file, stock used an NRV2B decoding that ran past the declared stream size to an end marker.
+Barnacle returns incomplete coverage when any other NRV decoder reaches an end marker in the rest of the file.
+It also returns incomplete coverage when the declared decoder does not yield exactly the declared sizes.
+The same applies when the last `PE\0\0` in the decompressed data is not a valid PE32 header.
+For some of these files, stock builds a different image, scans the raw decompressed data, or decodes nothing.
+Barnacle does not unpack LZMA streams, DLL stubs, PE32+ files, or other UPX versions.
+Stock did not unpack the LZMA, DLL, or PE32+ fixtures either. [UPX comparisons](../tests/object_upx.rs)
+
+The benchmark used the 23,552-byte `rich-nrv2b.exe` and one local hash for its 73,728-byte rebuilt child.
+It used one pinned ARM64 CPU, 2 GiB of memory, no swap, and disabled scan caching.
+The Rust driver checked every INSTREAM reply. Each median comes from three fresh containers per engine and phase.
+One client sent the first request after daemon readiness. Four clients sent 256 requests each in the sustained run.
+
+| Daemon | First request (ms) | Sustained scans/s | Sustained p95 (ms) | Sustained peak cgroup memory (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Barnacle | 0.46 | 4,105 | 1.83 | 3.54 |
+| Debian clamd 1.4.3+dfsg-1 | 1.42 | 1,441 | 6.13 | 6.00 |
+
+Cgroup memory includes the driver and any file-backed pages charged to the container.
+The release executable SHA-256 was `107b9436619a39621ece90d5a0ef4eae84e1a5125ddcc29dc37b0b93b184065b`.
+Use the archive benchmark procedure with `rich-nrv2b.exe` as the input.
+Load `698e5c674981701552d61d76f56f6bff:73728:Workspace.Reference` as the only rule.
+[Raw measurements](benchmarks/object-upx.csv) · [Benchmark procedure](benchmarks/object-decoder-workspace.md#reproduction)
+
+A second benchmark added a 262,144-row inventory resource to the same GUI program.
+The packed file is 2,417,664 bytes and the stock child is 14,458,880 bytes.
+Five rounds used the same container settings. The sustained run sent 16 requests per client.
+All 650 replies matched the same local hash rule. Stock's sustained p95 ranged from 230 to 1,611 ms.
+
+| Daemon | First request (ms) | Sustained scans/s | Sustained p95 (ms) | Sustained peak cgroup memory (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Barnacle | 34.90 | 29.58 | 141 | 70.64 |
+| Debian clamd 1.4.3+dfsg-1 | 59.79 | 17.83 | 239 | 223.65 |
+
+Generate the resource using the fixture sources, i686 MinGW GCC 16.2.0, and GNU windres 2.47.20260726.
+Pack the result with Debian `upx-ucl` 4.2.4-1.1. [Debian package](https://packages.debian.org/trixie/arm64/upx-ucl)
+
+```sh
+fixture_dir=$(mktemp -d)
+cp tests/fixtures/upx/rich.c tests/fixtures/upx/rich.rc "$fixture_dir"
+cd "$fixture_dir"
+awk 'BEGIN { for (i = 0; i < 262144; i++) printf "%06d,consignment,letter folders,shelf %03d,carton %03d\n", i, i % 251, i % 131 }' > inventory.csv
+printf '\n%s\n' '2 RCDATA "inventory.csv"' >> rich.rc
+i686-w64-mingw32-windres rich.rc -O coff -o rich.res
+i686-w64-mingw32-gcc -O2 -s -mwindows -Wl,--no-insert-timestamp -o inventory.exe rich.c rich.res -ladvapi32 -luser32
+upx-ucl -q -9 --nrv2b -o inventory-nrv2b.exe inventory.exe
+```
+
+Load `f1115e67ad8ce1425b5e945896ce4316:14458880:Workspace.Reference` as the only rule.
+The packed fixture SHA-256 was `297ef42f6d4249288d1cab6f9f0a772a12eb8b95ea8841dae9de4749eb25edad`. [Raw measurements](benchmarks/object-upx-inventory.csv)
+
+Stock also runs FSG, MEW, Upack, Petite, PESpin, yC, WWPack, ASPack, and NsPack unpackers after its PE heuristics and bytecode hooks.
+Those stages belong to [#26](https://github.com/yavosh/barnacle/issues/26). Other UPX releases belong to [#24](https://github.com/yavosh/barnacle/issues/24). A packed executable without an earlier match returns incomplete coverage, never a clean result.
+The UPX code follows the NRV bit-stream format and stock's observed output, not ClamAV source.
+The rebuilt image keeps stock's fixed DOS header and stub, so unpacked-child hashes match stock. The licensing decision in [#17](https://github.com/yavosh/barnacle/issues/17) keeps these bytes. [Reference PE pipeline](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c)
 
 A Java 17 interface matched its target-12 body signature both directly and inside a JAR.
 A Java 11 class matched its whole-file hash in both locations. Stock treated the Java 21 control as generic data.
