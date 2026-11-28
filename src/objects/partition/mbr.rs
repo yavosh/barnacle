@@ -83,8 +83,20 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
     if sink.skip_declared_size(SECTOR as u64) {
         return Ok(Handling::Complete);
     }
+    let check_intersections = sink.check_partition_intersections() && sink.child_limit().is_none();
     if sink.child_bytes(&bytes[..SECTOR], None)? {
         return Ok(Handling::Stopped);
+    }
+    if check_intersections {
+        let ranges = table
+            .iter()
+            .take(sink.max_partitions())
+            .map(|e| (e.kind != 0).then_some((e.start, e.start + e.length)));
+        if super::intersects(ranges, sink)?
+            && sink.partition_intersection("Heuristics.MBRPartitionnIntersect")
+        {
+            return Ok(Handling::Stopped);
+        }
     }
     let mut seen = 0;
     for e in table {

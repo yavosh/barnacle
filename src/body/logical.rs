@@ -7,12 +7,14 @@ use super::logical_pcre::{PcreLimits, RegexChild};
 use super::search::{STOCK_WINDOW, SearchEvent};
 use super::{ObjectContext, Offset, Pattern, Rule, SearchIndex, Target, invalid, level};
 use crate::IgnoreSet;
+use crate::bytecode::{MAX_MEMBER_BYTES, Program};
 use crate::objects::Layer;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const MAX_LINE: usize = 32768;
 const MAX_CHILDREN: usize = 64;
@@ -151,6 +153,8 @@ pub struct LogicalIndex {
     icons: IconDatabase,
     max_icons: usize,
     search: SearchIndex,
+    bytecode: HashMap<u32, Program>,
+    bytecode_timeout: Duration,
 }
 
 impl LogicalIndex {
@@ -158,12 +162,60 @@ impl LogicalIndex {
         paths: &[(&Path, bool)],
         flevel: u32,
         ignored: &IgnoreSet,
+        open: impl FnMut(&Path) -> io::Result<File>,
+    ) -> io::Result<Self> {
+        Self::load_with_bytecode(paths, flevel, ignored, Duration::ZERO, open)
+    }
+
+    /// Compile ordinary logical signatures and bytecode triggers in source order.
+    pub fn load_with_bytecode(
+        paths: &[(&Path, bool)],
+        flevel: u32,
+        ignored: &IgnoreSet,
+        bytecode_timeout: Duration,
         mut open: impl FnMut(&Path) -> io::Result<File>,
     ) -> io::Result<Self> {
         let mut builder = Builder::default();
+        let mut bytecode = HashMap::new();
         for &(path, official) in paths {
             let file = open(path)
                 .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cbc"))
+            {
+                let located =
+                    |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+                let mut contents = Vec::new();
+                file.take(MAX_MEMBER_BYTES + 1)
+                    .read_to_end(&mut contents)
+                    .map_err(located)?;
+                if let Some(program) =
+                    Program::compile(&contents, u64::from(flevel)).map_err(located)?
+                {
+                    let id = builder.records.len();
+                    builder
+                        .add(program.trigger(), true, flevel, ignored)
+                        .map_err(located)?;
+                    if let Some(record) = builder.records.get(id) {
+                        if record
+                            .conditions
+                            .attributes
+                            .as_ref()
+                            .is_some_and(|attributes| {
+                                attributes.handler.is_some() || attributes.icon_groups.is_some()
+                            })
+                        {
+                            return Err(located(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "bytecode trigger requires handler or icon evaluation",
+                            )));
+                        }
+                        bytecode.insert(id as u32, program);
+                    }
+                }
+                continue;
+            }
             let mut reader = BufReader::new(file);
             let mut line = String::new();
             for number in 1.. {
@@ -212,6 +264,8 @@ impl LogicalIndex {
             image_fuzzy_enabled: true,
             icons: IconDatabase::default(),
             max_icons: 100,
+            bytecode,
+            bytecode_timeout,
             regexes: builder.regexes,
             zero_triggers: builder.zero_triggers,
             pcre_limits: PcreLimits::default(),
@@ -495,11 +549,12 @@ impl LogicalIndex {
             if e.is_some_and(|e| !self.expressions[rule.expression].matches(&e.counts)) {
                 continue;
             }
-            if rule
-                .conditions
-                .attributes
-                .as_deref()
-                .is_some_and(|a| a.icon_groups.is_some() || rescan && a.handler.is_some())
+            if (!self.bytecode.is_empty() && self.bytecode.contains_key(&id))
+                || rule
+                    .conditions
+                    .attributes
+                    .as_deref()
+                    .is_some_and(|a| a.icon_groups.is_some() || rescan && a.handler.is_some())
             {
                 pending.push(key);
             } else {
@@ -512,6 +567,25 @@ impl LogicalIndex {
         let mut handlers = Vec::new();
         let mut icon_samples = None;
         for (_, id) in pending {
+            if let Some(program) = self.bytecode.get(&id) {
+                let start = Instant::now();
+                let mut expired = false;
+                let result = program.run(|| {
+                    check()?;
+                    if !self.bytecode_timeout.is_zero() && start.elapsed() >= self.bytecode_timeout
+                    {
+                        expired = true;
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    Ok(())
+                });
+                // Stock proceeds with the rest of the scan after a bytecode-only timeout.
+                if !expired && let Some(name) = result? {
+                    finding = Ok(Some(name));
+                    break;
+                }
+                continue;
+            }
             let rule = &self.records[id as usize];
             let attributes = rule
                 .conditions

@@ -446,8 +446,11 @@ The MBR boot sector also consumes a file slot. An oversized first APM partition 
 Stock finds the legacy APM with a map at byte 512. It misses the same payload with a native map at byte 2048.
 ZIP ancestry, container signatures, recursion, scan size, and file-count limits have paired controls. [Partition comparisons](../tests/object_partition.rs)
 
-Stock-only controls record the three intersection heuristic names and their order against a matching partition signature.
-Barnacle's heuristic matcher still needs that coverage. Vendor-specific extended layouts and non-ASCII partition names need additional comparisons.
+With `AlertPartitionIntersection yes`, both daemons report intersections in the primary MBR table, GPT tables, and APM entries.
+A matching member wins by default. With `HeuristicScanPrecedence yes`, the intersection wins before members.
+An MBR whole-image or boot-sector match still wins first. The partition setting remains effective with `HeuristicAlerts no`.
+When different deferred heuristic names compete, stock can report different names across daemon starts. Barnacle returns an incomplete scan.
+Vendor-specific extended layouts and non-ASCII partition names need additional comparisons. [Partition comparisons](../tests/object_partition.rs)
 
 ### HFS+ and HFSX partitions
 

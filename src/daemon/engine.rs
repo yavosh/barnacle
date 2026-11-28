@@ -4,6 +4,7 @@ mod raw;
 
 use super::Config;
 use barnacle::body::{BodyIndex, LogicalIndex};
+use barnacle::bytecode::MAX_MEMBER_BYTES;
 use barnacle::index::{self, Index};
 use barnacle::objects::{self, Limit, Options, Snapshot, Verdict};
 use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
@@ -235,12 +236,29 @@ impl Generation {
         let local_dir = temp.path().join("local");
         fs::create_dir(&local_dir)?;
         let mut paths = Vec::new();
+        let mut has_local_bytecode = false;
         for source in &inputs {
             let path = &source.path;
             let ext = extension(path);
             match ext.as_str() {
                 "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
+                "cbc" => {
+                    has_local_bytecode = true;
+                    if !config.bytecode || !config.bytecode_unsigned {
+                        continue;
+                    }
+                    if source.length > MAX_MEMBER_BYTES {
+                        return Err(invalid(format!(
+                            "bytecode database exceeds 1 MiB: {}",
+                            path.display()
+                        )));
+                    }
+                    let output =
+                        local_dir.join(path.file_name().expect("directory entry has a name"));
+                    source.copy_to(&output)?;
+                    paths.push((output, false));
+                }
                 "hdb" | "hsb" | "ndb" | "ndu" | "ldb" | "ldu" | "ign" | "ign2" | "fp" | "sfp"
                 | "idb" => {
                     let output =
@@ -258,7 +276,7 @@ impl Generation {
         for (path, official) in &paths {
             let group = match extension(path).as_str() {
                 "ndb" | "ndu" => &mut body_paths,
-                "ldb" | "ldu" => &mut logical_paths,
+                "ldb" | "ldu" | "cbc" => &mut logical_paths,
                 "idb" => {
                     icon_paths.push(path.as_path());
                     continue;
@@ -268,7 +286,10 @@ impl Generation {
             group.push((path.as_path(), *official));
         }
         let (mut feed, ignores) = if hash_paths.is_empty()
-            && (!body_paths.is_empty() || !logical_paths.is_empty() || !icon_paths.is_empty())
+            && (has_local_bytecode
+                || !body_paths.is_empty()
+                || !logical_paths.is_empty()
+                || !icon_paths.is_empty())
         {
             (Feed::default(), IgnoreSet::default())
         } else {
@@ -288,11 +309,16 @@ impl Generation {
             Ok(file)
         };
         let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, open_snapshot)?;
-        let logical =
-            LogicalIndex::load_with(&logical_paths, PINNED_FLEVEL, &ignores, open_snapshot)?
-                .with_pcre_limits(config.pcre)
-                .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
-                .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
+        let logical = LogicalIndex::load_with_bytecode(
+            &logical_paths,
+            PINNED_FLEVEL,
+            &ignores,
+            config.bytecode_timeout,
+            open_snapshot,
+        )?
+        .with_pcre_limits(config.pcre)
+        .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
+        .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }

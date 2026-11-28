@@ -20,6 +20,9 @@ pub(super) struct Config {
     pub official_database_only: bool,
     pub fail_if_cvd_older_than: Option<u64>,
     pub detect_pua: bool,
+    pub bytecode: bool,
+    pub bytecode_unsigned: bool,
+    pub bytecode_timeout: Duration,
     pub stream_max_length: u64,
     pub objects: Options,
     pub pcre: PcreLimits,
@@ -71,6 +74,9 @@ impl Default for Config {
             official_database_only: false,
             fail_if_cvd_older_than: None,
             detect_pua: false,
+            bytecode: true,
+            bytecode_unsigned: false,
+            bytecode_timeout: Duration::from_millis(10_000),
             stream_max_length: 100 << 20,
             objects: Options::default(),
             pcre: PcreLimits::default(),
@@ -150,6 +156,10 @@ impl Config {
                 self.fail_if_cvd_older_than = Some(number(value)?).filter(|d| *d > 0)
             }
             "DetectPUA" => self.detect_pua = boolean(value)?,
+            "Bytecode" => self.bytecode = boolean(value)?,
+            "BytecodeUnsigned" => self.bytecode_unsigned = boolean(value)?,
+            "BytecodeTimeout" => self.bytecode_timeout = Duration::from_millis(number(value)?),
+            "BytecodeMode" if matches!(value, "Auto" | "ForceInterpreter") => {}
             "MaxFileSize" => self.objects.max_file_size = size(value)?,
             "MaxScanSize" => self.objects.max_scan_size = size(value)?,
             "MaxFiles" => self.objects.max_files = number(value)?,
@@ -157,6 +167,15 @@ impl Config {
             "MaxRecursion" => self.objects.max_recursion = number(value)?,
             "MaxRecHWP3" => self.objects.max_rec_hwp3 = number(value)?,
             "AlertExceedsMax" => self.objects.alert_exceeds_max = boolean(value)?,
+            "AlertPartitionIntersection" => {
+                self.objects.alert_partition_intersection = boolean(value)?
+            }
+            "HeuristicScanPrecedence" => self.objects.heuristic_scan_precedence = boolean(value)?,
+            "HeuristicAlerts" => {
+                // Partition and scan-limit alerts use their own switches on the pinned daemon.
+                boolean(value)?;
+                self.partial_engine_options.push(key.into());
+            }
             "ScanArchive" => self.objects.scan_archive = boolean(value)?,
             "ScanPE" => self.objects.scan_pe = boolean(value)?,
             "MaxIconsPE" => self.max_icons_pe = number(value)?,
@@ -322,7 +341,7 @@ fn queue_limit(threads: usize, recursion: usize, requested: usize, descriptors: 
 
 fn reference_engine_value(key: &str, value: &str) -> bool {
     match key {
-        "AlgorithmicDetection" | "PhishingSignatures" | "PhishingScanURLs" | "Bytecode" => {
+        "AlgorithmicDetection" | "PhishingSignatures" | "PhishingScanURLs" => {
             boolean(value).ok() == Some(true)
         }
         "AlertEncrypted"
@@ -333,14 +352,12 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "PhishingAlwaysBlockCloak"
         | "PartitionIntersection"
         | "ScanPartialMessages"
-        | "HeuristicScanPrecedence"
         | "StructuredDataDetection"
         | "OLE2BlockMacros"
         | "ForceToDisk"
         | "DisableCertCheck" => boolean(value).ok() == Some(false),
         "BytecodeSecurity" => value == "TrustSigned",
         "MaxZipTypeRcg" => size(value).ok() == Some(1 << 20),
-        "BytecodeTimeout" => value == "60000" || value == "10000",
         _ => false,
     }
 }

@@ -1,5 +1,6 @@
 //! The byte-for-byte signed archives verified for the pinned ClamAV comparison.
 use super::invalid;
+use barnacle::bytecode::PINNED_ARCHIVE;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -18,11 +19,7 @@ pub(super) const PINNED: [(&str, u64, &str); 3] = [
         89_072_577,
         "0b2182d229f46981ec8f535382222f7c9dfdd656b250ad47988b910a8d302365",
     ),
-    (
-        "bytecode.cvd",
-        281_702,
-        "6d4aa01f219e988060fc419f495d07f27e0cdf1a2cccc065971da922c76f7ffb",
-    ),
+    PINNED_ARCHIVE,
 ];
 
 pub(super) fn extract(

@@ -124,13 +124,33 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
     }
     let primary = table(bytes, sector, 1, sink)?;
     let secondary = table(bytes, sector, bytes.len() / sector - 1, sink)?;
+    let secondary = secondary.filter(|s| primary.as_ref().is_none_or(|p| p.sum != s.sum));
+    if sink.check_partition_intersections() {
+        for table in primary.iter().chain(&secondary) {
+            let ranges = table
+                .entries
+                .iter()
+                .take(sink.max_partitions())
+                .map(|entry| {
+                    let start = u64le(entry, 32);
+                    let end = u64le(entry, 40);
+                    (start >= table.first && end <= table.last && start <= end)
+                        .then(|| (start, end + 1))
+                });
+            if super::intersects(ranges, sink)? {
+                if sink.partition_intersection("Heuristics.GPTPartitionIntersection") {
+                    return Ok(Handling::Stopped);
+                }
+                break;
+            }
+        }
+    }
     if let Some(p) = &primary
         && let Some(status) = p.scan(bytes, sector, sink)?
     {
         return Ok(status);
     }
     if let Some(s) = secondary
-        && primary.as_ref().is_none_or(|p| p.sum != s.sum)
         && let Some(status) = s.scan(bytes, sector, sink)?
     {
         return Ok(status);

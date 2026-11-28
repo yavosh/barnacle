@@ -4,9 +4,35 @@ mod gpt;
 mod mbr;
 
 use super::{ChildSink, Handling};
-use std::io;
+use std::{collections::BTreeMap, io};
 
 const SECTOR: usize = 512;
+
+// Each input pair is a start and an exclusive end in sectors. Until the
+// first intersection, only the preceding and following ranges can overlap.
+fn intersects(
+    ranges: impl Iterator<Item = Option<(u64, u64)>>,
+    sink: &mut dyn ChildSink,
+) -> io::Result<bool> {
+    let mut seen = BTreeMap::new();
+    for range in ranges {
+        sink.check()?;
+        let Some((start, end)) = range else { continue };
+        if seen
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, &previous_end)| start < previous_end)
+            || seen
+                .range(start..)
+                .next()
+                .is_some_and(|(&next, _)| next < end)
+        {
+            return Ok(true);
+        }
+        seen.insert(start, end);
+    }
+    Ok(false)
+}
 
 fn extent(bytes: &[u8], sector: usize, start: u64, count: u64) -> Option<&[u8]> {
     let offset = usize::try_from(start).ok()?.checked_mul(sector)?;
