@@ -77,6 +77,8 @@ pub(crate) struct PeMetadata {
     sections: Vec<[u32; 9]>,
     entry: u32,
     pub(crate) base_of_data: Option<u32>,
+    pub(crate) resource_rva: u32,
+    pub(crate) resource_size: u32,
     headers: PeHeaders,
     file_size: usize,
 }
@@ -169,9 +171,28 @@ pub(crate) fn pe_metadata(bytes: &[u8]) -> Option<PeMetadata> {
     } else {
         None
     };
+    let header = bytes.get(headers.offset as usize..)?;
+    let optional = header
+        .get(24..)?
+        .get(..usize::from(headers.optional_size))?;
+    let standard = if headers.optional_magic == 0x10b {
+        96
+    } else {
+        112
+    };
+    let (resource_rva, resource_size) = if Endian::Little.u32(optional, standard - 4)? > 2 {
+        (
+            Endian::Little.u32(optional, standard + 16)? as u32,
+            Endian::Little.u32(optional, standard + 20)? as u32,
+        )
+    } else {
+        (0, 0)
+    };
     Some(PeMetadata {
         sections,
         base_of_data,
+        resource_rva,
+        resource_size,
         entry: u32::try_from(executable.entry).ok()?,
         headers,
         file_size: bytes.len(),

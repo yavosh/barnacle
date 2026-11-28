@@ -106,6 +106,8 @@ pub(super) enum PeField {
     SectionCount,
     EntryRva,
     BaseOfData,
+    ResourceRva,
+    ResourceSize,
     HeaderOffset,
     OptionalSize,
     OptionalMagic,
@@ -303,6 +305,8 @@ impl Operation {
                     PeField::BaseOfData => pe
                         .base_of_data
                         .ok_or_else(|| unsupported("BaseOfData outside PE32"))?,
+                    PeField::ResourceRva => pe.resource_rva,
+                    PeField::ResourceSize => pe.resource_size,
                     PeField::HeaderOffset => pe.header_offset(),
                     PeField::OptionalSize => u32::from(pe.optional_size()),
                     PeField::OptionalMagic => u32::from(pe.optional_magic()),

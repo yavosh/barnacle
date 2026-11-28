@@ -574,8 +574,8 @@ pub fn output_probe(hook: u64, title: &str, finish: WriteFinish) -> String {
     )
 }
 
-pub fn pe_fields(hook: u64) -> String {
-    let mut globals = name_globals(0x8005, 12, 71);
+pub fn pe_fields(hook: u64, resource_rva: u64) -> String {
+    let mut globals = name_globals(0x8005, 18, 71);
     global_pointer(&mut globals, 67, 0x8000, 0);
     global_pointer(&mut globals, 67, 0x8005, 0);
     for offset in [4, 52, 280, 632] {
@@ -585,6 +585,12 @@ pub fn pe_fields(hook: u64) -> String {
         global_pointer(&mut globals, 66, 0x8003, offset);
     }
     global_pointer(&mut globals, 67, 0x8003, 60);
+    global_pointer(&mut globals, 67, 0x8003, 392);
+    global_pointer(&mut globals, 67, 0x8003, 396);
+    global_pointer(&mut globals, 67, 0x8003, 148);
+    global_pointer(&mut globals, 67, 0x8003, 152);
+    global_pointer(&mut globals, 67, 0x8003, 520);
+    global_pointer(&mut globals, 67, 0x8003, 524);
     let equals = |dest, value| op(1, dest, 21, &[number(32), number(0), immediate(value, 4)]);
     let combine = || op(1, 1, 11, &[number(1), number(2)]);
     let mut checks = vec![
@@ -594,7 +600,7 @@ pub fn pe_fields(hook: u64) -> String {
         equals(2, u64::from(b'Y')),
         combine(),
     ];
-    // Match count, match offset, raw entry, both entry RVAs, PE header offset, and BaseOfData.
+    // Match counts, entry metadata, BaseOfData, and all three resource-directory copies.
     for (index, expected) in [
         (3, 0),
         (4, 0),
@@ -603,6 +609,12 @@ pub fn pe_fields(hook: u64) -> String {
         (7, 0x1020),
         (8, 128),
         (11, 0x2000),
+        (12, resource_rva),
+        (13, if resource_rva == 0 { 0 } else { 16 }),
+        (14, resource_rva),
+        (15, if resource_rva == 0 { 0 } else { 16 }),
+        (16, resource_rva),
+        (17, if resource_rva == 0 { 0 } else { 16 }),
     ] {
         checks.extend([
             op(32, 0, 39, &[pointer(index)]),

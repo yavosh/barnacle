@@ -859,9 +859,18 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
     let mut marked = pe::benign_pe();
     marked[168..172].copy_from_slice(&0x1020u32.to_le_bytes());
     marked[176..180].copy_from_slice(&0x2000u32.to_le_bytes());
+    marked[264..268].copy_from_slice(&0x1100u32.to_le_bytes());
+    marked[268..272].copy_from_slice(&16u32.to_le_bytes());
+    marked[768..848].fill(0); // An empty resource-directory header and padding.
     marked[544..552].copy_from_slice(b"receiptY");
     let mut other_base = marked.clone();
     other_base[176..180].copy_from_slice(&0x3000u32.to_le_bytes());
+    let mut other_resource = marked.clone();
+    other_resource[264..268].copy_from_slice(&0x1200u32.to_le_bytes());
+    let mut other_resource_size = marked.clone();
+    other_resource_size[268..272].copy_from_slice(&32u32.to_le_bytes());
+    let mut absent_resource = marked.clone();
+    absent_resource[244..248].copy_from_slice(&2u32.to_le_bytes());
     let mut other_entry = marked.clone();
     other_entry[168..172].copy_from_slice(&0x1030u32.to_le_bytes());
     let mut prefilter_only = marked.clone();
@@ -902,12 +911,28 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
     )?;
     run_program(
         executable,
-        &scalar::pe_fields(257),
+        &scalar::pe_fields(257, 0x1100),
         options,
-        &[(&marked, true), (&other_base, false), (&pe64, false)],
+        &[
+            (&marked, true),
+            (&other_base, false),
+            (&other_resource, false),
+            (&other_resource_size, false),
+            (&absent_resource, false),
+            (&pe64, false),
+        ],
         miss,
     )?;
-    let program = scalar::pe_fields(259);
+    for hook in [257, 259] {
+        run_program(
+            executable,
+            &scalar::pe_fields(hook, 0),
+            options,
+            &[(&absent_resource, true), (&marked, false), (&pe64, false)],
+            miss,
+        )?;
+    }
+    let program = scalar::pe_fields(259, 0x1100);
     run_program(
         executable,
         &program,
@@ -916,6 +941,9 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
             (&marked, true),
             (&other_entry, false),
             (&other_base, false),
+            (&other_resource, false),
+            (&other_resource_size, false),
+            (&absent_resource, false),
             (&prefilter_only, false),
             (&hook_only, false),
             (&pe64, false),
