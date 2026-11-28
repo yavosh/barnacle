@@ -444,8 +444,8 @@ mod tests {
         assert_eq!(found.instructions, 15_034);
         assert_eq!(found.opcodes.len(), 44);
         assert_eq!(found.apis.len(), 28);
-        assert_eq!(found.compiled, 72);
-        assert_eq!(found.compile_errors.values().sum::<usize>(), 10);
+        assert_eq!(found.compiled, 73);
+        assert_eq!(found.compile_errors.values().sum::<usize>(), 9);
 
         let scratch = tempfile::tempdir()?;
         let mut sources = Vec::new();
@@ -464,8 +464,8 @@ mod tests {
             &crate::IgnoreSet::default(),
             |path| File::open(path),
         )?;
-        assert_eq!(sources.len(), 72);
-        assert_eq!(index.rule_count(), 70);
+        assert_eq!(sources.len(), 73);
+        assert_eq!(index.rule_count(), 71);
         assert_eq!(index.pe_hooks().unwrap().programs.len(), 1);
         assert_eq!(index.pdf_hooks().unwrap().programs.len(), 2);
         Ok(())

@@ -39,10 +39,10 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 72 eligible modules, including 69 logical modules, both PDF hooks, and one `PE_ALL` hook.
+The compiler accepts 73 eligible modules, including 70 logical modules, both PDF hooks, and one `PE_ALL` hook.
 The archive test loads those modules into one generation and verifies each hook count.
-The inventory groups the remaining 10 eligible modules by the first compiler rejection.
-Six use the PE unpacker hook. Three declare an unsupported host API. One needs pointer-to-integer conversion.
+The inventory groups the remaining nine eligible modules by the first compiler rejection.
+Six use the PE unpacker hook. Three declare the unsupported `disasm_x86` host API.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -68,6 +68,7 @@ Direct helper calls accept integers and byte pointers. Helpers can return intege
 Each call gets a fresh frame. A helper can write through a pointer to a live caller buffer.
 Calls share the scan object's cursor and execution deadline. The interpreter bounds stack depth and storage.
 The frame supports pointer arithmetic, loads, stores, byte swaps, and bounded memory operations.
+Heap pointer conversions use the pinned interpreter's object IDs and offsets. Frame and global conversions remain unsupported.
 Each invocation can allocate up to 1 MiB of heap payload across at most 4,096 allocations.
 Separate bounded storage tracks which heap bytes are initialized. Memory copies use at most 4 KiB of scratch space.
 The decoder accepts structured API declarations. General aggregate locals and struct field addressing remain unsupported.

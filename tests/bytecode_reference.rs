@@ -410,6 +410,13 @@ fn compare_memory_and_pe_queries(executable: &Path, miss: &str) -> io::Result<()
     let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
     run_program(
         executable,
+        &scalar::heap_pointer_integers(),
+        options,
+        &[(b"receipt\x04", true), (b"receipt\x05", false)],
+        miss,
+    )?;
+    run_program(
+        executable,
         &scalar::heap_search(),
         options,
         &[

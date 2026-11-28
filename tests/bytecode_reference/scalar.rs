@@ -1078,6 +1078,61 @@ pub fn direct_calls() -> String {
     )
 }
 
+pub fn heap_pointer_integers() -> String {
+    let cast = |dest, src| op(64, dest, 50, &[number(src)]);
+    let eq = |dest, lhs, rhs| op(1, dest, 21, &[number(64), number(lhs), rhs]);
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32]),
+            callable(&[65, 32]),
+            array(NAME.len() + 1, 8),
+        ],
+        &[
+            (SET_NAME, 69, "setvirusname"),
+            (BYTE_AT, 70, "file_byteat"),
+            (ALLOCATE, 71, "malloc"),
+        ],
+        name_globals(0, 3, 72),
+        &[65, 65, 64, 64, 64, 64, 64, 32, 64, 1, 1, 65, 64, 32],
+        &[
+            vec![
+                call_with_type(65, 0, ALLOCATE, &[immediate(12, 4)]),
+                op(65, 1, 35, &[number(65), number(0), immediate(4, 4)]),
+                cast(2, 0),
+                cast(3, 1),
+                op(64, 4, 2, &[number(3), number(2)]),
+                // Each pointer has an object ID in its high 32 bits.
+                eq(9, 2, immediate(8 << 32, 8)),
+                cast(5, 1),
+                eq(10, 3, number(5)),
+                op(1, 9, 11, &[number(9), number(10)]),
+                // The first subtraction wraps before the base address cancels.
+                op(64, 5, 2, &[immediate(4, 8), number(3)]),
+                op(64, 6, 1, &[number(5), number(2)]),
+                eq(10, 6, immediate(0, 8)),
+                op(1, 9, 11, &[number(9), number(10)]),
+                call_with_type(65, 11, ALLOCATE, &[immediate(0, 4)]),
+                cast(12, 11),
+                eq(10, 12, immediate(0, 8)),
+                op(1, 9, 11, &[number(9), number(10)]),
+                call_with_type(65, 11, ALLOCATE, &[immediate(8, 4)]),
+                cast(12, 11),
+                eq(10, 12, immediate(9 << 32, 8)),
+                op(1, 9, 11, &[number(9), number(10)]),
+                call(7, BYTE_AT, &[immediate(7, 4)]),
+                op(64, 8, 16, &[number(7)]),
+                eq(10, 4, number(8)),
+                op(1, 9, 11, &[number(9), number(10)]),
+                branch(9, 1, 2),
+            ],
+            vec![report(13), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
 pub fn heap_search() -> String {
     let mut globals = name_globals(0, 5, 73);
     global_array(&mut globals, 74, b"!AY");

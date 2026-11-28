@@ -1069,6 +1069,7 @@ enum Expression {
     FileByte(Value),
     Find(Address, Value, Option<Value>),
     Allocate(Value),
+    PointerToInt(usize),
     MemStr(Address, Value, Address, Value),
     Memory(MemoryOp),
     ByteSwap(Value, Width),
@@ -1093,6 +1094,7 @@ impl Expression {
             Self::Host(ref op) => return op.eval(locals, scan, check),
             Self::Pdf(ref query) => u64::from(query.eval(locals, scan.pdf, check)?),
             Self::Allocate(size) => locals.allocate(size.get(locals) as usize)?,
+            Self::PointerToInt(slot) => locals.pointer_integer(slot)?,
             Self::MemStr(ref haystack, hlen, ref needle, nlen) => {
                 let Some(h) = memory::outcome(haystack.read(locals, hlen.get(locals) as usize))?
                 else {
@@ -1419,6 +1421,19 @@ fn instruction(
         46..=48 if width.0 == 16 << (opcode - 46) => {
             Expression::ByteSwap(line.scalar(slots, width)?, width)
         }
+        50 if width.0 == 64 => {
+            if matches!(line.first(), Some(b'@'..=b'P')) {
+                return Err(unsupported("integer conversion of a non-register pointer"));
+            }
+            let slot = field(usize::try_from(field(line.number())?).ok())?;
+            let operand = field(slots.get(slot))?;
+            if operand.ty != BYTE_POINTER || operand.addressable {
+                return Err(unsupported(
+                    "integer conversion outside a byte pointer register",
+                ));
+            }
+            Expression::PointerToInt(slot)
+        }
         _ => return Err(unsupported("instruction opcode")),
     };
     Ok(Instruction::Write(dest, expr))
@@ -1725,7 +1740,7 @@ mod tests {
         assert!(Program::compile(text.as_bytes(), 55).unwrap().is_none());
         assert!(Program::compile(b"ClamBCai", 213).unwrap().is_none()); // Format 9.
         let mut unsupported = sample(true);
-        unsupported[6] = unsupported[6].replacen(&fixed(33, 2), &fixed(50, 2), 1);
+        unsupported[6] = unsupported[6].replacen(&fixed(33, 2), &fixed(49, 2), 1);
         assert_eq!(
             Program::compile(unsupported.join("\n").as_bytes(), 213)
                 .unwrap_err()

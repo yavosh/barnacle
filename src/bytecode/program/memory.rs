@@ -137,6 +137,8 @@ impl<'a> Storage<'a> {
 }
 
 const HEAP_TAG: u32 = 1 << 31;
+// Stock FLEVEL 213 reserves IDs 1..=6 for host globals and ID 7 for module data.
+const FIRST_HEAP_ID: u32 = 8;
 const HEAP_OBJECT_LIMIT: usize = 4096;
 
 struct Allocation {
@@ -211,6 +213,22 @@ impl<'a> Frame<'a> {
         });
         self.heap_bytes = total;
         Ok(u64::from(id) << 32)
+    }
+
+    pub(super) fn pointer_integer(&self, slot: usize) -> io::Result<u64> {
+        let encoded = self.get(slot);
+        if encoded == 0 {
+            return Ok(0);
+        }
+        let id = (encoded >> 32) as u32;
+        if id & HEAP_TAG == 0 {
+            return Err(unsupported("integer conversion of a frame address"));
+        }
+        let allocation = id ^ HEAP_TAG;
+        if self.heap.get(allocation as usize).is_none() {
+            return Err(unsupported("integer conversion of an unknown heap address"));
+        }
+        Ok((u64::from(FIRST_HEAP_ID + allocation) << 32) | u64::from(encoded as u32))
     }
 
     fn stack_object(&self, id: u32) -> Result<(&Storage<'a>, Slot), MemoryFault> {
@@ -463,6 +481,10 @@ impl MemoryOp {
                     .checked_mul(*stride)
                     .and_then(|n| n.checked_add(offset))
                     .ok_or(MemoryFault::Bounds)?;
+                // A negative heap offset changes the stock object ID through a borrow.
+                if object & HEAP_TAG != 0 && offset < 0 {
+                    return Err(MemoryFault::Bounds);
+                }
                 Ok((u64::from(object) << 32) | u64::from(offset as u32))
             }
             Self::Load(source, width) => {
@@ -667,6 +689,10 @@ mod tests {
             .unwrap();
         frame.set(1, addr);
         frame.enter(&child, &[Value::Local(1)])?;
+        assert_eq!(
+            frame.pointer_integer(0).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         Address::Pointer(0).write(&mut frame, b"abc").unwrap();
         let retired = MemoryOp::Gep(Address::Object(1), Value::Constant(0), 1)
             .eval(&mut frame, &[])
@@ -688,6 +714,8 @@ mod tests {
         assert_eq!(frame.allocate(0)?, 0);
         let ptr = frame.allocate(4)?;
         frame.set(0, ptr);
+        let below = MemoryOp::Gep(Address::Pointer(0), Value::Constant(u64::from(u32::MAX)), 1);
+        assert_eq!(below.eval(&mut frame, &[]), Err(MemoryFault::Bounds));
         let addr = Address::Pointer(0);
         assert_eq!(addr.read(&frame, 1), Err(MemoryFault::Uninitialized));
         MemoryOp::Read(addr, Value::Constant(4))
