@@ -106,6 +106,7 @@ The return value is the next absolute offset. The cursor stays in place.
 Comparison with pinned stock covered 6,384 instruction records, including operand metadata and result length.
 One verified module checks for `PUSHAD`. Paired daemon tests check the complete records and next offsets for `PUSHAD` and `PUSHA`.
 Another verified module checks for `BSWAP`. Tests cover all eight registers and confirm that the operand-size prefix preserves the 32-bit register.
+One verified module checks for `PUSH` with a 32-bit memory operand. Tests cover the `FF /6` memory and register forms.
 Paired daemon tests cover invalid instructions, EOF, and which result bytes change on failure.
 Unmodeled encodings return an explicit unsupported error. These include x87, indirect calls and jumps, and several two-byte groups.
 Programs that use first offsets currently require indexed pattern subsignatures.

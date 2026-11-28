@@ -350,7 +350,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
             match extension {
                 0 => 59, // INC
                 1 => 52, // DEC
-                2..=6 if opcode == 0xff => return Err(Error::Unsupported),
+                2..=5 if opcode == 0xff => return Err(Error::Unsupported),
+                6 if opcode == 0xff => 124, // PUSH
                 _ => return Err(Error::Invalid),
             }
         }
