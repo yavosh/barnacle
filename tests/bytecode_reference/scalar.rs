@@ -846,6 +846,33 @@ pub fn direct_read() -> String {
     )
 }
 
+/// Report when the selected PNG subsignature count is zero.
+pub fn image_count(slot: u64) -> String {
+    let mut globals = name_globals(0x8000, 4, 70);
+    global_pointer(&mut globals, 67, 0x8000, slot * 4);
+    image(
+        "0|1;0:89504e470d0a1a0a;fuzzy_img#e3f302e2c0e7ec51#0",
+        &[
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(64, 32),
+        ],
+        &[(SET_NAME, 69, "setvirusname")],
+        globals,
+        &[32, 1],
+        &[
+            vec![
+                op(32, 0, 39, &[pointer(3)]),
+                op(1, 1, 21, &[number(32), number(0), immediate(0, 4)]),
+                branch(1, 1, 2),
+            ],
+            vec![report(0), ret()],
+            vec![ret()],
+        ],
+    )
+    .replacen("Target:0;", "Engine:150-255,Target:5;", 1)
+}
+
 /// Observe the current file size, two matches, and a zero for an unused counter.
 pub fn scan_metadata() -> String {
     let mut globals = name_globals(0x8004, 6, 70);

@@ -161,6 +161,51 @@ impl Expression {
         }))
     }
 
+    /// Return a verdict when unknown child counts cannot change it.
+    pub(super) fn matches_with_unknown(&self, counts: &[u32; 64], unknown: u64) -> Option<bool> {
+        if unknown == 0 {
+            return Some(self.matches(counts));
+        }
+        let (affected, counted) = match &self.0 {
+            Program::All(ids) => (ids & unknown, false),
+            Program::Postfix { steps, .. } => {
+                let mut affected = 0;
+                let mut counted = false;
+                for step in steps {
+                    match *step {
+                        Instruction::Child(id) => affected |= (1u64 << id) & unknown,
+                        Instruction::Compare { .. } => counted = true,
+                        _ => {}
+                    }
+                }
+                (affected, counted)
+            }
+        };
+        if affected == 0 {
+            return Some(self.matches(counts));
+        }
+        if counted {
+            return None;
+        }
+        // Uncounted expressions are monotone in the presence of each child.
+        let mut bound = *counts;
+        let mut evaluate_bound = |value| {
+            let mut ids = affected;
+            while ids != 0 {
+                bound[ids.trailing_zeros() as usize] = value;
+                ids &= ids - 1;
+            }
+            self.matches(&bound)
+        };
+        if evaluate_bound(0) {
+            Some(true)
+        } else if !evaluate_bound(1) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn matches(&self, counts: &[u32]) -> bool {
         match &self.0 {
             Program::All(mask) => {

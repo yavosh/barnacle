@@ -1071,6 +1071,50 @@ fn compare_bytecode_write(executable: &Path, miss: &str) -> io::Result<()> {
         )],
     )?;
     run(scalar::write_probe(Return), "", "", "", &[(parent, miss)])?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_luma8(140_000, 1)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(io::Error::other)?;
+    let png = png.into_inner();
+    let budget_error = "stream: image fuzzy hash exceeds the decoded image budget. ERROR\0";
+    for (slot, expected) in [
+        (
+            1,
+            if miss == PARTIAL_MISS {
+                budget_error
+            } else {
+                &fallback
+            },
+        ),
+        (2, &fallback),
+    ] {
+        run(scalar::image_count(slot), "", "", "", &[(&png, expected)])?;
+    }
+    // A PNG-specific writer runs before the generic fuzzy rule. Resume after its child misses.
+    let image_writer = scalar::write_probe(Return).replacen(
+        "Target:0;0;72656365697074",
+        "Target:5;0;0:89504e470d0a1a0a",
+        1,
+    );
+    let fuzzy = "Local.Fuzzy;Engine:150-255,Target:0;0;fuzzy_img#e3f302e2c0e7ec51#0\n";
+    run(image_writer.clone(), "", &full, fuzzy, &[(&png, child)])?;
+    let unresolved = if miss == PARTIAL_MISS {
+        budget_error
+    } else {
+        miss
+    };
+    run(image_writer, "", "", fuzzy, &[(&png, unresolved)])?;
+    let pe_hook = scalar::pe_all_break().replace(
+        "Target:1;0;544:72656365697074",
+        "Engine:150-255,Target:5;0;fuzzy_img#e3f302e2c0e7ec51#0",
+    );
+    run(
+        pe_hook,
+        "",
+        "",
+        "Local.Header;Target:0;0;0:89504e470d0a1a0a\n",
+        &[(&png, "stream: Local.Header.UNOFFICIAL FOUND\0")],
+    )?;
     Ok(())
 }
 

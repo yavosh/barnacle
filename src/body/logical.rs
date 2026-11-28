@@ -137,6 +137,7 @@ struct Builder {
     zero_matches: Vec<u32>,
     byte_compares: HashMap<Target, Vec<(u32, ByteCompare)>>,
     images: HashMap<u64, Vec<ChildBinding>>,
+    image_owners: Vec<u32>,
     regexes: HashMap<u32, Box<[RegexChild]>>,
     zero_triggers: Vec<u32>,
 }
@@ -150,6 +151,7 @@ pub struct LogicalIndex {
     zero_matches: Vec<u32>,
     byte_compares: HashMap<Target, Vec<(u32, ByteCompare)>>,
     images: HashMap<u64, Vec<ChildBinding>>,
+    image_owners: Vec<u32>,
     regexes: HashMap<u32, Box<[RegexChild]>>,
     zero_triggers: Vec<u32>,
     pcre_limits: PcreLimits,
@@ -294,6 +296,7 @@ impl LogicalIndex {
             zero_matches: builder.zero_matches,
             byte_compares: builder.byte_compares,
             images: builder.images,
+            image_owners: builder.image_owners,
             image_fuzzy_enabled: true,
             icons: IconDatabase::default(),
             max_icons: 100,
@@ -565,8 +568,11 @@ impl LogicalIndex {
                 *step.as_mut().expect("traversal session").cursor = Some(Box::new(cursor));
                 return Ok(matches);
             }
-            if let Some((_, id)) = cursor.winner {
-                matches.finding = Ok(Some(self.records[id as usize].name.as_ref()));
+            if let Some(key) = cursor.winner {
+                matches.finding = match cursor.evidence.image_error {
+                    Some((unresolved, error)) if unresolved == key => Err(error),
+                    _ => Ok(Some(self.records[key.1 as usize].name.as_ref())),
+                };
                 return Ok(matches);
             }
             if cursor.restored || object.unmapped_script || object.script_source.is_none() {
@@ -669,33 +675,164 @@ impl LogicalIndex {
                 Ok(())
             },
         )?;
-        if self.image_fuzzy_enabled
-            && context.target() == Target::Graphics
-            && !self.images.is_empty()
-            && let Some(hash) = image_fuzzy::hash(bytes, &mut check)?
-            && let Some(bindings) = self.images.get(&hash)
-        {
+        let image_error =
+            self.scan_image(bytes, context, object, &mut evidence.matches, &mut check)?;
+        self.scan_regexes(bytes, context, object, &mut evidence.matches, &mut check)?;
+        if let Some(error) = image_error {
+            let regex_enabled = self.pcre_limits.max_file_size == 0
+                || bytes.len() as u64 <= self.pcre_limits.max_file_size;
+            if let Some(key) = self.unresolved_image(
+                context,
+                object,
+                &evidence.matches,
+                regex_enabled,
+                &mut check,
+            )? {
+                evidence.image_error = Some((key, error.to_string()));
+            }
+        }
+        Ok(evidence)
+    }
+
+    fn image_owner_accepts(
+        &self,
+        id: u32,
+        context: &ObjectContext,
+        object: &LogicalObject<'_>,
+    ) -> bool {
+        let conditions = &self.records[id as usize].conditions;
+        context.accepts(conditions.target)
+            && conditions.accepts(context, object)
+            && conditions
+                .attributes
+                .as_ref()
+                .is_none_or(|a| a.icon_groups.is_none())
+            && self
+                .pe_bytecode
+                .binary_search_by_key(&id, |&(id, _)| id)
+                .is_err()
+    }
+
+    fn scan_image(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: &LogicalObject<'_>,
+        evidence: &mut HashMap<u32, Evidence>,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<io::Error>> {
+        if !self.image_fuzzy_enabled || context.target() != Target::Graphics {
+            return Ok(None);
+        }
+        let mut eligible = false;
+        for owners in self.image_owners.chunks(256) {
+            check()?;
+            if owners
+                .iter()
+                .any(|&id| self.image_owner_accepts(id, context, object))
+            {
+                eligible = true;
+                break;
+            }
+        }
+        if !eligible {
+            return Ok(None);
+        }
+
+        let mut cancelled = false;
+        let hash = match image_fuzzy::hash(bytes, || {
+            let result = check();
+            cancelled = result.is_err();
+            result
+        }) {
+            Ok(Some(hash)) => hash,
+            Ok(None) => return Ok(None),
+            Err(error) if cancelled => return Err(error),
+            Err(error) => return Ok(Some(error)),
+        };
+        if let Some(bindings) = self.images.get(&hash) {
             for (i, binding) in bindings.iter().enumerate() {
                 if i % 256 == 0 {
                     check()?;
                 }
-                let record = &self.records[binding.owner as usize];
-                if context.accepts(record.conditions.target)
-                    && record.conditions.accepts(context, object)
-                {
-                    let entry = evidence
-                        .matches
-                        .entry(binding.owner)
-                        .or_insert_with(|| Evidence {
-                            counts: vec![0; record.children],
-                            last: vec![0; record.children],
-                        });
+                if self.image_owner_accepts(binding.owner, context, object) {
+                    let record = &self.records[binding.owner as usize];
+                    let entry = evidence.entry(binding.owner).or_insert_with(|| Evidence {
+                        counts: vec![0; record.children],
+                        last: vec![0; record.children],
+                    });
                     entry.counts[usize::from(binding.slot)] = 1;
                 }
             }
         }
-        self.scan_regexes(bytes, context, object, &mut evidence.matches, &mut check)?;
-        Ok(evidence)
+        Ok(None)
+    }
+
+    // One image can match only one exact hash. All slots for that hash change together.
+    fn unresolved_image(
+        &self,
+        context: &ObjectContext,
+        object: &LogicalObject<'_>,
+        evidence: &HashMap<u32, Evidence>,
+        regex_enabled: bool,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<(bool, u32)>> {
+        let zero = [0; MAX_CHILDREN];
+        let mut earliest = None;
+        let groups = self
+            .images
+            .values()
+            .flat_map(|bindings| bindings.chunk_by(|a, b| a.owner == b.owner));
+        for (i, group) in groups.enumerate() {
+            if i % 256 == 0 {
+                check()?;
+            }
+            let id = group[0].owner;
+            let rule = &self.records[id as usize];
+            let key = (rule.conditions.target == Target::Generic, id);
+            if earliest.is_some_and(|known| known <= key)
+                || !self.image_owner_accepts(id, context, object)
+            {
+                continue;
+            }
+            let expr = &self.expressions[rule.expression];
+            let known = evidence
+                .get(&id)
+                .map_or(&zero[..rule.children], |e| e.counts.as_slice());
+            let mut alternate = zero;
+            alternate[..known.len()].copy_from_slice(known);
+            for binding in group {
+                alternate[usize::from(binding.slot)] = 1;
+            }
+            let mut unknown = 0;
+            if regex_enabled && let Some(children) = self.regexes.get(&id) {
+                // Triggers refer only to earlier slots. A previously run regex
+                // has the same hit count whenever its trigger stays true.
+                for child in children {
+                    let ran = child.trigger.matches(known);
+                    match child.trigger.matches_with_unknown(&alternate, unknown) {
+                        Some(false) => alternate[child.slot] = 0,
+                        Some(true) if ran => {}
+                        None if ran && known[child.slot] == 0 => {}
+                        _ => unknown |= 1u64 << child.slot,
+                    }
+                }
+            }
+            let matched = expr.matches(known);
+            // A triggered logical program can also inspect counts outside its expression.
+            let changed_input = matched
+                && self.bytecode.get(&id).is_some_and(|program| {
+                    let slots = program.match_count_slots;
+                    slots & unknown != 0
+                        || known.iter().enumerate().any(|(slot, count)| {
+                            slots & (1u64 << slot) != 0 && *count != alternate[slot]
+                        })
+                });
+            if changed_input || expr.matches_with_unknown(&alternate, unknown) != Some(matched) {
+                earliest = Some(key);
+            }
+        }
+        Ok(earliest)
     }
 
     fn scan_regexes(
@@ -759,7 +896,7 @@ impl LogicalIndex {
         // Each target's logical table is evaluated in load order after scanning.
         // The specific target precedes generic. Only touched records and those
         // known to pass with all-zero counts can win.
-        let mut winner = None;
+        let mut winner = evidence.image_error.as_ref().map(|(key, _)| *key);
         let mut pending = Vec::new();
         let candidates = evidence.matches.iter().map(|(&id, e)| (id, Some(e))).chain(
             self.zero_matches
@@ -833,6 +970,7 @@ struct Evidence {
 struct ScanEvidence {
     matches: HashMap<u32, Evidence>,
     first_offsets: HashMap<u32, [u32; MAX_CHILDREN]>,
+    image_error: Option<((bool, u32), String)>,
 }
 
 impl Builder {
@@ -860,12 +998,12 @@ impl Builder {
         // The stock LDB tokenizer permits semicolons between the two PCRE slashes.
         // Preserve the true arity when diagnosing an unsupported child or filtering Engine.
         let mut in_regex = false;
-        let mut previous = ';';
+        let mut escaped = false;
         let fields = text.split(move |ch| {
-            if ch == '/' && previous != '\\' {
+            if ch == '/' && !escaped {
                 in_regex = !in_regex;
             }
-            previous = ch;
+            escaped = ch == '\\' && !escaped;
             ch == ';' && !in_regex
         });
         let children = fields.clone().count();
@@ -906,6 +1044,9 @@ impl Builder {
             }
             if field.starts_with("fuzzy_img#") {
                 let hash = image_fuzzy::parse(field).map_err(located)?;
+                if self.image_owners.last() != Some(&id) {
+                    self.image_owners.push(id);
+                }
                 self.images.entry(hash).or_default().push(ChildBinding {
                     owner: id,
                     slot: i as u8,

@@ -26,6 +26,7 @@ pub struct Program {
     trigger: Box<str>,
     functions: Vec<Function>,
     uses_match_offsets: bool,
+    pub(crate) match_count_slots: u64,
     pub(crate) writes_output: bool,
 }
 
@@ -199,14 +200,20 @@ impl Program {
                 blocks,
             });
         }
-        let uses_match_offsets = functions
-            .iter()
-            .flat_map(|f| f.blocks.iter().flatten())
-            .any(|op| matches!(op, Instruction::Write(_, Expression::MatchOffset(_))));
+        let mut uses_match_offsets = false;
+        let mut match_count_slots = 0;
+        for instruction in functions.iter().flat_map(|f| f.blocks.iter().flatten()) {
+            match instruction {
+                Instruction::Write(_, Expression::MatchOffset(_)) => uses_match_offsets = true,
+                Instruction::Write(_, Expression::MatchCount(i)) => match_count_slots |= 1u64 << i,
+                _ => (),
+            }
+        }
         Ok(Some(Self {
             hook,
             trigger: trigger.into(),
             uses_match_offsets,
+            match_count_slots,
             writes_output: apis.contains(&host::WRITE),
             functions,
         }))
