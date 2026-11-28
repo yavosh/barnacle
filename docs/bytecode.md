@@ -124,6 +124,11 @@ Stock runs PDF hooks before discovery, after discovery, after recursive child sc
 The completion phase requires remaining parser flags. The post-extraction phase sees the extracted bytes.
 [Pinned PE scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c) · [Pinned PDF scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pdf.c)
 
+Both signed PDF hooks query the current phase and configuration functionality level, which is 213.
+One queries document flags. The other uses discovery order, object offsets, and object spans.
+Post-extraction calls retain the parent object table while reading extracted bytes.
+[Pinned bytecode host APIs](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.c)
+
 The reference enables `HeuristicAlerts` and disables `HeuristicScanPrecedence`.
 Default precedence lets later detections win over a deferred heuristic finding.
 Use the effective daemon options and engine module flags together to determine which detectors run.
@@ -132,7 +137,7 @@ Use the effective daemon options and engine module flags together to determine w
 | Enabled stock detector | Barnacle verification |
 | --- | --- |
 | PE heuristics for Parite, Kriz, Magistr, and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
-| PDF obfuscated names | Barnacle parses escaped PDF names. The `Heuristics.PDF.ObfuscatedNameObject` verdict remains open. |
+| PDF obfuscated names | Stock comparisons cover physical and packed dictionaries, escaped Flate filters, and competing child signatures. |
 | RIFF and Mydoom log checks | Named finding parity is open. |
 | XZ dictionary limit | Barnacle bounds XZ reads. The `Heuristics.XZ.DicSizeLimit` verdict remains open. |
 | URL phishing checks | Verified URL rule loading and detection are tracked in [issue #10](https://github.com/yavosh/barnacle/issues/10). |

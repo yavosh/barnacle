@@ -352,6 +352,12 @@ A whole-file signature wins first. A ciphertext stream signature wins with defau
 The alert requires `ScanPDF yes`. Documents that open with an empty user password remain eligible for ordinary stream scanning.
 The controls include documents with extraction restrictions. A deferred PDF alert and a deferred limit can win on different daemon starts.
 Barnacle reports incomplete when that winner is ambiguous. [PDF alert comparisons](../tests/object_pdf_security.rs)
+
+With `HeuristicAlerts yes` and `ScanPDF yes`, Barnacle reports `Heuristics.PDF.ObfuscatedNameObject` for escaped common dictionary names.
+The check covers ordinary dictionaries and decoded object streams within supported PDF layouts.
+Supported escaped filter values still decode their streams. A child signature wins even with `HeuristicScanPrecedence yes`.
+PDF layouts that require unsupported extraction remain incomplete. [Name alert comparisons](../tests/object_pdf.rs) · [Packed dictionary comparison](../tests/object_pdf_streams.rs)
+
 Stock sets its attachment flag only when `/EmbeddedFile` appears before the filter list.
 Without that flag, a stream whose only filters are LZW or run-length is not scanned. The flag also selects the `/EFF` crypt filter.
 In encrypted documents, stock decrypts a stream before its LZW chain. A leading DCT stage keeps the ciphertext.

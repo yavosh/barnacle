@@ -544,3 +544,103 @@ fn stock_pdf_objects() -> io::Result<()> {
     assert_eq!(pin.stdout, b"1.4.3+dfsg-1");
     compare(Path::new("/usr/sbin/clamd"), true)
 }
+
+fn compare_name_alert(exe: &Path, stock: bool) -> io::Result<()> {
+    const ALERT: &str = "Heuristics.PDF.ObfuscatedNameObject";
+    const CONTENT: &[u8] = b"ordinary stationery order";
+    let clean = if stock {
+        "OK"
+    } else {
+        "Incomplete scan: unsupported detection coverage. ERROR"
+    };
+    let attachment = deflate(CONTENT)?;
+    let make_pdf = |key: &str, extra: &str, content: &[u8], filter: &str| {
+        pdf(&[
+            format!("<< /{key} /Catalog /Pages 2 0 R {extra} >>").into_bytes(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_vec(),
+            stream("", content),
+            stream(
+                &format!("/Type /EmbeddedFile /Filter /{filter}"),
+                &attachment,
+            ),
+        ])
+    };
+    let caption = b"BT (ordinary page contents) Tj ET";
+    let plain_filter = |key, extra, content| make_pdf(key, extra, content, "FlateDecode");
+    let ordinary = plain_filter("Type", "", caption);
+    let escaped = plain_filter("Ty#70e", "", caption);
+    let unknown = plain_filter("Type", "/Des#6bNote (office)", caption);
+    let title = plain_filter("Type", "/Tit#6ce (office)", caption);
+    let stream_name = plain_filter("Type", "", b"BT (/Ty#70e on the receipt) Tj ET");
+    let escaped_filter = make_pdf("Type", "", caption, "Fl#61teDecode");
+    let escaped_alias = make_pdf("Type", "", caption, "F#6c");
+
+    let root = tempfile::tempdir_in("/tmp")?;
+    let db = root.path().join("db");
+    fs::create_dir(&db)?;
+    let conf = root.path().join("clamd.conf");
+    let sock = root.path().join("sock");
+    for (options, child, verdict) in [
+        ("", false, ALERT),
+        ("HeuristicAlerts no", false, clean),
+        ("ScanPDF no", false, clean),
+        ("", true, "Pdf.Order.UNOFFICIAL"),
+        ("HeuristicScanPrecedence yes", true, "Pdf.Order.UNOFFICIAL"),
+    ] {
+        let marker = if child { CONTENT } else { b"other stationery" };
+        fs::write(
+            db.join("receipt.hdb"),
+            format!("{}:{}:Pdf.Order\n", hex(&Md5::digest(marker)), marker.len()),
+        )?;
+        fs::write(
+            &conf,
+            format!(
+                "Foreground yes\nDisableCache yes\nSelfCheck 0\nDatabaseDirectory {}\nLocalSocket {}\n{}\n",
+                db.display(),
+                sock.display(),
+                options,
+            ),
+        )?;
+        let daemon = Daemon::start(exe, &conf, &sock)?;
+        let check = |bytes: &[u8], want: &str| -> io::Result<()> {
+            let suffix = if matches!(want, "OK") || want.ends_with(" ERROR") {
+                ""
+            } else {
+                " FOUND"
+            };
+            assert_eq!(
+                unix_request(&sock, &stream_frame(bytes)?)?,
+                format!("stream: {want}{suffix}\0"),
+                "{options} child={child}"
+            );
+            Ok(())
+        };
+        for input in [&escaped, &escaped_filter, &escaped_alias] {
+            check(input, verdict)?;
+        }
+        if options.is_empty() && !child {
+            for input in [&ordinary, &unknown, &title, &stream_name] {
+                check(input, clean)?;
+            }
+        }
+        drop(daemon);
+        fs::remove_file(&sock)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn barnacle_pdf_name_alert() -> io::Result<()> {
+    compare_name_alert(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd package"]
+fn stock_pdf_name_alert() -> io::Result<()> {
+    let pin = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Version}", "clamav-daemon"])
+        .output()?;
+    assert_eq!(pin.stdout, b"1.4.3+dfsg-1");
+    compare_name_alert(Path::new("/usr/sbin/clamd"), true)
+}

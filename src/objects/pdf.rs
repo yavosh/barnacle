@@ -239,6 +239,7 @@ struct Object<'a> {
 struct Pdf<'a> {
     objects: Vec<Object<'a>>,
     count: usize,
+    obfuscated_name: bool,
     lengths: HashMap<Id, usize>,
     contents: HashSet<Id>,
     security: Option<security::Security>,
@@ -281,10 +282,98 @@ fn read_stream<'a>(
     Ok(None)
 }
 
+// Use the first complete dictionary in an object. Positions are relative to its body.
+#[derive(Default)]
+struct Dictionary {
+    start: usize,
+    depth: usize,
+    end: Option<usize>,
+}
+
+impl Dictionary {
+    fn observe(&mut self, token: &[u8], pos: usize) {
+        if self.end.is_some() {
+            return;
+        }
+        match token {
+            b"<<" => {
+                if self.depth == 0 {
+                    self.start = pos;
+                }
+                self.depth += 1;
+            }
+            b">>" if self.depth > 0 => {
+                self.depth -= 1;
+                if self.depth == 0 {
+                    self.end = Some(pos - 2);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn range(&self) -> Option<std::ops::Range<usize>> {
+        Some(self.start..self.end?)
+    }
+}
+
+#[derive(Default)]
+struct NameFlags {
+    embedded: bool,
+    obfuscated: bool,
+    escaped_child_structure: bool,
+}
+
+fn obfuscated_dictionary(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<bool> {
+    for chunk in bytes.chunks(TOKEN_BLOCK) {
+        sink.check()?;
+        if memchr::memchr(b'#', chunk).is_some() {
+            return Ok(name_flags(bytes, Some(0..bytes.len()), &mut || sink.check())?.obfuscated);
+        }
+    }
+    Ok(false)
+}
+
+fn read_name(bytes: &[u8], output: &mut [u8; 63]) -> (usize, usize, bool) {
+    let (mut at, mut len, mut escaped) = (0, 0, false);
+    while len < output.len() && at < bytes.len() {
+        let b = bytes[at];
+        if b == b'#' {
+            let Some(byte) = bytes
+                .get(at + 1..at + 3)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
+            else {
+                break;
+            };
+            output[len] = byte;
+            at += 3;
+            escaped = true;
+        } else if b" \t\r\n/>[]<(".contains(&b) {
+            break;
+        } else {
+            output[len] = b;
+            at += 1;
+        }
+        len += 1;
+    }
+    (at, len, escaped)
+}
+
+fn escaped_token<'a>(token: &[u8], output: &'a mut [u8; 63]) -> Option<&'a [u8]> {
+    let bytes = token.strip_prefix(b"/")?;
+    let (used, len, escaped) = read_name(bytes, output);
+    (escaped && used == bytes.len()).then_some(&output[..len])
+}
+
 // Stock reads every `/` in a dictionary through a small name state machine.
 // `/EmbeddedFile` sets its flag only in the idle state. `/Filter` keeps the
 // filter state until `/Length` or `/Crypt`, so a later type name is ignored.
-fn embedded_flag(dict: &[u8]) -> bool {
+fn name_flags(
+    dict: &[u8],
+    heuristic_range: Option<std::ops::Range<usize>>,
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<NameFlags> {
     #[derive(PartialEq)]
     enum State {
         Idle,
@@ -336,39 +425,66 @@ fn embedded_flag(dict: &[u8]) -> bool {
         b"Length",
     ];
     let mut state = State::Idle;
-    let mut flag = false;
+    let mut flags = NameFlags::default();
     let mut at = 0;
-    let mut name = Vec::with_capacity(63);
-    while let Some(slash) = memchr::memchr(b'/', &dict[at..]) {
-        at += slash + 1;
-        name.clear();
-        // The reference keeps at most 63 bytes and decodes `#xx` escapes.
-        while name.len() < 63 && at < dict.len() {
-            let b = dict[at];
-            if b == b'#' {
-                let Some(byte) = dict
-                    .get(at + 1..at + 3)
-                    .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
-                else {
-                    break;
-                };
-                name.push(byte);
-                at += 3;
-                continue;
-            }
-            if b" \t\r\n/>[]<(".contains(&b) {
-                break;
-            }
-            name.push(b);
-            at += 1;
+    let mut next_check = 0;
+    let mut name = [0; 63];
+    while at < dict.len() {
+        if at >= next_check {
+            check()?;
+            next_check = at.saturating_add(TOKEN_BLOCK);
         }
-        let name = name.as_slice();
+        let end = dict.len().min(next_check);
+        let Some(slash) = memchr::memchr(b'/', &dict[at..end]) else {
+            at = end;
+            continue;
+        };
+        at += slash + 1;
+        let start = at - 1;
+        let (used, len, escaped) = read_name(&dict[at..], &mut name);
+        at += used;
+        let name = &name[..len];
+        if escaped && heuristic_range.as_ref().is_some_and(|r| r.contains(&start)) {
+            let common = name.split(|&b| b == 0).next().unwrap_or_default();
+            // Packed action, content and filter layouts need their own child scheduling.
+            flags.escaped_child_structure |= FILTER_NAMES.contains(&common)
+                || matches!(
+                    common,
+                    b"Contents"
+                        | b"OpenAction"
+                        | b"JavaScript"
+                        | b"JS"
+                        | b"Launch"
+                        | b"Filter"
+                        | b"Linearized"
+                        | b"Image"
+                        | b"Catalog"
+                );
+            flags.obfuscated |= FILTER_NAMES.contains(&common)
+                || matches!(
+                    common,
+                    b"EmbeddedFile"
+                        | b"Image"
+                        | b"Type"
+                        | b"Page"
+                        | b"Linearized"
+                        | b"Contents"
+                        | b"S"
+                        | b"Filter"
+                        | b"Launch"
+                        | b"Sig"
+                        | b"V"
+                        | b"R"
+                        | b"JavaScript"
+                        | b"OpenAction"
+                );
+        }
         state = match name {
             b"Filter" => State::Filter,
             b"Launch" => State::Launch,
             b"Sig" | b"V" | b"R" | b"JavaScript" | b"OpenAction" => State::Idle,
             _ if IDLE_NAMES.contains(&name) && state == State::Idle => {
-                flag |= name == b"EmbeddedFile";
+                flags.embedded |= name == b"EmbeddedFile";
                 if name == b"S" { State::S } else { State::Idle }
             }
             _ if FILTER_NAMES.contains(&name) && state == State::Filter => {
@@ -387,7 +503,7 @@ fn embedded_flag(dict: &[u8]) -> bool {
             _ => state,
         };
     }
-    flag
+    Ok(flags)
 }
 
 fn trim_eol(bytes: &[u8]) -> &[u8] {
@@ -398,12 +514,17 @@ fn trim_eol(bytes: &[u8]) -> &[u8] {
         .unwrap_or(bytes)
 }
 
-fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<'a>>> {
+fn parse<'a>(
+    data: &'a [u8],
+    heuristic_alerts: bool,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Option<Pdf<'a>>> {
     let mut input = Tokens { data, pos: 0 };
     let mut token_budget = TokenBudget::default();
     let mut pdf = Pdf {
         objects: Vec::new(),
         count: 0,
+        obfuscated_name: false,
         lengths: HashMap::new(),
         contents: HashSet::new(),
         security: None,
@@ -445,6 +566,8 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
         let mut has_opening = false;
         let mut standard_filter = false;
         let mut escaped_name = None;
+        let mut dictionary = Dictionary::default();
+        let mut passive_escape = false;
         let mut encrypt_entry = false;
         let mut copy = input.clone();
         if let Some(n) = copy.next_checked(&mut token_budget, sink)?.and_then(number)
@@ -456,8 +579,18 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
             let Some(tok) = input.next_checked(&mut token_budget, sink)? else {
                 return Ok(None);
             };
+            dictionary.observe(tok, input.pos - obj.start);
             match tok {
                 b"endobj" => {
+                    if obj.encoded.is_none()
+                        && heuristic_alerts
+                        && !pdf.obfuscated_name
+                        && let Some(r) = dictionary.range()
+                    {
+                        let bytes = &data[obj.start + r.start..obj.start + r.end];
+                        pdf.obfuscated_name = obfuscated_dictionary(bytes, sink)?;
+                    }
+                    obj.unsupported |= passive_escape && (obj.encoded.is_some() || has_opening);
                     if let Some(name) = escaped_name {
                         obj.unsupported |= obj.encoded.is_none()
                             || !security::embedded_mime(&data[obj.start..input.pos], name);
@@ -482,7 +615,15 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                     break;
                 }
                 b"stream" => {
-                    obj.embedded = embedded_flag(&data[obj.start..input.pos]);
+                    let flags = name_flags(
+                        &data[obj.start..input.pos],
+                        dictionary
+                            .range()
+                            .filter(|_| heuristic_alerts && !pdf.obfuscated_name),
+                        &mut || sink.check(),
+                    )?;
+                    obj.embedded = flags.embedded;
+                    pdf.obfuscated_name |= flags.obfuscated;
                     obj.directory = object_stream::Directory::read(&data[obj.start..input.pos]);
                     let Some(encoded) = read_stream(&mut input, &mut || sink.check())? else {
                         return Ok(None);
@@ -548,7 +689,12 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 b"/Encrypt" if !encrypt_entry => encrypt_entry = true,
                 b"/Encrypt" => return Ok(None),
                 n if n.first() == Some(&b'/') && n.contains(&b'#') => {
-                    obj.unsupported |= escaped_name.replace(n).is_some();
+                    // These names alone add no child to an ordinary non-stream object.
+                    if matches!(escaped_token(n, &mut [0; 63]), Some(b"Type" | b"Page")) {
+                        passive_escape = true;
+                    } else {
+                        obj.unsupported |= escaped_name.replace(n).is_some();
+                    }
                 }
                 _ => (),
             }
@@ -598,7 +744,7 @@ pub(super) fn header_type(data: &[u8]) -> bool {
 
 pub(super) fn extract(
     data: &[u8],
-    alert_encrypted_doc: bool,
+    options: &super::Options,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Handling> {
     let Some(start) = data[..data.len().min(1032)]
@@ -608,11 +754,14 @@ pub(super) fn extract(
         return Ok(Handling::Complete);
     };
     let data = &data[start..];
-    let Some(mut pdf) = parse(data, sink)? else {
+    let Some(mut pdf) = parse(data, options.heuristic_alerts, sink)? else {
         return Ok(Handling::Incomplete);
     };
     sink.check()?;
-    if pdf.locked && alert_encrypted_doc && sink.report_heuristic("Heuristics.Encrypted.PDF") {
+    if pdf.locked
+        && options.alert_encrypted_doc
+        && sink.report_heuristic("Heuristics.Encrypted.PDF")
+    {
         return Ok(Handling::Stopped);
     }
     let directories = pdf
@@ -628,6 +777,7 @@ pub(super) fn extract(
             sink.temporary_directory(),
             sink.remaining(),
             pdf.count,
+            options.heuristic_alerts,
             pdf.objects
                 .iter()
                 .filter(|obj| obj.unsupported || obj.encoded.is_some() && !obj.raw_destination)
@@ -884,9 +1034,17 @@ pub(super) fn extract(
             retained = Some(source);
         }
     }
-    packed.map_or(Ok(Handling::Complete), |packed| {
-        packed.finish(retained.as_ref().map(AsRef::as_ref), sink)
-    })
+    if let Some(packed) = packed {
+        pdf.obfuscated_name |= packed.obfuscated_name;
+        let result = packed.finish(retained.as_ref().map(AsRef::as_ref), sink)?;
+        if result != Handling::Complete {
+            return Ok(result);
+        }
+    }
+    if pdf.obfuscated_name && sink.report_heuristic("Heuristics.PDF.ObfuscatedNameObject") {
+        return Ok(Handling::Stopped);
+    }
+    Ok(Handling::Complete)
 }
 
 fn physical_stream(data: &[u8], content: bool, sink: &mut dyn ChildSink) -> io::Result<bool> {

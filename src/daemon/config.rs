@@ -178,7 +178,7 @@ impl Config {
             "HeuristicScanPrecedence" => self.objects.heuristic_scan_precedence = boolean(value)?,
             "HeuristicAlerts" => {
                 // Partition, locked PDF and scan-limit alerts use independent switches.
-                boolean(value)?;
+                self.objects.heuristic_alerts = boolean(value)?;
                 self.partial_engine_options.push(key.into());
             }
             "ScanArchive" => self.objects.scan_archive = boolean(value)?,

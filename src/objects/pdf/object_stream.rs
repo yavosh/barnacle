@@ -223,6 +223,8 @@ pub(super) struct Packed {
     length: usize,
     spool_limit: u64,
     count: usize,
+    heuristic_alerts: bool,
+    pub(super) obfuscated_name: bool,
 }
 
 impl Packed {
@@ -230,6 +232,7 @@ impl Packed {
         directory: &Path,
         spool_limit: u64,
         count: usize,
+        heuristic_alerts: bool,
         physical: impl Iterator<Item = Id>,
     ) -> Self {
         Self {
@@ -240,6 +243,8 @@ impl Packed {
             length: 0,
             spool_limit,
             count,
+            heuristic_alerts,
+            obfuscated_name: false,
         }
     }
 
@@ -325,11 +330,11 @@ impl Packed {
                 continue;
             }
             let mut dump = selected.then_some(Deferred::Raw);
-            if super::embedded_flag(bytes) {
-                dump.get_or_insert(Deferred::Raw);
-            }
+            let mut dictionary = super::Dictionary::default();
+            dictionary.observe(b"<<", input.pos);
             let mut seen_opening = false;
             while let Some(token) = input.next_checked(&mut budget, sink)? {
+                dictionary.observe(token, input.pos);
                 match token {
                     b"/Contents" => {
                         let mut value = input.clone();
@@ -358,6 +363,14 @@ impl Packed {
                     }
                     _ => {}
                 }
+            }
+            let flags = super::name_flags(bytes, dictionary.range(), &mut || sink.check())?;
+            self.obfuscated_name |= self.heuristic_alerts && flags.obfuscated;
+            if flags.escaped_child_structure {
+                dump = Some(Deferred::Unsupported);
+            }
+            if flags.embedded {
+                dump.get_or_insert(Deferred::Raw);
             }
             if let Some(kind) = dump {
                 self.defer(bytes, kind, source_offset, sink)?;

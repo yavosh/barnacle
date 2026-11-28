@@ -25,14 +25,21 @@ pub(super) enum Output {
 
 impl Filter {
     pub(super) fn parse(name: &[u8]) -> Self {
+        if name == b"/Crypt" {
+            return Self::Crypt;
+        }
+        let Some(plain) = name.strip_prefix(b"/") else {
+            return Self::Unsupported;
+        };
+        let mut buffer = [0; 63];
+        let name = super::escaped_token(name, &mut buffer).unwrap_or(plain);
         match name {
-            b"/Crypt" => Self::Crypt,
-            b"/LZWDecode" | b"/LZW" => Self::Lzw,
-            b"/FlateDecode" | b"/Fl" => Self::Flate,
-            b"/ASCIIHexDecode" | b"/AHx" => Self::Hex,
-            b"/ASCII85Decode" | b"/A85" => Self::Ascii85,
-            b"/RunLengthDecode" | b"/RL" => Self::RunLength,
-            b"/DCTDecode" | b"/DCT" => Self::Jpeg,
+            b"LZWDecode" | b"LZW" => Self::Lzw,
+            b"FlateDecode" | b"Fl" => Self::Flate,
+            b"ASCIIHexDecode" | b"AHx" => Self::Hex,
+            b"ASCII85Decode" | b"A85" => Self::Ascii85,
+            b"RunLengthDecode" | b"RL" => Self::RunLength,
+            b"DCTDecode" | b"DCT" => Self::Jpeg,
             _ => Self::Unsupported,
         }
     }

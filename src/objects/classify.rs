@@ -351,7 +351,7 @@ impl Parser {
             Self::Pe {
                 overlay: Some(start),
             } if options.scan_pe => super::installer::legacy(&bytes[start..], sink),
-            Self::Pdf if options.scan_pdf => pdf::extract(bytes, options.alert_encrypted_doc, sink),
+            Self::Pdf if options.scan_pdf => pdf::extract(bytes, options, sink),
             Self::Text if options.scan_html && options.scan_normalized_script => {
                 text::after_raw(bytes, sink)
             }
