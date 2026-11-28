@@ -52,6 +52,14 @@ pub struct PdfHooks<'a> {
     pub timeout: Duration,
 }
 
+/// Scan-time settings for conditioned PE hooks in database order.
+#[derive(Clone, Copy)]
+pub struct PeHooks<'a> {
+    pub programs: &'a [(u32, Program)],
+    pub debug: bool,
+    pub timeout: Duration,
+}
+
 trait ChildSink {
     /// Visit one child synchronously. A true return stops traversal in this handler.
     fn child(
@@ -96,6 +104,7 @@ trait ChildSink {
         input: &[u8],
         context: PdfHookContext<'_>,
     ) -> io::Result<PdfHookControl>;
+    fn run_pe_all_hooks(&mut self, bytes: &[u8]) -> io::Result<Handling>;
 
     fn check(&mut self) -> io::Result<()>;
     fn at_root(&self) -> bool;
@@ -219,6 +228,8 @@ pub struct Object<'a> {
     pub logical_rescan: bool,
     pub logical: LogicalObject<'a>,
     pub handled_format: bool,
+    /// Matching PE prefilters belong to this map until its PE hook runs.
+    pub pe_hook_hits: Option<&'a mut Vec<u32>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -359,6 +370,8 @@ struct Traversal<'a> {
     deferred_heuristic: Option<Verdict>,
     last_handler_hash: [u8; 16],
     pdf_hooks: Option<PdfHooks<'a>>,
+    pe_hooks: Option<PeHooks<'a>>,
+    pe_hook_hits: Vec<u32>,
     matcher: &'a mut Matcher<'a>,
     check: &'a mut dyn FnMut() -> io::Result<()>,
 }
@@ -379,15 +392,44 @@ pub fn scan(
     matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
     check: impl FnMut() -> io::Result<()>,
 ) -> io::Result<Verdict> {
-    scan_with_pdf_hooks(bytes, options, temporary_directory, None, matcher, check)
+    scan_with_hooks(
+        bytes,
+        options,
+        temporary_directory,
+        None,
+        None,
+        matcher,
+        check,
+    )
 }
 
-/// Scan objects with the PDF hooks from the same database generation.
+/// Scan objects with PDF bytecode hooks.
 pub fn scan_with_pdf_hooks(
     bytes: &[u8],
     options: &Options,
     temporary_directory: &Path,
     pdf_hooks: Option<PdfHooks<'_>>,
+    matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
+    check: impl FnMut() -> io::Result<()>,
+) -> io::Result<Verdict> {
+    scan_with_hooks(
+        bytes,
+        options,
+        temporary_directory,
+        pdf_hooks,
+        None,
+        matcher,
+        check,
+    )
+}
+
+/// Scan objects with the bytecode hooks from the same database generation.
+pub fn scan_with_hooks(
+    bytes: &[u8],
+    options: &Options,
+    temporary_directory: &Path,
+    pdf_hooks: Option<PdfHooks<'_>>,
+    pe_hooks: Option<PeHooks<'_>>,
     mut matcher: impl FnMut(Object<'_>, &mut dyn FnMut() -> io::Result<()>) -> io::Result<Verdict>,
     mut check: impl FnMut() -> io::Result<()>,
 ) -> io::Result<Verdict> {
@@ -403,6 +445,8 @@ pub fn scan_with_pdf_hooks(
         deferred_heuristic: None,
         last_handler_hash: [0; 16],
         pdf_hooks,
+        pe_hooks,
+        pe_hook_hits: Vec::new(),
         matcher: &mut matcher,
         check: &mut check,
     };
@@ -470,6 +514,7 @@ impl Traversal<'_> {
                 return Ok(());
             }
         }
+        let parent_hook_hits = std::mem::take(&mut self.pe_hook_hits);
         self.parents.push(Layer {
             normalized,
             target: file_type.context.target(),
@@ -515,6 +560,7 @@ impl Traversal<'_> {
             }
         }
         self.parents.pop();
+        self.pe_hook_hits = parent_hook_hits;
         Ok(())
     }
 
@@ -543,6 +589,8 @@ impl Traversal<'_> {
                 script_source: None,
             },
             handled_format,
+            pe_hook_hits: (self.pe_hooks.is_some() && !normalized && context.is_valid_pe())
+                .then_some(&mut self.pe_hook_hits),
         };
         let verdict = (self.matcher)(object, self.check)?;
         self.apply_verdict(bytes, verdict)
@@ -654,6 +702,14 @@ impl Traversal<'_> {
         }
         file_type.parser.after_raw(bytes, self.options, self)
     }
+
+    fn report_hook_detection(&mut self, name: &str) -> bool {
+        if name.starts_with("BC.Heuristics") {
+            return self.report_heuristic(name);
+        }
+        self.stopped = Some(Verdict::Found(name.to_owned()));
+        true
+    }
 }
 
 impl ChildSink for Traversal<'_> {
@@ -677,22 +733,37 @@ impl ChildSink for Traversal<'_> {
                     hooks.timeout,
                     &mut *self.check,
                 )? {
-                    PdfHookResult::Found(name) => {
-                        if name.starts_with("BC.Heuristics") {
-                            if self.report_heuristic(name) {
-                                return Ok(PdfHookControl::Found);
-                            }
-                        } else {
-                            self.stopped = Some(Verdict::Found(name.to_owned()));
-                            return Ok(PdfHookControl::Found);
-                        }
+                    PdfHookResult::Found(name) if self.report_hook_detection(name) => {
+                        return Ok(PdfHookControl::Found);
                     }
+                    PdfHookResult::Found(_) | PdfHookResult::Continue => (),
                     PdfHookResult::Break => control = PdfHookControl::Break,
-                    PdfHookResult::Continue => (),
                 }
             }
         }
         Ok(control)
+    }
+
+    fn run_pe_all_hooks(&mut self, bytes: &[u8]) -> io::Result<Handling> {
+        let Some(hooks) = self.pe_hooks.filter(|_| !self.pe_hook_hits.is_empty()) else {
+            return Ok(Handling::Unrecognized);
+        };
+        if !classify::pe32_optional_header(bytes) {
+            return Ok(Handling::Unrecognized);
+        }
+        self.pe_hook_hits.sort_unstable();
+        for (id, program) in hooks.programs {
+            if self.pe_hook_hits.binary_search(id).is_err() {
+                continue;
+            }
+            if let PdfHookResult::Found(name) =
+                program.run_pe_all(bytes, hooks.debug, hooks.timeout, &mut *self.check)?
+                && self.report_hook_detection(name)
+            {
+                return Ok(Handling::Stopped);
+            }
+        }
+        Ok(Handling::Complete)
     }
 
     fn at_root(&self) -> bool {
@@ -759,6 +830,7 @@ impl ChildSink for Traversal<'_> {
                 script_source: None,
             },
             handled_format: true,
+            pe_hook_hits: None,
         };
         let verdict = (self.matcher)(object, self.check)?;
         self.apply_verdict(bytes, verdict)?;
@@ -986,6 +1058,7 @@ impl ChildSink for Traversal<'_> {
                 script_source: Some(source),
             },
             handled_format: true,
+            pe_hook_hits: None,
         };
         let verdict = (self.matcher)(object, self.check)?;
         self.apply_verdict(bytes, verdict)?;

@@ -54,6 +54,8 @@ pub enum HandlerType {
 pub struct LogicalMatches<'a> {
     pub handlers: Vec<(Result<Option<&'a str>, String>, HandlerType)>,
     pub finding: Result<Option<&'a str>, String>,
+    /// Logical IDs whose prefilters enabled a later PE_ALL hook on this object.
+    pub pe_hooks: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -157,6 +159,7 @@ pub struct LogicalIndex {
     search: SearchIndex,
     bytecode: HashMap<u32, Program>,
     pdf_bytecode: Vec<Program>,
+    pe_bytecode: Vec<(u32, Program)>,
     bytecode_debug: bool,
     bytecode_timeout: Duration,
 }
@@ -182,6 +185,7 @@ impl LogicalIndex {
         let mut builder = Builder::default();
         let mut bytecode = HashMap::new();
         let mut pdf_bytecode = Vec::new();
+        let mut pe_bytecode = Vec::new();
         for &(path, official) in paths {
             let file = open(path)
                 .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
@@ -221,7 +225,9 @@ impl LogicalIndex {
                                 "bytecode trigger requires handler or icon evaluation",
                             )));
                         }
-                        if program.uses_match_offsets()
+                        let pe_hook = program.is_pe_all_hook();
+                        if !pe_hook
+                            && program.uses_match_offsets()
                             && (0..record.children).any(|slot| {
                                 !builder.bindings[first_binding..]
                                     .iter()
@@ -233,7 +239,11 @@ impl LogicalIndex {
                                 "bytecode match offsets require indexed pattern subsignatures",
                             )));
                         }
-                        bytecode.insert(id as u32, program);
+                        if pe_hook {
+                            pe_bytecode.push((id as u32, program));
+                        } else {
+                            bytecode.insert(id as u32, program);
+                        }
                     }
                 }
                 continue;
@@ -288,6 +298,7 @@ impl LogicalIndex {
             max_icons: 100,
             bytecode,
             pdf_bytecode,
+            pe_bytecode,
             bytecode_debug: false,
             bytecode_timeout,
             regexes: builder.regexes,
@@ -307,6 +318,15 @@ impl LogicalIndex {
     pub fn pdf_hooks(&self) -> Option<crate::objects::PdfHooks<'_>> {
         (!self.pdf_bytecode.is_empty()).then_some(crate::objects::PdfHooks {
             programs: &self.pdf_bytecode,
+            debug: self.bytecode_debug,
+            timeout: self.bytecode_timeout,
+        })
+    }
+
+    /// Return PE_ALL programs in this generation's logical load order.
+    pub fn pe_hooks(&self) -> Option<crate::objects::PeHooks<'_>> {
+        (!self.pe_bytecode.is_empty()).then_some(crate::objects::PeHooks {
+            programs: &self.pe_bytecode,
             debug: self.bytecode_debug,
             timeout: self.bytecode_timeout,
         })
@@ -612,24 +632,37 @@ impl LogicalIndex {
             if e.is_some_and(|e| !self.expressions[rule.expression].matches(&e.counts)) {
                 continue;
             }
-            if (!self.bytecode.is_empty() && self.bytecode.contains_key(&id))
+            let pe_hook = self
+                .pe_bytecode
+                .binary_search_by_key(&id, |&(id, _)| id)
+                .is_ok();
+            if pe_hook && !context.is_valid_pe() {
+                continue;
+            }
+            if pe_hook
+                || (!self.bytecode.is_empty() && self.bytecode.contains_key(&id))
                 || rule
                     .conditions
                     .attributes
                     .as_deref()
                     .is_some_and(|a| a.icon_groups.is_some() || rescan && a.handler.is_some())
             {
-                pending.push(key);
+                pending.push((key, pe_hook));
             } else {
                 winner = Some(key);
             }
         }
-        pending.retain(|key| winner.is_none_or(|earlier| *key < earlier));
+        pending.retain(|(key, _)| winner.is_none_or(|earlier| *key < earlier));
         pending.sort_unstable();
         let mut finding = Ok(winner.map(|(_, id)| self.records[id as usize].name.as_ref()));
         let mut handlers = Vec::new();
+        let mut pe_hooks = Vec::new();
         let mut icon_samples = None;
-        for (_, id) in pending {
+        for ((_, id), pe_hook) in pending {
+            if pe_hook {
+                pe_hooks.push(id);
+                continue;
+            }
             if let Some(program) = self.bytecode.get(&id) {
                 let input = if object.unmapped_script {
                     object.script_source.unwrap_or(bytes)
@@ -695,7 +728,11 @@ impl LogicalIndex {
                 break;
             }
         }
-        Ok(LogicalMatches { handlers, finding })
+        Ok(LogicalMatches {
+            handlers,
+            finding,
+            pe_hooks,
+        })
     }
 }
 

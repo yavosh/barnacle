@@ -348,9 +348,19 @@ impl Parser {
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
         match self {
-            Self::Pe {
-                overlay: Some(start),
-            } if options.scan_pe => super::installer::legacy(&bytes[start..], sink),
+            Self::Pe { overlay } if options.scan_pe => {
+                let earlier = match overlay {
+                    Some(start) => super::installer::legacy(&bytes[start..], sink)?,
+                    None => Handling::Unrecognized,
+                };
+                if matches!(earlier, Handling::Incomplete | Handling::Stopped) {
+                    return Ok(earlier);
+                }
+                match sink.run_pe_all_hooks(bytes)? {
+                    Handling::Unrecognized => Ok(earlier),
+                    result => Ok(result),
+                }
+            }
             Self::Pdf if options.scan_pdf => pdf::extract(bytes, options, sink),
             Self::Text if options.scan_html && options.scan_normalized_script => {
                 text::after_raw(bytes, sink)
@@ -358,4 +368,14 @@ impl Parser {
             _ => Ok(Handling::Unrecognized),
         }
     }
+}
+
+pub(super) fn pe32_optional_header(bytes: &[u8]) -> bool {
+    let Some(pointer) = bytes.get(0x3c..).and_then(<[u8]>::first_chunk::<4>) else {
+        return false;
+    };
+    (u32::from_le_bytes(*pointer) as usize)
+        .checked_add(24)
+        .and_then(|offset| bytes.get(offset..))
+        .is_some_and(|optional| optional.starts_with(b"\x0b\x01"))
 }

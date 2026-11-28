@@ -1,4 +1,4 @@
-//! A typed CBC interpreter for logical signatures and PDF hooks.
+//! A typed CBC interpreter for logical signatures, PDF hooks, and PE hooks.
 use super::{Cursor, MAX_MEMBER_BYTES, PdfHookContext, PdfHookResult, invalid};
 use std::time::{Duration, Instant};
 use std::{io, str, sync::Arc};
@@ -10,6 +10,7 @@ use memory::{Address, Frame, MemoryOp, Slot};
 
 const LOGICAL_HOOK: u64 = 256;
 const PDF_HOOK: u64 = 258;
+const PE_ALL_HOOK: u64 = 259;
 const BREAK_RESULT: u64 = 0xcea5e;
 const SET_VIRUS_NAME: u64 = 5;
 const I32: u64 = 32;
@@ -21,7 +22,7 @@ const MAX_CALL_DEPTH: usize = 64;
 
 #[derive(Debug)]
 pub struct Program {
-    pdf_hook: bool,
+    hook: u64,
     trigger: Box<str>,
     functions: Vec<Function>,
     uses_match_offsets: bool,
@@ -58,7 +59,7 @@ fn unsupported(feature: &str) -> io::Error {
 }
 
 impl Program {
-    /// Compile a logical or PDF entry point inside the supported format and engine window.
+    /// Compile a supported entry point inside its format and engine window.
     pub fn compile(contents: &[u8], engine_level: u64) -> io::Result<Option<Self>> {
         if contents.len() as u64 > MAX_MEMBER_BYTES {
             return Err(invalid("CBC exceeds the module size limit"));
@@ -80,7 +81,7 @@ impl Program {
         if engine_level < min || max != 0 && engine_level > max {
             return Ok(None);
         }
-        if !matches!(hook, LOGICAL_HOOK | PDF_HOOK) || exclude != 0 {
+        if !matches!(hook, LOGICAL_HOOK | PDF_HOOK | PE_ALL_HOOK) || exclude != 0 {
             return Err(unsupported("hook or target exclusion"));
         }
         if field(h.number())? != 0 {
@@ -111,8 +112,12 @@ impl Program {
         if trigger.is_empty() || trigger.bytes().any(|b| b.is_ascii_control()) {
             return Err(invalid("invalid CBC trigger text"));
         }
-        if hook == PDF_HOOK && trigger.contains(';') {
-            return Err(unsupported("conditional PDF hook"));
+        match (hook, trigger.contains(';')) {
+            (PDF_HOOK, true) => return Err(unsupported("conditional PDF hook")),
+            (PE_ALL_HOOK, false) => {
+                return Err(unsupported("PE_ALL hook without a logical prefilter"));
+            }
+            _ => {}
         }
         let types = types(line()?, type_count)?;
         let apis = api(line()?, &types)?;
@@ -198,7 +203,7 @@ impl Program {
             .flat_map(|f| f.blocks.iter().flatten())
             .any(|op| matches!(op, Instruction::Write(_, Expression::MatchOffset(_))));
         Ok(Some(Self {
-            pdf_hook: hook == PDF_HOOK,
+            hook,
             trigger: trigger.into(),
             uses_match_offsets,
             functions,
@@ -210,11 +215,15 @@ impl Program {
     }
 
     pub fn is_pdf_hook(&self) -> bool {
-        self.pdf_hook
+        self.hook == PDF_HOOK
+    }
+
+    pub fn is_pe_all_hook(&self) -> bool {
+        self.hook == PE_ALL_HOOK
     }
 
     pub fn uses_match_offsets(&self) -> bool {
-        self.uses_match_offsets
+        self.hook == LOGICAL_HOOK && self.uses_match_offsets
     }
 
     /// Run on the current scan object. Treat a bytecode-only timeout as a miss.
@@ -227,8 +236,8 @@ impl Program {
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
-        if self.pdf_hook {
-            return Err(unsupported("PDF hook outside its PDF phase"));
+        if self.hook != LOGICAL_HOOK {
+            return Err(unsupported("hook outside its scan phase"));
         }
         let scan = Scan {
             input,
@@ -253,15 +262,40 @@ impl Program {
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<PdfHookResult<'_>> {
-        if !self.pdf_hook {
-            return Err(unsupported("logical entry in a PDF phase"));
+        if !self.is_pdf_hook() {
+            return Err(unsupported("non-PDF entry in a PDF phase"));
         }
+        self.run_hook(input, Some(context), debug, timeout, check)
+    }
+
+    pub fn run_pe_all(
+        &self,
+        input: &[u8],
+        debug: bool,
+        timeout: Duration,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<PdfHookResult<'_>> {
+        if !self.is_pe_all_hook() {
+            return Err(unsupported("non-PE_ALL entry in a PE phase"));
+        }
+        self.run_hook(input, None, debug, timeout, check)
+    }
+
+    fn run_hook(
+        &self,
+        input: &[u8],
+        pdf: Option<PdfHookContext<'_>>,
+        debug: bool,
+        timeout: Duration,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<PdfHookResult<'_>> {
+        // Stock executes the hook in a fresh context after prefilter selection.
         let scan = Scan {
             input,
             counts: &[],
             offsets: &[0; 64],
             debug,
-            pdf: Some(context),
+            pdf,
             pe: Default::default(),
         };
         self.execute(scan, timeout, check)
@@ -342,7 +376,7 @@ impl Program {
                         let Some(caller) = stack.pop() else {
                             return Ok(match name {
                                 Some(name) => PdfHookResult::Found(name),
-                                None if self.pdf_hook
+                                None if self.hook != LOGICAL_HOOK
                                     && result.is_some_and(|v| v.get(&locals) == BREAK_RESULT) =>
                                 {
                                     PdfHookResult::Break

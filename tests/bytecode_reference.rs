@@ -605,6 +605,99 @@ fn stock_pdf_hook_execution() -> io::Result<()> {
     compare_pdf_hooks(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }
 
+fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
+    let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    let mut marked = pe::benign_pe();
+    marked[544..552].copy_from_slice(b"receiptY");
+    let mut prefilter_only = marked.clone();
+    prefilter_only[551] = b'N';
+    let mut hook_only = marked.clone();
+    hook_only[544] = b'R';
+    let mut pe64 = marked.clone();
+    pe64.copy_within(376..416, 392);
+    pe64[132..134].copy_from_slice(&0x8664u16.to_le_bytes());
+    pe64[148..150].copy_from_slice(&240u16.to_le_bytes());
+    pe64[152..154].copy_from_slice(&0x20bu16.to_le_bytes());
+    pe64[260..264].copy_from_slice(&16u32.to_le_bytes());
+
+    let overlay_note = b"Ordinary installer overlay receipt";
+    let mut overlay = marked.clone();
+    overlay.resize(1536, 0);
+    overlay[134..136].copy_from_slice(&2u16.to_le_bytes());
+    overlay[208..212].copy_from_slice(&12288u32.to_le_bytes());
+    overlay.copy_within(376..416, 416);
+    overlay[416..424].copy_from_slice(b".notes\0\0");
+    overlay[428..432].copy_from_slice(&8192u32.to_le_bytes());
+    overlay[436..440].copy_from_slice(&1024u32.to_le_bytes());
+    overlay.extend_from_slice(b"notes.txt\0docs\0v1\0");
+    write!(overlay, "{}\0", overlay_note.len())?;
+    overlay.extend_from_slice(overlay_note);
+    overlay.extend_from_slice(&[0; 4]);
+
+    let nested = zip::zip(&[("receipt.exe", &marked)], true, false, false)?;
+    let siblings = zip::zip(
+        &[("first.exe", &prefilter_only), ("second.exe", &hook_only)],
+        true,
+        false,
+        false,
+    )?;
+    let program = scalar::pe_all_hook();
+    run_program(
+        executable,
+        &program,
+        options,
+        &[
+            (&marked, true),
+            (&prefilter_only, false),
+            (&hook_only, false),
+            (&pe64, false),
+            (&overlay, true),
+            (&nested, true),
+            (&siblings, false),
+        ],
+        miss,
+    )?;
+    for options in ["BytecodeUnsigned no\n", "BytecodeUnsigned yes\nScanPE no\n"] {
+        run_program(executable, &program, options, &[(&marked, false)], miss)?;
+    }
+
+    let root = tempfile::tempdir_in("/tmp")?;
+    let db = root.path().join("db");
+    fs::create_dir(&db)?;
+    fs::write(db.join(CBC), &program)?;
+    let mut rules = String::new();
+    for (input, name) in [
+        (marked.as_slice(), "Pe.RawReceipt"),
+        (overlay_note.as_slice(), "Pe.OverlayReceipt"),
+    ] {
+        let hash = barnacle::hash_reader(input)?;
+        rules.push_str(&format!("{}:{}:{name}\n", hash.md5_hex(), input.len()));
+    }
+    fs::write(db.join("receipt.hdb"), rules)?;
+    let (_daemon, socket) = start(root.path(), executable, options)?;
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&marked)?)?,
+        "stream: Pe.RawReceipt.UNOFFICIAL FOUND\0"
+    );
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&overlay)?)?,
+        "stream: Pe.OverlayReceipt.UNOFFICIAL FOUND\0"
+    );
+    Ok(())
+}
+
+#[test]
+fn barnacle_pe_all_hook_execution() -> io::Result<()> {
+    compare_pe_all_hooks(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_pe_all_hook_execution() -> io::Result<()> {
+    verify_stock()?;
+    compare_pe_all_hooks(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
 #[test]
 #[ignore = "requires pinned Debian clamd and BARNACLE_CVD_DIR"]
 fn stock_and_barnacle_run_verified_pdf_modules() -> io::Result<()> {

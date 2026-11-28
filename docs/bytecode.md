@@ -42,7 +42,7 @@ It also checks the Rust compiler against every eligible module.
 The compiler accepts 70 eligible modules, including 68 logical modules and both PDF hooks.
 The archive test loads those modules into one generation's logical index and PDF hook list.
 The inventory groups the remaining 12 eligible modules by the first compiler rejection.
-Eight require PE hooks with logical prefilters. Four logical modules declare unsupported APIs.
+Six use the PE unpacker hook. Five declare unsupported host APIs. One uses an unsupported PE global.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -123,6 +123,10 @@ It runs `PE_UNPACKER` after native unpackers. Both hooks receive the original PE
 Stock runs PDF hooks before discovery, after discovery, after recursive child scans, and at PDF completion.
 The completion phase requires remaining parser flags. The post-extraction phase sees the extracted bytes.
 [Pinned PE scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pe.c) · [Pinned PDF scanner](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/pdf.c)
+
+Barnacle runs supported `PE_ALL` programs after overlay scanning. A matching logical prefilter enables the hook for that PE object.
+The comparison covers earlier raw and overlay findings, sibling archive members, PE32+, and the `ScanPE` and unsigned bytecode options.
+The signed PE modules still require unsupported host globals or APIs. `PE_UNPACKER` is unsupported.
 
 Both signed PDF hooks query the current phase and configuration functionality level, which is 213.
 One queries document flags. The other uses discovery order, object offsets, and object spans.

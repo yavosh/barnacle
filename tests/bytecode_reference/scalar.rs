@@ -359,6 +359,52 @@ fn name_globals(max_host: u64, globals_count: u64, name_type: u64) -> String {
     row
 }
 
+pub fn pe_all_hook() -> String {
+    let mut globals = name_globals(0x8005, 5, 71);
+    global_pointer(&mut globals, 67, 0x8000, 0);
+    global_pointer(&mut globals, 67, 0x8005, 0);
+    let equals = |dest, value| op(1, dest, 21, &[number(32), number(0), immediate(value, 4)]);
+    let combine = || op(1, 1, 11, &[number(1), number(2)]);
+    program(
+        259,
+        "Local.Receipt.Prefilter.{};Target:1;0;544:72656365697074",
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32]),
+            array(NAME.len() + 1, 8),
+            array(64, 32),
+        ],
+        &[
+            (SET_NAME, 69, "setvirusname"),
+            (PE_RAW_OFFSET, 70, "pe_rawaddr"),
+            (BYTE_AT, 70, "file_byteat"),
+        ],
+        globals,
+        &[Function {
+            args: 0,
+            slots: &[32, 1, 1],
+            blocks: &[
+                vec![
+                    call(0, PE_RAW_OFFSET, &[immediate(0x1020, 4)]),
+                    equals(1, 544),
+                    call(0, BYTE_AT, &[immediate(551, 4)]),
+                    equals(2, u64::from(b'Y')),
+                    combine(),
+                    op(32, 0, 39, &[pointer(3)]),
+                    equals(2, 0),
+                    combine(),
+                    op(32, 0, 39, &[pointer(4)]),
+                    equals(2, 0),
+                    combine(),
+                    branch(1, 1, 2),
+                ],
+                vec![report(0), ret()],
+                vec![ret()],
+            ],
+        }],
+    )
+}
+
 /// Read the byte after the first trigger and compare the reported engine level.
 pub fn first_match() -> String {
     let mut globals = name_globals(0x8005, 5, 72);

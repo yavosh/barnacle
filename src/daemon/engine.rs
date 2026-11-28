@@ -417,11 +417,12 @@ impl Generation {
             .flatten();
         let mut expired = false;
         let verdict = object.with_bytes(|bytes| {
-            objects::scan_with_pdf_hooks(
+            objects::scan_with_hooks(
                 bytes,
                 &self.objects,
                 &self.temporary_directory,
                 self.logical.pdf_hooks(),
+                self.logical.pe_hooks(),
                 |obj, check| {
                     let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
                     let eligible = obj.normalized
@@ -458,6 +459,9 @@ impl Generation {
                         !self.disable_cache && obj.logical_rescan,
                         &mut *check,
                     )?;
+                    if let Some(hits) = obj.pe_hook_hits {
+                        hits.extend(matches.pe_hooks);
+                    }
                     if !matches.handlers.is_empty() {
                         return Ok(Verdict::Handlers {
                             rules: matches
