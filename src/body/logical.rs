@@ -7,7 +7,7 @@ use super::logical_pcre::{PcreLimits, RegexChild};
 use super::search::{STOCK_WINDOW, SearchEvent};
 use super::{ObjectContext, Offset, Pattern, Rule, SearchIndex, Target, invalid, level};
 use crate::IgnoreSet;
-use crate::bytecode::{MAX_MEMBER_BYTES, Program};
+use crate::bytecode::{LogicalInput, MAX_MEMBER_BYTES, Program};
 use crate::objects::Layer;
 use std::collections::HashMap;
 use std::fs::File;
@@ -410,6 +410,187 @@ impl LogicalIndex {
         rescan: bool,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<LogicalMatches<'_>> {
+        self.match_step(bytes, context, object, rescan, None, &mut check)
+    }
+
+    /// Resume at the first unevaluated rule after a bytecode child or handler scan.
+    pub fn match_step(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: LogicalObject<'_>,
+        rescan: bool,
+        mut step: Option<crate::objects::LogicalStep<'_>>,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<LogicalMatches<'_>> {
+        let mut cursor = match step.as_mut().and_then(|step| step.cursor.take()) {
+            Some(cursor) => *cursor,
+            None => {
+                let evidence = self.evidence(bytes, context, &object, &mut *check)?;
+                self.candidates(
+                    context,
+                    &object,
+                    evidence,
+                    rescan && !object.unmapped_script,
+                    check,
+                )?
+            }
+        };
+        let mut matches = LogicalMatches {
+            finding: Ok(None),
+            handlers: Vec::new(),
+            pe_hooks: Vec::new(),
+        };
+        loop {
+            let (view_bytes, view_object) = if cursor.restored {
+                let source = object.script_source.expect("restored source");
+                (
+                    source,
+                    LogicalObject {
+                        file_size: source.len(),
+                        recursion_level: object.recursion_level.saturating_sub(1),
+                        script_source: None,
+                        ..object
+                    },
+                )
+            } else {
+                (bytes, object)
+            };
+            let mut paused = false;
+            while let Some(&(key, pe_hook)) = cursor.pending.last() {
+                let id = key.1;
+                let program = self.bytecode.get(&id);
+                if step.is_some()
+                    && !matches.handlers.is_empty()
+                    && program.is_some_and(|program| program.writes_output)
+                {
+                    paused = true;
+                    break;
+                }
+                cursor.pending.pop();
+                if pe_hook {
+                    if !cursor.restored {
+                        matches.pe_hooks.push(id);
+                    }
+                    continue;
+                }
+                let rule = &self.records[id as usize];
+                let attributes = rule.conditions.attributes.as_deref();
+                let icon_matches = match attributes.and_then(|a| a.icon_groups.as_deref()) {
+                    None => Ok(true),
+                    Some(groups) => {
+                        if context.is_valid_pe()
+                            && let Some(ids) = self
+                                .icons
+                                .select([groups[0].as_deref(), groups[1].as_deref()])
+                        {
+                            let samples = match &mut cursor.icons {
+                                Some(samples) => samples,
+                                empty => empty.insert(context.icon_metrics(
+                                    view_bytes,
+                                    self.max_icons,
+                                    check,
+                                )?),
+                            };
+                            if self.icons.matches(ids, &samples.values, check)? {
+                                Ok(true)
+                            } else {
+                                samples
+                                    .unsupported
+                                    .as_ref()
+                                    .map_or(Ok(false), |error| Err(error.clone()))
+                            }
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                };
+                let result = match icon_matches {
+                    Err(error) => Err(error),
+                    Ok(false) => Ok(None),
+                    Ok(true) => {
+                        if let Some(program) = program {
+                            let input = if view_object.unmapped_script {
+                                view_object.script_source.unwrap_or(view_bytes)
+                            } else {
+                                view_bytes
+                            };
+                            let offsets = cursor
+                                .evidence
+                                .first_offsets
+                                .get(&id)
+                                .unwrap_or(&NO_MATCH_OFFSETS);
+                            let counts = cursor
+                                .evidence
+                                .matches
+                                .get(&id)
+                                .map_or(&[][..], |e| e.counts.as_slice());
+                            if let Some(step) = step.as_mut() {
+                                *step.restored_output = cursor.restored;
+                            }
+                            Ok(program.run_logical(
+                                input,
+                                LogicalInput {
+                                    offsets,
+                                    counts,
+                                    has_entry: Some(context.has_entry()),
+                                    output: step.as_ref().map(|step| (step.output, step.directory)),
+                                },
+                                self.bytecode_debug,
+                                self.bytecode_timeout,
+                                &mut *check,
+                            )?)
+                        } else {
+                            Ok(Some(rule.name.as_ref()))
+                        }
+                    }
+                };
+                if cursor.rescan
+                    && let Some(handler) = attributes.and_then(|a| a.handler)
+                {
+                    matches.handlers.push((result, handler));
+                } else if result != Ok(None) {
+                    matches.finding = result;
+                    return Ok(matches);
+                }
+                if step
+                    .as_ref()
+                    .is_some_and(|step| step.output.borrow().snapshot.is_some())
+                {
+                    paused = true;
+                    break;
+                }
+            }
+            if paused {
+                *step.as_mut().expect("traversal session").cursor = Some(Box::new(cursor));
+                return Ok(matches);
+            }
+            if let Some((_, id)) = cursor.winner {
+                matches.finding = Ok(Some(self.records[id as usize].name.as_ref()));
+                return Ok(matches);
+            }
+            if cursor.restored || object.unmapped_script || object.script_source.is_none() {
+                return Ok(matches);
+            }
+            // The mapped script view is followed by a pass with the owning map and empty counters.
+            let restored = LogicalObject {
+                file_size: object.script_source.expect("mapped script source").len(),
+                recursion_level: object.recursion_level.saturating_sub(1),
+                script_source: None,
+                ..object
+            };
+            cursor = self.candidates(context, &restored, ScanEvidence::default(), false, check)?;
+            cursor.restored = true;
+        }
+    }
+
+    fn evidence(
+        &self,
+        bytes: &[u8],
+        context: &ObjectContext,
+        object: &LogicalObject<'_>,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<ScanEvidence> {
         let mut evidence = ScanEvidence::default();
         self.search.run_events(
             &self.children,
@@ -448,7 +629,7 @@ impl LogicalIndex {
                 let child = hit.rule_id as usize;
                 let binding = &self.bindings[child];
                 let record = &self.records[binding.owner as usize];
-                if !record.conditions.accepts(context, &object)
+                if !record.conditions.accepts(context, object)
                     || object.unmapped_script
                         && record.conditions.target == Target::Generic
                         && self.children[child].offset.is_relative()
@@ -500,7 +681,7 @@ impl LogicalIndex {
                 }
                 let record = &self.records[binding.owner as usize];
                 if context.accepts(record.conditions.target)
-                    && record.conditions.accepts(context, &object)
+                    && record.conditions.accepts(context, object)
                 {
                     let entry = evidence
                         .matches
@@ -513,39 +694,8 @@ impl LogicalIndex {
                 }
             }
         }
-        self.scan_regexes(bytes, context, &object, &mut evidence.matches, &mut check)?;
-        let mut matches = self.evaluate(
-            bytes,
-            context,
-            &object,
-            &evidence,
-            rescan && !object.unmapped_script,
-            &mut check,
-        )?;
-        if matches.finding == Ok(None)
-            && !object.unmapped_script
-            && let Some(source) = object.script_source
-        {
-            // cli_scanscript restores the source map after scanning the mapped view,
-            // then checks the caller's initially empty logical counters.
-            let restored = LogicalObject {
-                file_size: source.len(),
-                recursion_level: object.recursion_level.saturating_sub(1),
-                script_source: None,
-                ..object
-            };
-            matches.finding = self
-                .evaluate(
-                    source,
-                    context,
-                    &restored,
-                    &ScanEvidence::default(),
-                    false,
-                    &mut check,
-                )?
-                .finding;
-        }
-        Ok(matches)
+        self.scan_regexes(bytes, context, object, &mut evidence.matches, &mut check)?;
+        Ok(evidence)
     }
 
     fn scan_regexes(
@@ -598,15 +748,14 @@ impl LogicalIndex {
         Ok(())
     }
 
-    fn evaluate(
+    fn candidates(
         &self,
-        bytes: &[u8],
         context: &ObjectContext,
         object: &LogicalObject<'_>,
-        evidence: &ScanEvidence,
+        evidence: ScanEvidence,
         rescan: bool,
         check: &mut impl FnMut() -> io::Result<()>,
-    ) -> io::Result<LogicalMatches<'_>> {
+    ) -> io::Result<LogicalCursor> {
         // Each target's logical table is evaluated in load order after scanning.
         // The specific target precedes generic. Only touched records and those
         // known to pass with all-zero counts can win.
@@ -654,86 +803,25 @@ impl LogicalIndex {
             }
         }
         pending.retain(|(key, _)| winner.is_none_or(|earlier| *key < earlier));
-        pending.sort_unstable();
-        let mut finding = Ok(winner.map(|(_, id)| self.records[id as usize].name.as_ref()));
-        let mut handlers = Vec::new();
-        let mut pe_hooks = Vec::new();
-        let mut icon_samples = None;
-        for ((_, id), pe_hook) in pending {
-            if pe_hook {
-                pe_hooks.push(id);
-                continue;
-            }
-            let rule = &self.records[id as usize];
-            let attributes = rule.conditions.attributes.as_deref();
-            let icon_matches = match attributes.and_then(|a| a.icon_groups.as_deref()) {
-                None => Ok(true),
-                Some(groups) => {
-                    if context.is_valid_pe()
-                        && let Some(ids) = self
-                            .icons
-                            .select([groups[0].as_deref(), groups[1].as_deref()])
-                    {
-                        let samples = match &mut icon_samples {
-                            Some(samples) => samples,
-                            empty => {
-                                empty.insert(context.icon_metrics(bytes, self.max_icons, check)?)
-                            }
-                        };
-                        if self.icons.matches(ids, &samples.values, check)? {
-                            Ok(true)
-                        } else {
-                            samples
-                                .unsupported
-                                .as_ref()
-                                .map_or(Ok(false), |error| Err(error.clone()))
-                        }
-                    } else {
-                        Ok(false)
-                    }
-                }
-            };
-            let result = match icon_matches {
-                Err(error) => Err(error),
-                Ok(false) => Ok(None),
-                Ok(true) => {
-                    if let Some(program) = self.bytecode.get(&id) {
-                        let input = if object.unmapped_script {
-                            object.script_source.unwrap_or(bytes)
-                        } else {
-                            bytes
-                        };
-                        let offsets = evidence.first_offsets.get(&id).unwrap_or(&NO_MATCH_OFFSETS);
-                        let counts = evidence
-                            .matches
-                            .get(&id)
-                            .map_or(&[][..], |e| e.counts.as_slice());
-                        Ok(program.run_logical(
-                            input,
-                            (offsets, counts),
-                            Some(context.has_entry()),
-                            self.bytecode_debug,
-                            self.bytecode_timeout,
-                            &mut *check,
-                        )?)
-                    } else {
-                        Ok(Some(rule.name.as_ref()))
-                    }
-                }
-            };
-            if rescan && let Some(handler) = attributes.and_then(|a| a.handler) {
-                handlers.push((result, handler));
-            } else if result != Ok(None) {
-                finding = result;
-                break;
-            }
-        }
-        Ok(LogicalMatches {
-            handlers,
-            finding,
-            pe_hooks,
+        pending.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(LogicalCursor {
+            evidence,
+            pending,
+            winner,
+            icons: None,
+            rescan,
+            restored: false,
         })
     }
+}
+
+pub(crate) struct LogicalCursor {
+    evidence: ScanEvidence,
+    pending: Vec<((bool, u32), bool)>,
+    winner: Option<(bool, u32)>,
+    icons: Option<super::target::IconSamples>,
+    rescan: bool,
+    restored: bool,
 }
 
 struct Evidence {

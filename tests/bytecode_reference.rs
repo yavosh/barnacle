@@ -1,6 +1,8 @@
 //! Compare harmless bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "bytecode_reference/parite.rs"]
+mod parite;
 #[path = "common/pe.rs"]
 mod pe;
 #[path = "common/pe_icons.rs"]
@@ -28,10 +30,18 @@ const PARTIAL_MISS: &str = "stream: Incomplete scan: unsupported detection cover
 fn start(dir: &Path, executable: &Path, options: &str) -> io::Result<(Daemon, PathBuf)> {
     let config = dir.join("clamd.conf");
     let socket = dir.join("sock");
+    let cache = if options
+        .lines()
+        .any(|line| line.starts_with("DisableCache "))
+    {
+        ""
+    } else {
+        "DisableCache yes\n"
+    };
     fs::write(
         &config,
         format!(
-            "Foreground yes\nSelfCheck 0\nDisableCache yes\nDatabaseDirectory {}\nLocalSocket {}\n{options}",
+            "Foreground yes\nSelfCheck 0\n{cache}DatabaseDirectory {}\nLocalSocket {}\n{options}",
             dir.join("db").display(),
             socket.display()
         ),
@@ -707,12 +717,16 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
     prefilter_only[551] = b'N';
     let mut hook_only = marked.clone();
     hook_only[544] = b'R';
-    let mut pe64 = marked.clone();
-    pe64.copy_within(376..416, 392);
-    pe64[132..134].copy_from_slice(&0x8664u16.to_le_bytes());
-    pe64[148..150].copy_from_slice(&240u16.to_le_bytes());
-    pe64[152..154].copy_from_slice(&0x20bu16.to_le_bytes());
-    pe64[260..264].copy_from_slice(&16u32.to_le_bytes());
+    let to_pe64 = |mut image: Vec<u8>| {
+        let sections = u16::from_le_bytes([image[134], image[135]]) as usize;
+        image.copy_within(376..376 + sections * 40, 392);
+        image[132..134].copy_from_slice(&0x8664u16.to_le_bytes());
+        image[148..150].copy_from_slice(&240u16.to_le_bytes());
+        image[152..154].copy_from_slice(&0x20bu16.to_le_bytes());
+        image[260..264].copy_from_slice(&16u32.to_le_bytes());
+        image
+    };
+    let pe64 = to_pe64(marked.clone());
 
     let overlay_note = b"Ordinary installer overlay receipt";
     let mut overlay = marked.clone();
@@ -777,6 +791,10 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
     assert_eq!(
         unix_request(&socket, &stream_frame(&overlay)?)?,
         "stream: Pe.OverlayReceipt.UNOFFICIAL FOUND\0"
+    );
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&to_pe64(overlay))?)?,
+        miss
     );
     Ok(())
 }
@@ -889,4 +907,174 @@ fn stock_and_barnacle_run_verified_pdf_modules() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn compare_bytecode_write(executable: &Path, miss: &str) -> io::Result<()> {
+    use scalar::WriteFinish::{Abort, Check, Report, Return};
+    let parent = b"receipt seed";
+    let note = scalar::EXTRACTED_NOTE;
+    let child = "stream: Local.Generated.Child.UNOFFICIAL FOUND\0";
+    let prefix = "stream: Local.Generated.Prefix.UNOFFICIAL FOUND\0";
+    let raw = "stream: Local.Generated.Raw.UNOFFICIAL FOUND\0";
+    let fallback = format!("stream: {} FOUND\0", scalar::NAME);
+    let hash = |bytes: &[u8], name: &str| -> io::Result<String> {
+        Ok(format!(
+            "{}:{}:{name}\n",
+            barnacle::hash_reader(bytes)?.md5_hex(),
+            bytes.len()
+        ))
+    };
+    let full = hash(note, "Local.Generated.Child")?;
+    let both = full.clone() + &hash(&note[..11], "Local.Generated.Prefix")?;
+    let with_parent = both.clone() + &hash(parent, "Local.Generated.Raw")?;
+    let run = |program: String,
+               options: &str,
+               hashes: &str,
+               ldb: &str,
+               cases: &[(&[u8], &str)]|
+     -> io::Result<()> {
+        let root = tempfile::tempdir_in("/tmp")?;
+        let db = root.path().join("db");
+        fs::create_dir(&db)?;
+        fs::write(db.join(CBC), program)?;
+        if !hashes.is_empty() {
+            fs::write(db.join("generated.hdb"), hashes)?;
+        }
+        if !ldb.is_empty() {
+            fs::write(db.join("later.ldb"), ldb)?;
+        }
+        let options = format!("BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n{options}");
+        let (_daemon, socket) = start(root.path(), executable, &options)?;
+        for (input, expected) in cases {
+            assert_eq!(
+                unix_request(&socket, &stream_frame(input)?)?,
+                *expected,
+                "{options}"
+            );
+        }
+        Ok(())
+    };
+    let nested = zip::zip(&[("ledger.txt", parent.as_slice())], true, false, false)?;
+    run(
+        scalar::write_probe(Return),
+        "",
+        &both,
+        "",
+        &[(parent, child), (&nested, child)],
+    )?;
+    run(
+        scalar::write_probe(Return),
+        "",
+        &with_parent,
+        "",
+        &[(parent, raw)],
+    )?;
+    run(
+        scalar::write_probe(Report),
+        "",
+        &both,
+        "",
+        &[(parent, child)],
+    )?;
+    run(
+        scalar::write_probe(Report),
+        "",
+        "",
+        "",
+        &[(parent, &fallback)],
+    )?;
+    run(
+        scalar::write_probe(Return),
+        "MaxFileSize 24\nAlertExceedsMax yes\n",
+        &both,
+        "",
+        &[(parent, prefix)],
+    )?;
+    for (limit, expected) in [
+        (
+            "MaxScanSize 71\n",
+            "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0",
+        ),
+        ("MaxScanSize 72\n", child),
+        (
+            "MaxFiles 2\n",
+            "stream: Heuristics.Limits.Exceeded.MaxFiles FOUND\0",
+        ),
+        ("MaxFiles 3\n", child),
+    ] {
+        run(
+            scalar::write_probe(Return),
+            &(limit.to_owned() + "AlertExceedsMax yes\n"),
+            &full,
+            "",
+            &[(parent, expected)],
+        )?;
+    }
+    run(
+        scalar::write_probe(Check(19)),
+        "",
+        "",
+        "",
+        &[(parent, &fallback)],
+    )?;
+    run(
+        scalar::write_probe(Check(u32::MAX)),
+        "MaxFileSize 24\n",
+        "",
+        "",
+        &[(parent, &fallback)],
+    )?;
+    run(
+        scalar::write_probe(Abort),
+        "",
+        &full,
+        "",
+        &[(parent, child)],
+    )?;
+    let script = b"RECEIPT    SEED";
+    for target in [0, 7] {
+        let program =
+            scalar::write_probe(Return).replacen("Target:0;", &format!("Target:{target};"), 1);
+        run(program, "", &full, "", &[(script, child)])?;
+    }
+    let mut receipt = pe::benign_pe();
+    receipt[544..556].copy_from_slice(parent);
+    let later = "Local.Generated.Later;Target:0;0;726563656970742073656564\n";
+    let program = scalar::write_probe(Return).replacen("Target:0;", "Target:1;", 1);
+    run(program.clone(), "", &full, later, &[(&receipt, child)])?;
+    run(
+        program,
+        "",
+        "",
+        later,
+        &[(&receipt, "stream: Local.Generated.Later.UNOFFICIAL FOUND\0")],
+    )?;
+    let handler = concat!(
+        "Local.Generated.Hint;Engine:81-255,Target:1,HandlerType:CL_TYPE_GRAPHICS,Container:CL_TYPE_ANY;0;726563656970742073656564\n",
+        "Local.Generated.Handler;Engine:81-255,Target:5,Container:CL_TYPE_MSEXE;0;4d5a\n",
+    );
+    run(
+        scalar::write_probe(Return),
+        "DisableCache no\n",
+        &full,
+        handler,
+        &[(
+            &receipt,
+            "stream: Local.Generated.Handler.UNOFFICIAL FOUND\0",
+        )],
+    )?;
+    run(scalar::write_probe(Return), "", "", "", &[(parent, miss)])?;
+    Ok(())
+}
+
+#[test]
+fn barnacle_bytecode_write() -> io::Result<()> {
+    compare_bytecode_write(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_bytecode_write() -> io::Result<()> {
+    verify_stock()?;
+    compare_bytecode_write(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }

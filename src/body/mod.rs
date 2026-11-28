@@ -18,6 +18,7 @@ mod pattern;
 mod pcre;
 mod search;
 mod target;
+pub(crate) use logical::LogicalCursor;
 pub use logical::{HandlerType, LogicalIndex, LogicalMatches, LogicalObject};
 pub use logical_pcre::PcreLimits;
 pub(crate) use target::IconMetric;

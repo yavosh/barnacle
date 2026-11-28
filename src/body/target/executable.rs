@@ -10,6 +10,7 @@ pub(super) struct Executable {
     pub(super) entry: usize,
     pub(super) sections: Vec<Section>,
     pub(super) pe_overlay: Option<usize>,
+    pub(super) entry_at_last_pe_section: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +214,7 @@ fn read_pe(
     let mut mapped_entry = None;
     let mut high_rva = 0;
     let mut pe_overlay = None;
+    let mut last_present_raw = None;
     for h in sections {
         let rva = e.u32(h, 12)?;
         let pointer = e.u32(h, 20)?;
@@ -223,6 +225,10 @@ fn read_pe(
         } else {
             up(declared, falign)?.min(bytes.len() - raw)
         };
+        // The PE scanner removes on-disk sections starting past EOF. Its raw matcher retains them.
+        if size != 0 || declared == 0 {
+            last_present_raw = Some(raw);
+        }
         if rva > i32::MAX as usize
             || e.u32(h, 8)? > i32::MAX as usize
             || (size != 0 && (pointer > i32::MAX as usize || declared > i32::MAX as usize))
@@ -261,6 +267,7 @@ fn read_pe(
             entry: raw_entry,
             sections: result,
             pe_overlay,
+            entry_at_last_pe_section: last_present_raw == Some(raw_entry),
         },
         PeHeaders {
             size: header_bytes,
@@ -334,6 +341,7 @@ pub(super) fn elf(bytes: &[u8]) -> Option<Executable> {
         entry: entry as u32 as usize,
         sections,
         pe_overlay: None,
+        entry_at_last_pe_section: false,
     })
 }
 
@@ -408,5 +416,6 @@ pub(super) fn macho(bytes: &[u8]) -> Option<Executable> {
         entry,
         sections,
         pe_overlay: None,
+        entry_at_last_pe_section: false,
     })
 }

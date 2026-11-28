@@ -424,40 +424,43 @@ impl Generation {
                 self.logical.pdf_hooks(),
                 self.logical.pe_hooks(),
                 |obj, check| {
-                    let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
-                    let eligible = obj.normalized
-                        || obj.handled_format
-                        || raw::eligible(header, obj.layer.file_type);
-                    if !eligible && !obj.context.is_valid_pe() {
-                        return Ok(Verdict::Incomplete);
-                    }
-                    if let Some(name) =
-                        self.body
-                            .first_match_checked(obj.bytes, obj.context, &mut *check)?
-                    {
-                        return Ok(Verdict::Found(name.to_owned()));
-                    }
-                    // The script buffer goes directly to the body matcher. HTML parser
-                    // artifacts are files and also pass through whole-file matching.
-                    if self.has_hash_rules && eligible && !obj.body_only {
-                        let found = if obj.parents.is_empty() && !obj.normalized {
-                            hashes
-                                .as_ref()
-                                .expect("hash rules require root digests")
-                                .lookup(|a, d, s| self.index.lookup(a, d, s))?
-                        } else {
-                            self.index.match_bytes(obj.bytes, check)?
-                        };
-                        if let Some(name) = found {
-                            return Ok(Verdict::Found(name));
+                    if !obj.logical_step.is_resuming() {
+                        let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
+                        let eligible = obj.normalized
+                            || obj.handled_format
+                            || raw::eligible(header, obj.layer.file_type);
+                        if !eligible && !obj.context.is_valid_pe() {
+                            return Ok(Verdict::Incomplete);
+                        }
+                        if let Some(name) =
+                            self.body
+                                .first_match_checked(obj.bytes, obj.context, &mut *check)?
+                        {
+                            return Ok(Verdict::Found(name.to_owned()));
+                        }
+                        // The script buffer goes directly to the body matcher. HTML parser
+                        // artifacts are files and also pass through whole-file matching.
+                        if self.has_hash_rules && eligible && !obj.body_only {
+                            let found = if obj.parents.is_empty() && !obj.normalized {
+                                hashes
+                                    .as_ref()
+                                    .expect("hash rules require root digests")
+                                    .lookup(|a, d, s| self.index.lookup(a, d, s))?
+                            } else {
+                                self.index.match_bytes(obj.bytes, check)?
+                            };
+                            if let Some(name) = found {
+                                return Ok(Verdict::Found(name));
+                            }
                         }
                     }
-                    let matches = self.logical.matches_checked(
+                    let matches = self.logical.match_step(
                         obj.bytes,
                         obj.context,
                         obj.logical,
                         !self.disable_cache && obj.logical_rescan,
-                        &mut *check,
+                        Some(obj.logical_step),
+                        &mut &mut *check,
                     )?;
                     if let Some(hits) = obj.pe_hook_hits {
                         hits.extend(matches.pe_hooks);

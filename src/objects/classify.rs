@@ -1,7 +1,7 @@
 use super::udf;
 use super::{
-    ChildSink, Handling, InputKind, Options, archive, iso, office, ole, onenote, partition, pdf,
-    rtf, swf, text, xml,
+    ChildSink, Handling, HookControl, InputKind, Options, archive, iso, office, ole, onenote,
+    partition, pdf, rtf, swf, text, xml,
 };
 use crate::body::{HandlerType, ObjectContext, Target};
 use std::io;
@@ -31,7 +31,7 @@ pub(super) enum Parser {
     HfsPlus,
     UniversalMachO,
     ThinMachO,
-    Pe { overlay: Option<usize> },
+    Pe,
     Elf { has_layout: bool },
     PartitionMap(&'static str),
     Xml(xml::Format),
@@ -189,9 +189,7 @@ impl FileType {
                 Parser::Udf
             }
             Target::Pdf => Parser::Pdf,
-            Target::Pe if context.is_valid_pe() => Parser::Pe {
-                overlay: context.pe_overlay(),
-            },
+            Target::Pe if context.is_valid_pe() => Parser::Pe,
             Target::MachO if context.has_executable_layout() => Parser::ThinMachO,
             Target::Elf => Parser::Elf {
                 has_layout: context.has_executable_layout(),
@@ -350,7 +348,7 @@ impl Parser {
             | Self::Script
             | Self::AutoIt
             | Self::ThinMachO
-            | Self::Pe { .. }
+            | Self::Pe
             | Self::Elf { .. }
             | Self::Rtf
             | Self::Ole2
@@ -375,16 +373,21 @@ impl Parser {
             Self::Text | Self::None => Ok(Handling::Unrecognized),
         }
     }
+}
 
+impl FileType {
     pub fn after_raw(
-        self,
+        &self,
         bytes: &[u8],
         options: &Options,
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
-        match self {
-            Self::Pe { overlay } if options.scan_pe => {
-                let earlier = match overlay {
+        match self.parser {
+            Parser::Pe if options.scan_pe => {
+                let Some(header) = pe32_header(bytes) else {
+                    return Ok(Handling::Unrecognized);
+                };
+                let earlier = match self.context.pe_overlay() {
                     Some(start) => super::installer::legacy(&bytes[start..], sink)?,
                     None => Handling::Unrecognized,
                 };
@@ -392,12 +395,24 @@ impl Parser {
                     return Ok(earlier);
                 }
                 match sink.run_pe_all_hooks(bytes)? {
-                    Handling::Unrecognized => Ok(earlier),
-                    result => Ok(result),
+                    HookControl::Found => return Ok(Handling::Stopped),
+                    HookControl::Break => return Ok(Handling::Complete),
+                    HookControl::Continue => (),
                 }
+                if options.heuristic_alerts
+                    && u16::from_le_bytes([header[22], header[23]]) & 0x2000 == 0
+                    && self
+                        .context
+                        .last_section_entry()
+                        .is_some_and(|ep| parite(&bytes[ep..]))
+                    && sink.report_heuristic("Heuristics.W32.Parite.B")
+                {
+                    return Ok(Handling::Stopped);
+                }
+                Ok(earlier)
             }
-            Self::Pdf if options.scan_pdf => pdf::extract(bytes, options, sink),
-            Self::Text if options.scan_html && options.scan_normalized_script => {
+            Parser::Pdf if options.scan_pdf => pdf::extract(bytes, options, sink),
+            Parser::Text if options.scan_html && options.scan_normalized_script => {
                 text::after_raw(bytes, sink)
             }
             _ => Ok(Handling::Unrecognized),
@@ -405,12 +420,30 @@ impl Parser {
     }
 }
 
-pub(super) fn pe32_optional_header(bytes: &[u8]) -> bool {
-    let Some(pointer) = bytes.get(0x3c..).and_then(<[u8]>::first_chunk::<4>) else {
+fn pe32_header(bytes: &[u8]) -> Option<&[u8; 26]> {
+    let pointer = bytes.get(0x3c..)?.first_chunk::<4>()?;
+    let header = bytes
+        .get(u32::from_le_bytes(*pointer) as usize..)?
+        .first_chunk::<26>()?;
+    (header[24..] == [0x0b, 0x01]).then_some(header)
+}
+
+fn parite(entry: &[u8]) -> bool {
+    const LABEL: &[u8] = b"GetProcAddress\0";
+    let Some(window) = entry.first_chunk::<4096>() else {
         return false;
     };
-    (u32::from_le_bytes(*pointer) as usize)
-        .checked_add(24)
-        .and_then(|offset| bytes.get(offset..))
-        .is_some_and(|optional| optional.starts_with(b"\x0b\x01"))
+    let Some(label) = memchr::memmem::find(&window[..4040], LABEL) else {
+        return false;
+    };
+    // The first label selects the three pairs of little-endian words.
+    let start = label + LABEL.len();
+    let (words, _) = window[start..start + 24].as_chunks::<4>();
+    let (pairs, _) = words.as_chunks::<2>();
+    pairs
+        .iter()
+        .zip([0x505a4f, 0xffffb, 0xb8])
+        .all(|(&[left, right], difference)| {
+            u32::from_le_bytes(left) ^ u32::from_le_bytes(right) == difference
+        })
 }

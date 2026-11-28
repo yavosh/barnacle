@@ -2,6 +2,7 @@
 use std::fmt::Write;
 
 pub const NAME: &str = "Local.Bytecode.Receipt";
+pub const EXTRACTED_NOTE: &[u8] = b"Ordinary extracted ledger note";
 const RECEIPT_TRIGGER: &str = "0;72656365697074";
 const ADDRESSABLE: u64 = 1 << 15;
 const READ: u64 = 2;
@@ -402,6 +403,92 @@ pub fn match_icon(target: u8, prefilter: Option<&str>, group: &[u8], expected: u
                 vec![ret()],
             ],
         }],
+    )
+}
+
+pub fn pe_all_break() -> String {
+    program(
+        259,
+        "Local.Receipt.Stop.{};Target:1;0;544:72656365697074",
+        &[callable(&[32, 65, 32]), array(NAME.len() + 1, 8)],
+        &[(SET_NAME, 69, "setvirusname")],
+        name_globals(0x8000, 3, 70),
+        &[Function {
+            args: 0,
+            slots: &[32],
+            blocks: &[vec![format!(
+                "T{}{}{}",
+                fixed(19, 2),
+                number(32),
+                immediate(0xcea5e, 4)
+            )]],
+        }],
+    )
+}
+
+pub enum WriteFinish {
+    Return,
+    Report,
+    Check(u32),
+    Abort,
+}
+
+pub fn write_probe(finish: WriteFinish) -> String {
+    const WRITE: u64 = 3;
+    let split = 11;
+    let mut globals = name_globals(0, 6, 70);
+    global_array(&mut globals, 71, EXTRACTED_NOTE);
+    global_pointer(&mut globals, 65, 3, 0);
+    global_pointer(&mut globals, 65, 3, split);
+    let mut instructions = vec![
+        call(0, WRITE, &[pointer(4), immediate(split, 4)]),
+        call(
+            1,
+            WRITE,
+            &[
+                pointer(5),
+                immediate(EXTRACTED_NOTE.len() as u64 - split, 4),
+            ],
+        ),
+    ];
+    let blocks = match finish {
+        WriteFinish::Check(second) => {
+            instructions.extend([
+                op(1, 3, 21, &[number(32), number(0), immediate(split, 4)]),
+                op(
+                    1,
+                    4,
+                    21,
+                    &[number(32), number(1), immediate(second.into(), 4)],
+                ),
+                op(1, 3, 11, &[number(3), number(4)]),
+                branch(3, 1, 2),
+            ]);
+            vec![instructions, vec![report(2), ret()], vec![ret()]]
+        }
+        other => {
+            if matches!(other, WriteFinish::Report) {
+                instructions.push(report(2));
+            }
+            instructions.push(if matches!(other, WriteFinish::Abort) {
+                format!("T{}", fixed(45, 2))
+            } else {
+                ret()
+            });
+            vec![instructions]
+        }
+    };
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(EXTRACTED_NOTE.len(), 8),
+        ],
+        &[(WRITE, 69, "write"), (SET_NAME, 69, "setvirusname")],
+        globals,
+        &[32, 32, 32, 1, 1],
+        &blocks,
     )
 }
 

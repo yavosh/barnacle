@@ -1,5 +1,5 @@
 //! Metadata attached to one PDF parser invocation, independent of its current input map.
-use super::{ChildSink, Handling, Id, MAX_OBJECTS, PdfHookControl, TOKEN_BLOCK, number, white};
+use super::{ChildSink, Handling, HookControl, Id, MAX_OBJECTS, TOKEN_BLOCK, number, white};
 use crate::bytecode::{PdfHookContext, PdfHookObject, PdfPhase};
 use memchr::memmem;
 use std::io;
@@ -31,7 +31,7 @@ impl<'a> Hooks<'a> {
         phase: PdfPhase,
         input: &[u8],
         sink: &mut dyn ChildSink,
-    ) -> io::Result<PdfHookControl> {
+    ) -> io::Result<HookControl> {
         sink.check()?;
         sink.run_pdf_hooks(
             input,
@@ -51,9 +51,9 @@ impl<'a> Hooks<'a> {
         sink: &mut dyn ChildSink,
     ) -> io::Result<Option<Handling>> {
         Ok(match self.run(phase, self.parent, sink)? {
-            PdfHookControl::Continue => None,
-            PdfHookControl::Break => Some(Handling::Complete),
-            PdfHookControl::Found => Some(Handling::Stopped),
+            HookControl::Continue => None,
+            HookControl::Break => Some(Handling::Complete),
+            HookControl::Found => Some(Handling::Stopped),
         })
     }
 

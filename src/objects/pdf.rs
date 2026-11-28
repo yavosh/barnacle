@@ -1,5 +1,5 @@
 //! Scan PDF streams after the raw PDF matcher, in physical indirect-object order.
-use super::{ChildSink, Handling, Limit, ObjectBytes, PdfHookControl, Snapshot};
+use super::{ChildSink, Handling, HookControl, Limit, ObjectBytes, Snapshot};
 use crate::bytecode::PdfPhase;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -1176,7 +1176,7 @@ fn visit_dump(
     if let Some(hooks) = post
         && matches!(
             hooks.run(PdfPhase::PostDump, data, sink)?,
-            PdfHookControl::Found
+            HookControl::Found
         )
     {
         return Ok(true);

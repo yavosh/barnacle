@@ -26,6 +26,7 @@ pub struct Program {
     trigger: Box<str>,
     functions: Vec<Function>,
     uses_match_offsets: bool,
+    pub(crate) writes_output: bool,
 }
 
 #[derive(Debug)]
@@ -206,6 +207,7 @@ impl Program {
             hook,
             trigger: trigger.into(),
             uses_match_offsets,
+            writes_output: apis.contains(&host::WRITE),
             functions,
         }))
     }
@@ -236,14 +238,24 @@ impl Program {
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
-        self.run_logical(input, (offsets, counts), None, debug, timeout, check)
+        self.run_logical(
+            input,
+            LogicalInput {
+                offsets,
+                counts,
+                has_entry: None,
+                output: None,
+            },
+            debug,
+            timeout,
+            check,
+        )
     }
 
     pub(crate) fn run_logical(
         &self,
         input: &[u8],
-        (offsets, counts): (&[u32; 64], &[u32]),
-        has_entry: Option<bool>,
+        logical: LogicalInput<'_>,
         debug: bool,
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
@@ -253,10 +265,11 @@ impl Program {
         }
         let scan = Scan {
             input,
-            offsets,
-            counts,
+            offsets: logical.offsets,
+            counts: logical.counts,
             debug,
-            has_entry: has_entry.map_or_else(Default::default, Into::into),
+            output: logical.output,
+            has_entry: logical.has_entry.map_or_else(Default::default, Into::into),
             pdf: None,
             pe: Default::default(),
         };
@@ -309,6 +322,7 @@ impl Program {
             offsets: &[0; 64],
             debug,
             pdf,
+            output: None,
             has_entry: Default::default(),
             pe: Default::default(),
         };
@@ -423,7 +437,15 @@ struct Caller<'a> {
     dest: Option<usize>,
 }
 
+pub(crate) struct LogicalInput<'a> {
+    pub offsets: &'a [u32; 64],
+    pub counts: &'a [u32],
+    pub has_entry: Option<bool>,
+    pub output: Option<(&'a std::cell::RefCell<super::Output>, &'a std::path::Path)>,
+}
+
 struct Scan<'a> {
+    output: Option<(&'a std::cell::RefCell<super::Output>, &'a std::path::Path)>,
     input: &'a [u8],
     offsets: &'a [u32; 64],
     counts: &'a [u32],
@@ -552,6 +574,9 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
     let mut apis = Vec::new();
     for _ in 0..count {
         let id = field(line.number())?;
+        if id == host::WRITE && hook != LOGICAL_HOOK {
+            return Err(unsupported("write outside a logical program"));
+        }
         if id == host::MATCH_ICON && hook != LOGICAL_HOOK {
             return Err(unsupported("matchicon outside a logical program"));
         }
@@ -1934,6 +1959,7 @@ mod tests {
                         counts: &[],
                         debug: false,
                         pdf: None,
+                        output: None,
                         has_entry: Default::default(),
                         pe: Default::default(),
                     },
@@ -1975,6 +2001,7 @@ mod tests {
                     counts: &[],
                     debug: false,
                     pdf: None,
+                    output: None,
                     has_entry: Default::default(),
                     pe: Default::default(),
                 },
@@ -2018,6 +2045,7 @@ mod tests {
                     counts: &[],
                     debug: false,
                     pdf: None,
+                    output: None,
                     has_entry: Default::default(),
                     pe: Default::default(),
                 },

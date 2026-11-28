@@ -6,6 +6,7 @@ use super::{
 use crate::body::pe_metadata;
 use std::io::{self, Write};
 
+pub(super) const WRITE: u64 = 3;
 const DEBUG_STRING: u64 = 6;
 const DEBUG_UINT: u64 = 7;
 const PE_RAW_OFFSET: u64 = 15;
@@ -20,6 +21,7 @@ const POLL_BYTES: usize = 256 * 1024;
 
 pub(super) fn declaration(id: u64) -> Option<(&'static [u8], &'static [u64])> {
     Some(match id {
+        WRITE => (b"write\0", &[I32, BYTE_POINTER, I32]),
         DEBUG_STRING => (b"debug_print_str\0", &[I32, BYTE_POINTER, I32]),
         DEBUG_UINT => (b"debug_print_uint\0", &[I32, I32]),
         MATCH_ICON => (b"matchicon\0", &[I32, BYTE_POINTER, I32, BYTE_POINTER, I32]),
@@ -74,6 +76,7 @@ impl PeField {
 #[derive(Debug)]
 pub(super) enum Operation {
     Number(Value),
+    Write(Address, Value),
     PeField(PeField),
     PeRawOffset(Value),
     PeSection(Address, Value),
@@ -91,6 +94,10 @@ pub(super) fn decode(
     globals: &[Global],
 ) -> io::Result<Operation> {
     Ok(match (id, count) {
+        (WRITE, 2) => Operation::Write(
+            Address::decode(line, slots, globals, false)?,
+            line.scalar(slots, Width::WORD)?,
+        ),
         (READ_NUMBER, 1) => Operation::Number(line.scalar(slots, Width::WORD)?),
         (PE_RAW_OFFSET, 1) => Operation::PeRawOffset(line.scalar(slots, Width::WORD)?),
         (MATCH_ICON, 4) => {
@@ -130,6 +137,27 @@ impl Operation {
         check: &mut impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<u64>> {
         let result = match self {
+            Self::Write(address, length) => {
+                let length = length.get(frame) as u32;
+                if (length as i32) < 0 {
+                    return Ok(None);
+                }
+                if memory::outcome(address.check_host_span(frame, length as usize))?.is_none() {
+                    return Ok(None);
+                }
+                let (output, directory) = scan
+                    .output
+                    .ok_or_else(|| unsupported("write without child traversal"))?;
+                let mut output = output.borrow_mut();
+                if !output.accepts(length as usize) {
+                    return Ok(Some(u32::MAX.into()));
+                }
+                let Some(bytes) = memory::outcome(address.read(frame, length as usize))? else {
+                    return Ok(None);
+                };
+                output.append(directory, bytes, check)?;
+                length
+            }
             Self::Number(radix) => {
                 let radix = radix.get(frame) as u32;
                 read_number(scan.input, &mut frame.cursor, radix, check)?

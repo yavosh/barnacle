@@ -6,7 +6,10 @@ use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::path::Path;
 
+mod output;
+pub(crate) use output::{Output, OutputLimits};
 mod program;
+pub(crate) use program::LogicalInput;
 pub use program::Program;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -42,7 +42,7 @@ It also checks the Rust compiler against every eligible module.
 The compiler accepts 72 eligible modules, including 69 logical modules, both PDF hooks, and one `PE_ALL` hook.
 The archive test loads those modules into one generation and verifies each hook count.
 The inventory groups the remaining 10 eligible modules by the first compiler rejection.
-Six use the PE unpacker hook. Four declare unsupported host APIs.
+Six use the PE unpacker hook. Three declare an unsupported host API. One needs pointer-to-integer conversion.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -93,6 +93,9 @@ The heap and PE tests compare helper writes, short reads, in-memory search, and 
 The icon tests compare an icon-qualified logical trigger and the `matchicon` host call.
 The trigger checks the PE icon before bytecode runs.
 In pinned stock, the host call uses an empty resource table and returns zero for valid arguments.
+Logical bytecode can write a child to a spool. The scan checks that child before reporting the bytecode's own name.
+The tests cover output that survives a rejected write, VM abort, or script normalization.
+Stock charges the output once at extraction and again when admitting the child, so both charges affect scan limits.
 The tests also cover competing generic logical signatures.
 When both rules match, stock evaluates the one loaded first from the database directory.
 Barnacle returns its existing incomplete-scan error for misses while detection coverage remains partial.
@@ -130,6 +133,7 @@ The completion phase requires remaining parser flags. The post-extraction phase 
 Barnacle runs supported `PE_ALL` programs after overlay scanning. A matching logical prefilter enables the hook for that PE object.
 `PE_ALL` programs can read the entry RVA, PE header offset, optional header size, and optional header magic.
 The comparison covers earlier raw and overlay findings, sibling archive members, PE32+, and the `ScanPE` and unsigned bytecode options.
+On PE32+, the scan skips the overlay and hook phase. A `PE_ALL` break skips later PE checks.
 One signed `PE_ALL` module loads in the archive test. The other requires unsupported host APIs. `PE_UNPACKER` is unsupported.
 
 Both signed PDF hooks query the current phase and configuration functionality level, which is 213.
@@ -159,7 +163,8 @@ Use the effective daemon options and engine module flags together to determine w
 
 | Enabled stock detector | Barnacle verification |
 | --- | --- |
-| PE heuristics for Parite, Kriz, Magistr, and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
+| PE Parite heuristic | Stock comparisons cover the exact verdict, option gates, raw signature priority, and `PE_ALL` breaks. The fixture uses inert data in a non-executable section. [Parite tests](../tests/bytecode_reference/parite.rs) |
+| PE heuristics for Kriz, Magistr, and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
 | PDF obfuscated names | Stock comparisons cover physical and packed dictionaries, escaped Flate filters, and competing child signatures. |
 | Mydoom log checksum | Stock comparisons cover binary and UTF-16BE inputs, checksums, minimum size, the early word screen, and precedence against a hash signature. [Log tests](../tests/object_mydoom.rs) |
 | RIFF | Named finding parity is open. |

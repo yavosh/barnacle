@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 mod executable;
 pub(crate) use executable::{PeMetadata, pe_metadata};
 mod icons;
-pub(crate) use icons::IconMetric;
+pub(crate) use icons::{IconMetric, IconSamples};
 mod version_info;
 use executable::Executable;
 
@@ -253,6 +253,11 @@ impl ObjectContext {
 
     pub(crate) fn pe_overlay(&self) -> Option<usize> {
         self.exe.as_ref()?.pe_overlay
+    }
+
+    pub(crate) fn last_section_entry(&self) -> Option<usize> {
+        let layout = self.exe.as_ref()?;
+        layout.entry_at_last_pe_section.then_some(layout.entry)
     }
 
     pub fn accepts(&self, target: Target) -> bool {
