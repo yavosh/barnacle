@@ -1029,8 +1029,13 @@ impl Cursor<'_> {
         field(globals.get(id))
     }
 
-    fn const_bytes<'a>(&mut self, globals: &'a [Global]) -> io::Result<(&'a [u8], usize)> {
-        let Global::Pointer { base, offset, .. } = self.global(globals)? else {
+    fn const_bytes<'a>(&mut self, globals: &'a [Global]) -> io::Result<Option<&'a [u8]>> {
+        let Global::Pointer {
+            base,
+            offset,
+            source_at_zero,
+        } = self.global(globals)?
+        else {
             return Err(unsupported("host call without an immutable byte pointer"));
         };
         let Some(Global::Bytes(bytes, _)) = globals.get(*base) else {
@@ -1044,7 +1049,7 @@ impl Cursor<'_> {
         if len > bytes.len() {
             return Err(invalid("CBC host-call length exceeds its global array"));
         }
-        Ok((bytes, len))
+        Ok((!*source_at_zero).then_some(bytes))
     }
 }
 
@@ -1187,7 +1192,7 @@ enum Expression {
     MatchOffset(usize),
     MatchCount(usize),
     FileSize,
-    SetName(Box<str>),
+    SetName(Option<Box<str>>),
     Host(host::Operation),
     Pdf(pdf::Query),
 }
@@ -1298,7 +1303,8 @@ impl Expression {
                 }
                 u64::from(result)
             }
-            Self::SetName(ref s) => {
+            Self::SetName(None) => return Ok(None),
+            Self::SetName(Some(ref s)) => {
                 *name = Some(s);
                 0
             }
@@ -1665,7 +1671,9 @@ fn host_call(
             Expression::ExtractNew
         }
         (SET_VIRUS_NAME, 2) => {
-            let (bytes, _) = line.const_bytes(globals)?;
+            let Some(bytes) = line.const_bytes(globals)? else {
+                return Ok(Expression::SetName(None));
+            };
             // The VM checks the supplied length. The API reads through the first NUL.
             let nul = field(bytes.iter().position(|&b| b == 0))?;
             let name =
@@ -1676,7 +1684,7 @@ fn host_call(
             *data_budget = data_budget
                 .checked_sub(name.len())
                 .ok_or_else(|| unsupported("constant data budget"))?;
-            Expression::SetName(name.into())
+            Expression::SetName(Some(name.into()))
         }
         (FILE_BYTEAT, 1) => Expression::FileByte(line.scalar(slots, Width::WORD)?),
         (READ, 2) => Expression::Memory(MemoryOp::Read(

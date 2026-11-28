@@ -550,6 +550,15 @@ fn stock_bytecode_disasm_records() -> io::Result<()> {
 fn compare_memory_and_pe_queries(executable: &Path, miss: &str) -> io::Result<()> {
     let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
     for source_at_zero in [true, false] {
+        for set_name in [true, false] {
+            run_program(
+                executable,
+                &scalar::direct_global_pointer(source_at_zero, set_name),
+                options,
+                &[(b"receipt for a pen", !source_at_zero)],
+                miss,
+            )?;
+        }
         run_program(
             executable,
             &scalar::zero_offset_pointer(source_at_zero),

@@ -1426,6 +1426,39 @@ pub fn zero_offset_pointer(source_at_zero: bool) -> String {
     )
 }
 
+pub fn direct_global_pointer(source_at_zero: bool, set_name: bool) -> String {
+    let mut globals = format!("G{}{}{}@`", number(0), number(4), number(0));
+    let name = [NAME.as_bytes(), &[0]].concat();
+    let source = if source_at_zero {
+        global_pointer(&mut globals, 65, 3, 0);
+        global_pointer(&mut globals, 65, 3, 0);
+        global_array(&mut globals, 70, &name);
+        1
+    } else {
+        global_array(&mut globals, 70, &name);
+        global_pointer(&mut globals, 65, 1, 0);
+        global_pointer(&mut globals, 65, 1, 0);
+        3
+    };
+    let operation = if set_name {
+        call(
+            1,
+            SET_NAME,
+            &[pointer(source), immediate(NAME.len() as u64, 4)],
+        )
+    } else {
+        op(8, 0, 39, &[pointer(source)])
+    };
+    image(
+        RECEIPT_TRIGGER,
+        &[callable(&[32, 65, 32]), array(name.len(), 8)],
+        &[(SET_NAME, 69, "setvirusname")],
+        globals,
+        &[8, 32],
+        &[vec![operation, report(1), ret()]],
+    )
+}
+
 pub fn heap_search() -> String {
     let mut globals = name_globals(0, 5, 73);
     global_array(&mut globals, 74, b"!AY");

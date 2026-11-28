@@ -425,6 +425,7 @@ pub(super) fn outcome<T>(result: Result<T, MemoryFault>) -> io::Result<Option<T>
 
 #[derive(Debug)]
 pub(super) enum Address {
+    Null,
     Object(usize),
     Pointer(usize),
     Constant(Arc<[u8]>, usize),
@@ -441,9 +442,17 @@ impl Address {
             if writable {
                 return Err(unsupported("write to global bytes"));
             }
-            let Global::Pointer { base, offset, .. } = line.global(globals)? else {
+            let Global::Pointer {
+                base,
+                offset,
+                source_at_zero,
+            } = line.global(globals)?
+            else {
                 return Err(unsupported("non-byte global memory operand"));
             };
+            if *source_at_zero {
+                return Ok(Self::Null);
+            }
             let Some(Global::Bytes(bytes, _)) = globals.get(*base) else {
                 return Err(invalid("invalid CBC byte pointer"));
             };
@@ -466,6 +475,7 @@ impl Address {
 
     fn local_pointer(&self, frame: &Frame<'_>) -> Result<(u32, i32), MemoryFault> {
         match *self {
+            Self::Null => Err(MemoryFault::Null),
             Self::Object(i) => Ok((frame.current.base + i as u32, 0)),
             Self::Pointer(i) => {
                 let encoded = frame.get(i);
