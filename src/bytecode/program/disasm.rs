@@ -192,6 +192,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
             args[0] = register(opcode & 7, wide);
             [59, 52, 124, 129][usize::from((opcode - 0x40) >> 3)]
         }
+        0x60 => 125 + u16::from(record[2]), // PUSHAD, PUSHA
         0x68 | 0x6a => {
             args[0] = input.immediate(if opcode == 0x68 { wide } else { 0 }, false)?;
             124

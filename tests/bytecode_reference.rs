@@ -1,6 +1,8 @@
 //! Compare harmless bytecode programs against pinned clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "bytecode_reference/eicar.rs"]
+mod eicar;
 #[path = "bytecode_reference/kriz.rs"]
 mod kriz;
 #[path = "bytecode_reference/magistr.rs"]
@@ -433,6 +435,8 @@ fn compare_disasm_records(executable: &Path, miss: &str) -> io::Result<()> {
         }
         bytes
     };
+    add(&[0x60], 1, record([125, 0, 0, 0, 0], [&[]; 3]), true);
+    add(&[0x66, 0x60], 2, record([126, 0, 1, 0, 0], [&[]; 3]), true);
     add(&[0x90], 1, record([117, 0, 0, 0, 0], [&[]; 3]), true);
     add(&[0xf3, 0x90], 1, record([138, 0, 0, 0, 0], [&[]; 3]), true);
     add(

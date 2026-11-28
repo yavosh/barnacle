@@ -65,6 +65,22 @@ All profiles use a private stock clamd instance.
 The fixture SHA-256 is `36d282680ef43be4eb5fc1aec95b6d262460c3a5ffb2563a280a35dbe64bc8b3`.
 [Pinned upstream fixture](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/unit_tests/input/bytecode_sigs/Clamav-Unit-Test-Signature.cbc)
 
+### Signed EICAR logical rule
+
+Stock clamd loads only verified `bytecode.cvd` v339 with `BytecodeUnsigned no` and `BytecodeMode ForceInterpreter`.
+Barnacle loads its authenticated member `6327695.cbc` into the logical index as an official rule.
+The comparison runs its logical prefilter and bytecode on the standard EICAR test string. [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/)
+
+Both report `Eicar-Signature` for the canonical 68 bytes and space padding to 128 bytes.
+They also match a suffix containing space, tab, LF, CR, and Control-Z.
+Changing the first byte, removing the last byte, appending a letter, and padding to 129 bytes all miss.
+Stock reports clean on every input with `Bytecode no`.
+The production Barnacle daemon still returns incomplete before matching a CVD generation. [Paired regression](../tests/bytecode_reference/eicar.rs)
+
+```sh
+BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --test bytecode_reference verified_eicar_logical_rule -- --ignored
+```
+
 ## Supported execution
 
 The Rust interpreter executes logical bytecode with typed integer locals, arithmetic, comparisons, casts, branches, and loops.
@@ -88,6 +104,7 @@ Reads from copied fields that Barnacle does not model return an explicit unsuppo
 The `disasm_x86` host call decodes supported legacy 32-bit instructions at the current cursor.
 The return value is the next absolute offset. The cursor stays in place.
 Comparison with pinned stock covered 6,384 instruction records, including operand metadata and result length.
+One verified module checks for `PUSHAD`. Paired daemon tests check the complete records and next offsets for `PUSHAD` and `PUSHA`.
 Paired daemon tests cover invalid instructions, EOF, and which result bytes change on failure.
 Unmodeled encodings return an explicit unsupported error. These include x87, indirect calls and jumps, and several two-byte groups.
 Programs that use first offsets currently require indexed pattern subsignatures.
