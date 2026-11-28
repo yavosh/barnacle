@@ -105,7 +105,7 @@ ARM JIT, SWIZZOR, and the statistics module show as off in the dynamic settings.
 | --- | --- |
 | Raw, text, script, and HTML | Paired tests exercise HTML, script normalization, MIME, TNEF, and uuencoded attachments. [Text comparisons](../tests/object_text.rs) |
 | Archives and installers | Tests cover compressed streams, archive order, NSIS, AutoIt EA05 and EA06, and ordinary InstallShield packages. Legacy InstallShield cabinets remain open. [Archive and installer coverage](object-handling.md#reference-handlers) |
-| Executables | Tests cover PE resources, ELF sections, thin and universal Mach-O files, and Java classes in JARs. PE unpacking remains open. [Executable comparisons](object-handling.md#executable-containers) |
+| Executables | Tests cover PE resources, UPX 4.2.4 NRV PE32, ELF sections, Mach-O files, and Java classes in JARs. Other PE unpackers remain open. [Executable comparisons](object-handling.md#executable-containers) |
 | Documents | Tests cover PDF, XDP, RTF, OLE2, Office XML, HWP, and OneNote. Excel comparisons cover picture entries, nested workbooks, and mixed Office extraction. VBA, XLM, and additional encryption cases remain open. [Document comparisons](object-handling.md#reference-handlers) · [Excel pictures](../tests/object_ole_xls.rs) |
 | Media and disks | Tests cover image signature targets, WAVE, SWF, optical images, partition tables, HFS+, DMG, and XAR. Image heuristics and several disk layouts need further comparisons. [Media and disk coverage](object-handling.md#reference-handlers) |
 

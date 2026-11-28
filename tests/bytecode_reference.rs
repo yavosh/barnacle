@@ -790,7 +790,7 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
         rules.push_str(&format!("{}:{}:{name}\n", hash.md5_hex(), input.len()));
     }
     fs::write(db.join("receipt.hdb"), rules)?;
-    let (_daemon, socket) = start(root.path(), executable, options)?;
+    let (daemon, socket) = start(root.path(), executable, options)?;
     assert_eq!(
         unix_request(&socket, &stream_frame(&marked)?)?,
         "stream: Pe.RawReceipt.UNOFFICIAL FOUND\0"
@@ -803,6 +803,25 @@ fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {
         unix_request(&socket, &stream_frame(&to_pe64(overlay))?)?,
         miss
     );
+    drop(daemon);
+
+    let packed = include_bytes!("fixtures/upx/ledger-nrv2b.exe");
+    fs::write(
+        db.join("receipt.hdb"),
+        "52bd7b6f5b3a2c728c73c46d48c1ac51:69632:Pe.UnpackedReceipt\n",
+    )?;
+    for (pattern, expected) in [
+        ("0:4d5a", miss),
+        (
+            "0:7f454c46",
+            "stream: Pe.UnpackedReceipt.UNOFFICIAL FOUND\0",
+        ),
+    ] {
+        let stop = scalar::pe_all_break().replace("544:72656365697074", pattern);
+        fs::write(db.join(CBC), stop)?;
+        let (_daemon, socket) = start(root.path(), executable, options)?;
+        assert_eq!(unix_request(&socket, &stream_frame(packed)?)?, expected);
+    }
     Ok(())
 }
 

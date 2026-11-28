@@ -409,7 +409,10 @@ impl FileType {
                 {
                     return Ok(Handling::Stopped);
                 }
-                Ok(earlier)
+                match super::upx::extract(bytes, sink)? {
+                    Handling::Unrecognized => Ok(earlier),
+                    unpacked => Ok(unpacked),
+                }
             }
             Parser::Pdf if options.scan_pdf => pdf::extract(bytes, options, sink),
             Parser::Text if options.scan_html && options.scan_normalized_script => {

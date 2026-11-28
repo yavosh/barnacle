@@ -25,6 +25,7 @@ mod rtf;
 mod swf;
 mod text;
 mod udf;
+mod upx;
 mod xdp;
 mod xml;
 
