@@ -56,6 +56,22 @@ pub(super) fn ignored(bytes: &[u8]) -> bool {
 }
 
 impl FileType {
+    pub fn before_raw(
+        &self,
+        bytes: &[u8],
+        options: &Options,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Handling> {
+        if options.heuristic_alerts
+            && matches!(self.name, "CL_TYPE_BINARY_DATA" | "CL_TYPE_TEXT_UTF16BE")
+            && mydoom_log(bytes)
+            && sink.report_heuristic("Heuristics.Worm.Mydoom.M.log")
+        {
+            return Ok(Handling::Stopped);
+        }
+        self.parser.before_raw(bytes, options, sink)
+    }
+
     pub fn classify(bytes: &[u8], kind: InputKind, sink: &mut dyn ChildSink) -> io::Result<Self> {
         match kind {
             InputKind::Normalized(target) => return Ok(Self::typed(bytes, target, Parser::None)),
@@ -263,6 +279,25 @@ impl Disk {
     }
 }
 
+fn mydoom_log(bytes: &[u8]) -> bool {
+    let Some(records) = bytes.get(..64) else {
+        return false;
+    };
+    // The reference screens up to five leading words as the file grows.
+    let screened = (bytes.len() / 32).min(5);
+    let (words, _) = records.as_chunks::<4>();
+    if words[..screened].contains(&[0xff; 4]) {
+        return false;
+    }
+    words.as_chunks::<8>().0.iter().all(|record| {
+        let header = u32::from_be_bytes(record[0]);
+        let sum = record[1..].iter().fold(0u32, |sum, &word| {
+            sum.wrapping_add(u32::from_be_bytes(word) ^ !header)
+        });
+        sum == header
+    })
+}
+
 impl Parser {
     pub fn disk_descriptor(self) -> Option<(usize, Disk)> {
         match self {
@@ -272,7 +307,7 @@ impl Parser {
         }
     }
 
-    pub fn before_raw(
+    fn before_raw(
         self,
         bytes: &[u8],
         options: &Options,

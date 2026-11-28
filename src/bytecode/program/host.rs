@@ -14,6 +14,7 @@ const READ_NUMBER: u64 = 23;
 const RUNTIME_ERROR: u64 = 42;
 const DEBUG_START: u64 = 54;
 const DEBUG_BYTES: u64 = 55;
+pub(super) const MATCH_ICON: u64 = 89;
 const NUMBER_WINDOW: usize = 16;
 const POLL_BYTES: usize = 256 * 1024;
 
@@ -21,6 +22,7 @@ pub(super) fn declaration(id: u64) -> Option<(&'static [u8], &'static [u64])> {
     Some(match id {
         DEBUG_STRING => (b"debug_print_str\0", &[I32, BYTE_POINTER, I32]),
         DEBUG_UINT => (b"debug_print_uint\0", &[I32, I32]),
+        MATCH_ICON => (b"matchicon\0", &[I32, BYTE_POINTER, I32, BYTE_POINTER, I32]),
         PE_RAW_OFFSET => (b"pe_rawaddr\0", &[I32, I32]),
         READ_NUMBER => (b"read_number\0", &[I32, I32]),
         RUNTIME_ERROR => (b"bytecode_rt_error\0", &[I32, I32]),
@@ -75,6 +77,7 @@ pub(super) enum Operation {
     PeField(PeField),
     PeRawOffset(Value),
     PeSection(Address, Value),
+    MatchIcon([(Address, Value); 2]),
     RuntimeError(Value),
     DebugInt(Value),
     DebugText(Address, Value, TextMode),
@@ -90,6 +93,15 @@ pub(super) fn decode(
     Ok(match (id, count) {
         (READ_NUMBER, 1) => Operation::Number(line.scalar(slots, Width::WORD)?),
         (PE_RAW_OFFSET, 1) => Operation::PeRawOffset(line.scalar(slots, Width::WORD)?),
+        (MATCH_ICON, 4) => {
+            let mut group = || {
+                Ok::<_, io::Error>((
+                    Address::decode(line, slots, globals, false)?,
+                    line.scalar(slots, Width::WORD)?,
+                ))
+            };
+            Operation::MatchIcon([group()?, group()?])
+        }
         (PE_SECTION, 2) => Operation::PeSection(
             Address::decode(line, slots, globals, true)?,
             line.scalar(slots, Width::WORD)?,
@@ -121,6 +133,26 @@ impl Operation {
             Self::Number(radix) => {
                 let radix = radix.get(frame) as u32;
                 read_number(scan.input, &mut frame.cursor, radix, check)?
+            }
+            Self::MatchIcon(groups) => {
+                let has_entry = scan
+                    .has_entry
+                    .get_or_init(|| crate::body::ObjectContext::raw(scan.input).has_entry());
+                let valid = *has_entry && groups.iter().all(|(_, length)| length.get(frame) <= 127);
+                for (address, length) in groups {
+                    let length = length.get(frame) as usize;
+                    let span = if valid && length != 0 {
+                        address.read(frame, length).map(|_| ())
+                    } else {
+                        address.check_host_span(frame, length)
+                    };
+                    if memory::outcome(span)?.is_none() {
+                        return Ok(None);
+                    }
+                }
+                // Stock 1.4.3 leaves the API's resource directory count zero.
+                // Its call to findres cannot enumerate any icon groups.
+                if valid { 0 } else { u32::MAX }
             }
             Self::PeField(field) => {
                 let pe = scan

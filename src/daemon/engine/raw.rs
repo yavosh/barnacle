@@ -193,18 +193,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
     {
         return false;
     }
-    // The built-in Mydoom log heuristic can run before the raw scan. Withhold
-    // a result if its first 32-byte record passes the reference checksum.
-    if header.len() >= 64 {
-        let words = header[..32].as_chunks::<4>().0;
-        let first = u32::from_be_bytes(words[0]);
-        let sum = words[1..].iter().fold(0u32, |sum, &w| {
-            sum.wrapping_add(u32::from_be_bytes(w) ^ !first)
-        });
-        if sum == first {
-            return false;
-        }
-    }
     true
 }
 

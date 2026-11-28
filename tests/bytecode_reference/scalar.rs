@@ -359,6 +359,52 @@ fn name_globals(max_host: u64, globals_count: u64, name_type: u64) -> String {
     row
 }
 
+pub fn match_icon(target: u8, prefilter: Option<&str>, group: &[u8], expected: u32) -> String {
+    let mut globals = name_globals(0, 5, 71);
+    global_array(&mut globals, 72, group);
+    global_pointer(&mut globals, 65, 3, 0);
+    let conditions = prefilter.map_or_else(String::new, |g| format!(",IconGroup1:{g}"));
+    program(
+        256,
+        &format!("Local.Icon.Trigger.{{}};Engine:81-255,Target:{target}{conditions};0;0:4d5a"),
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 65, 32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(group.len(), 8),
+        ],
+        &[(SET_NAME, 69, "setvirusname"), (89, 70, "matchicon")],
+        globals,
+        &[Function {
+            args: 0,
+            slots: &[32, 1],
+            blocks: &[
+                vec![
+                    call(
+                        0,
+                        89,
+                        &[
+                            pointer(4),
+                            immediate(0, 4),
+                            pointer(4),
+                            immediate(group.len() as u64, 4),
+                        ],
+                    ),
+                    op(
+                        1,
+                        1,
+                        21,
+                        &[number(32), number(0), immediate(u64::from(expected), 4)],
+                    ),
+                    branch(1, 1, 2),
+                ],
+                vec![report(0), ret()],
+                vec![ret()],
+            ],
+        }],
+    )
+}
+
 pub fn pe_all_hook() -> String {
     let mut globals = name_globals(0x8005, 11, 71);
     global_pointer(&mut globals, 67, 0x8000, 0);

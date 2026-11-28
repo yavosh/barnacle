@@ -39,10 +39,10 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 71 eligible modules, including 68 logical modules, both PDF hooks, and one `PE_ALL` hook.
+The compiler accepts 72 eligible modules, including 69 logical modules, both PDF hooks, and one `PE_ALL` hook.
 The archive test loads those modules into one generation and verifies each hook count.
-The inventory groups the remaining 11 eligible modules by the first compiler rejection.
-Six use the PE unpacker hook. Five declare unsupported host APIs.
+The inventory groups the remaining 10 eligible modules by the first compiler rejection.
+Six use the PE unpacker hook. Four declare unsupported host APIs.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -90,7 +90,10 @@ The comparison covers exact names, offsets, match counts, scalar widths, search 
 Frame tests compare short reads, EOF, cursor position, nested archive members, and both script map modes.
 Helper tests compare nested calls and shared cursor behavior. Host-call tests cover numeric reads and debug settings.
 The heap and PE tests compare helper writes, short reads, in-memory search, and section lookup against stock.
-It also covers competing generic logical signatures.
+The icon tests compare an icon-qualified logical trigger and the `matchicon` host call.
+The trigger checks the PE icon before bytecode runs.
+In pinned stock, the host call uses an empty resource table and returns zero for valid arguments.
+The tests also cover competing generic logical signatures.
 When both rules match, stock evaluates the one loaded first from the database directory.
 Barnacle returns its existing incomplete-scan error for misses while detection coverage remains partial.
 [Comparison tests](../tests/bytecode_reference.rs)
@@ -158,7 +161,8 @@ Use the effective daemon options and engine module flags together to determine w
 | --- | --- |
 | PE heuristics for Parite, Kriz, Magistr, and Polipos | Detection parity is open. PE signatures and object handling have separate coverage. |
 | PDF obfuscated names | Stock comparisons cover physical and packed dictionaries, escaped Flate filters, and competing child signatures. |
-| RIFF and Mydoom log checks | Named finding parity is open. |
+| Mydoom log checksum | Stock comparisons cover binary and UTF-16BE inputs, checksums, minimum size, the early word screen, and precedence against a hash signature. [Log tests](../tests/object_mydoom.rs) |
+| RIFF | Named finding parity is open. |
 | XZ dictionary limit | A final decoder memory refusal reports `Heuristics.XZ.DicSizeLimit` and discards the decoded prefix. The stock test forces a refusal on an ordinary receipt. |
 | URL phishing checks | Verified URL rule loading and detection are tracked in [issue #10](https://github.com/yavosh/barnacle/issues/10). |
 

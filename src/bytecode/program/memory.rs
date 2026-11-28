@@ -382,6 +382,19 @@ impl Address {
         Ok((id, start..end))
     }
 
+    /// The host call requires a pointer inside the object, even for empty buffers.
+    pub(super) fn check_host_span(&self, frame: &Frame<'_>, len: usize) -> Result<(), MemoryFault> {
+        let len = len.max(1);
+        match self {
+            Self::Constant(bytes, off) => bytes
+                .get(*off..)
+                .and_then(|bytes| bytes.get(..len))
+                .map(|_| ())
+                .ok_or(MemoryFault::Bounds),
+            _ => self.span(frame, len).map(|_| ()),
+        }
+    }
+
     pub(super) fn remaining<'a>(&'a self, frame: &'a Frame<'_>) -> Result<&'a [u8], MemoryFault> {
         match self {
             Self::Constant(bytes, off) => bytes.get(*off..).ok_or(MemoryFault::Bounds),

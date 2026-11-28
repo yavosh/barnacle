@@ -3,6 +3,8 @@
 mod daemon;
 #[path = "common/pe.rs"]
 mod pe;
+#[path = "common/pe_icons.rs"]
+mod pe_icons;
 #[path = "bytecode_reference/scalar.rs"]
 mod scalar;
 #[path = "common/zip.rs"]
@@ -129,23 +131,17 @@ fn barnacle_logical_bytecode() -> io::Result<()> {
     let fixture = fixture()?;
     compare(executable, &fixture, PARTIAL_MISS)?;
     let fixture = std::str::from_utf8(&fixture).map_err(io::Error::other)?;
-    for title in [
-        "Target:0,HandlerType:CL_TYPE_ZIP;",
-        "Target:1,IconGroup1:Receipt;",
-    ] {
-        let dir = tempfile::tempdir_in("/tmp")?;
-        let db = dir.path().join("db");
-        fs::create_dir(&db)?;
-        fs::write(db.join(CBC), fixture.replacen("Target:0;", title, 1))?;
-        let failure = start(dir.path(), executable, "BytecodeUnsigned yes\n")
-            .err()
-            .unwrap();
-        assert!(
-            failure
-                .to_string()
-                .contains("requires handler or icon evaluation")
-        );
-    }
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let db = dir.path().join("db");
+    fs::create_dir(&db)?;
+    fs::write(
+        db.join(CBC),
+        fixture.replacen("Target:0;", "Target:0,HandlerType:CL_TYPE_ZIP;", 1),
+    )?;
+    let failure = start(dir.path(), executable, "BytecodeUnsigned yes\n")
+        .err()
+        .unwrap();
+    assert!(failure.to_string().contains("unsupported handler"));
     Ok(())
 }
 
@@ -603,6 +599,101 @@ fn barnacle_pdf_hook_execution() -> io::Result<()> {
 fn stock_pdf_hook_execution() -> io::Result<()> {
     verify_stock()?;
     compare_pdf_hooks(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
+fn compare_matchicon(executable: &Path, miss: &str) -> io::Result<()> {
+    use pe_icons::{Drawing::*, image};
+    let with_entry = |drawings: &[pe_icons::Drawing]| {
+        let mut image = image(drawings, true);
+        image[168..172].copy_from_slice(&0x1020u32.to_le_bytes());
+        image
+    };
+    let doc = with_entry(&[Document]);
+    let diamond = with_entry(&[Diamond]);
+    let both = with_entry(&[Document, Diamond]);
+    let mixed = with_entry(&[Diamond, ExtendedHeader]);
+    let zero_entry = image(&[Document, Diamond], true);
+    let groups = format!(
+        "Document:Paper:Office:{}\nDrawing:Art:Shapes:{}\n",
+        pe_icons::DOCUMENT,
+        pe_icons::DIAMOND
+    );
+    let found = format!("stream: {} FOUND\0", scalar::NAME);
+    let run = |program: String, cases: &[(&[u8], &str)]| -> io::Result<()> {
+        let root = tempfile::tempdir_in("/tmp")?;
+        let db = root.path().join("db");
+        fs::create_dir(&db)?;
+        fs::write(db.join(CBC), program)?;
+        fs::write(db.join("drawings.idb"), &groups)?;
+        let (_daemon, socket) = start(
+            root.path(),
+            executable,
+            "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n",
+        )?;
+        for (index, &(input, matched)) in cases.iter().enumerate() {
+            assert_eq!(
+                unix_request(&socket, &stream_frame(input)?)?,
+                matched,
+                "case {index}"
+            );
+        }
+        Ok(())
+    };
+    let extended = with_entry(&[ExtendedHeader]);
+    let incomplete = if miss == PARTIAL_MISS {
+        "stream: unverified PE icon DIB header or compression. ERROR\0"
+    } else {
+        miss
+    };
+    run(
+        scalar::match_icon(1, Some("Paper"), b"Shapes\0memo", 0),
+        &[
+            (&both, &found),
+            (&doc, &found),
+            (&diamond, miss),
+            (&zero_entry, miss),
+            (&extended, incomplete),
+        ],
+    )?;
+    run(
+        scalar::match_icon(1, None, b"*", 0),
+        &[
+            (&doc, &found),
+            (&diamond, &found),
+            (&mixed, &found),
+            (&zero_entry, miss),
+        ],
+    )?;
+    run(
+        scalar::match_icon(1, None, b"Unknown", u32::MAX),
+        &[(&doc, miss), (&zero_entry, &found)],
+    )?;
+    run(
+        scalar::match_icon(1, None, &[b'Q'; 127], 0),
+        &[(&doc, &found)],
+    )?;
+    run(
+        scalar::match_icon(1, None, &[b'Q'; 128], u32::MAX),
+        &[(&doc, &found)],
+    )?;
+    run(
+        scalar::match_icon(0, None, b"Unknown", 0),
+        &[(&doc, &found), (&zero_entry, miss)],
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn barnacle_matchicon_execution() -> io::Result<()> {
+    compare_matchicon(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_matchicon_execution() -> io::Result<()> {
+    verify_stock()?;
+    compare_matchicon(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }
 
 fn compare_pe_all_hooks(executable: &Path, miss: &str) -> io::Result<()> {

@@ -212,20 +212,21 @@ impl LogicalIndex {
                         .add(program.trigger(), true, flevel, ignored)
                         .map_err(located)?;
                     if let Some(record) = builder.records.get(id) {
+                        let pe_hook = program.is_pe_all_hook();
                         if record
                             .conditions
                             .attributes
                             .as_ref()
                             .is_some_and(|attributes| {
-                                attributes.handler.is_some() || attributes.icon_groups.is_some()
+                                attributes.handler.is_some()
+                                    || pe_hook && attributes.icon_groups.is_some()
                             })
                         {
                             return Err(located(io::Error::new(
                                 io::ErrorKind::Unsupported,
-                                "bytecode trigger requires handler or icon evaluation",
+                                "unsupported handler or PE hook icon condition on bytecode trigger",
                             )));
                         }
-                        let pe_hook = program.is_pe_all_hook();
                         if !pe_hook
                             && program.uses_match_offsets()
                             && (0..record.children).any(|slot| {
@@ -663,37 +664,9 @@ impl LogicalIndex {
                 pe_hooks.push(id);
                 continue;
             }
-            if let Some(program) = self.bytecode.get(&id) {
-                let input = if object.unmapped_script {
-                    object.script_source.unwrap_or(bytes)
-                } else {
-                    bytes
-                };
-                let offsets = evidence.first_offsets.get(&id).unwrap_or(&NO_MATCH_OFFSETS);
-                let counts = evidence
-                    .matches
-                    .get(&id)
-                    .map_or(&[][..], |entry| entry.counts.as_slice());
-                if let Some(name) = program.run(
-                    input,
-                    offsets,
-                    counts,
-                    self.bytecode_debug,
-                    self.bytecode_timeout,
-                    &mut *check,
-                )? {
-                    finding = Ok(Some(name));
-                    break;
-                }
-                continue;
-            }
             let rule = &self.records[id as usize];
-            let attributes = rule
-                .conditions
-                .attributes
-                .as_deref()
-                .expect("pending conditions");
-            let icon_matches = match attributes.icon_groups.as_deref() {
+            let attributes = rule.conditions.attributes.as_deref();
+            let icon_matches = match attributes.and_then(|a| a.icon_groups.as_deref()) {
                 None => Ok(true),
                 Some(groups) => {
                     if context.is_valid_pe()
@@ -720,8 +693,35 @@ impl LogicalIndex {
                     }
                 }
             };
-            let result = icon_matches.map(|matched| matched.then_some(rule.name.as_ref()));
-            if rescan && let Some(handler) = attributes.handler {
+            let result = match icon_matches {
+                Err(error) => Err(error),
+                Ok(false) => Ok(None),
+                Ok(true) => {
+                    if let Some(program) = self.bytecode.get(&id) {
+                        let input = if object.unmapped_script {
+                            object.script_source.unwrap_or(bytes)
+                        } else {
+                            bytes
+                        };
+                        let offsets = evidence.first_offsets.get(&id).unwrap_or(&NO_MATCH_OFFSETS);
+                        let counts = evidence
+                            .matches
+                            .get(&id)
+                            .map_or(&[][..], |e| e.counts.as_slice());
+                        Ok(program.run_logical(
+                            input,
+                            (offsets, counts),
+                            Some(context.has_entry()),
+                            self.bytecode_debug,
+                            self.bytecode_timeout,
+                            &mut *check,
+                        )?)
+                    } else {
+                        Ok(Some(rule.name.as_ref()))
+                    }
+                }
+            };
+            if rescan && let Some(handler) = attributes.and_then(|a| a.handler) {
                 handlers.push((result, handler));
             } else if result != Ok(None) {
                 finding = result;

@@ -238,6 +238,10 @@ impl ObjectContext {
         self.target == Target::Pe && self.exe.is_some()
     }
 
+    pub(crate) fn has_entry(&self) -> bool {
+        self.exe.as_ref().is_some_and(|layout| layout.entry != 0)
+    }
+
     pub(crate) fn has_executable_layout(&self) -> bool {
         self.exe.is_some()
     }

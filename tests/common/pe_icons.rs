@@ -1,6 +1,10 @@
 //! Passive PE resources containing ordinary 32×32 document and diamond drawings.
 use super::pe;
 
+// ClamAV 1.4.3 metrics for these two drawings.
+pub const DOCUMENT: &str = "204da000044d0017400000e15c030215c150215c030aea0302ea1502ea030ac20000c8000ec9001767020167160160020f3e050b3e130b3f07173400311c";
+pub const DIAMOND: &str = "20b7a0c05b7a140cb7a050d8660000866001787216009b0c059b140c9b050d970000970017971600470110461612460603000c0a000000000c120e342164";
+
 #[derive(Clone, Copy)]
 pub enum Drawing {
     Document,

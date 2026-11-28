@@ -522,7 +522,7 @@ impl Traversal<'_> {
             size: bytes.len(),
             name: name.map(Into::into),
         });
-        let handling = file_type.parser.before_raw(bytes, self.options, self)?;
+        let handling = file_type.before_raw(bytes, self.options, self)?;
         if handling == Handling::Incomplete {
             self.stopped = Some(Verdict::Incomplete);
         }

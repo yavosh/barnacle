@@ -120,7 +120,7 @@ impl Program {
             _ => {}
         }
         let types = types(line()?, type_count)?;
-        let apis = api(line()?, &types)?;
+        let apis = api(line()?, &types, hook)?;
         let globals = globals(line()?, &types, hook)?;
         // Calls name functions by index and may target a later definition.
         let mut signatures = Vec::new();
@@ -236,6 +236,18 @@ impl Program {
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<&str>> {
+        self.run_logical(input, (offsets, counts), None, debug, timeout, check)
+    }
+
+    pub(crate) fn run_logical(
+        &self,
+        input: &[u8],
+        (offsets, counts): (&[u32; 64], &[u32]),
+        has_entry: Option<bool>,
+        debug: bool,
+        timeout: Duration,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<&str>> {
         if self.hook != LOGICAL_HOOK {
             return Err(unsupported("hook outside its scan phase"));
         }
@@ -244,6 +256,7 @@ impl Program {
             offsets,
             counts,
             debug,
+            has_entry: has_entry.map_or_else(Default::default, Into::into),
             pdf: None,
             pe: Default::default(),
         };
@@ -296,6 +309,7 @@ impl Program {
             offsets: &[0; 64],
             debug,
             pdf,
+            has_entry: Default::default(),
             pe: Default::default(),
         };
         self.execute(scan, timeout, check)
@@ -415,6 +429,7 @@ struct Scan<'a> {
     counts: &'a [u32],
     debug: bool,
     pdf: Option<PdfHookContext<'a>>,
+    has_entry: std::cell::OnceCell<bool>,
     pe: std::cell::OnceCell<Option<crate::body::PeMetadata>>,
 }
 
@@ -530,13 +545,16 @@ const ENGINE_LEVEL: u64 = 66;
 const DCONF_LEVEL: u64 = 67;
 const PINNED_DCONF_LEVEL: u64 = 213;
 
-fn api(mut line: Cursor<'_>, types: &[Type]) -> io::Result<Vec<u64>> {
+fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> {
     field(line.expect(b'E'))?;
     let max_id = field(line.number())?;
     let count = field(line.number())?;
     let mut apis = Vec::new();
     for _ in 0..count {
         let id = field(line.number())?;
+        if id == host::MATCH_ICON && hook != LOGICAL_HOOK {
+            return Err(unsupported("matchicon outside a logical program"));
+        }
         let (name, prototype): (&[u8], &[u64]) = match id {
             READ => (b"read\0", &[I32, BYTE_POINTER, I32]),
             SEEK => (b"seek\0", &[I32, I32, I32]),
@@ -1916,6 +1934,7 @@ mod tests {
                         counts: &[],
                         debug: false,
                         pdf: None,
+                        has_entry: Default::default(),
                         pe: Default::default(),
                     },
                     &mut None,
@@ -1956,6 +1975,7 @@ mod tests {
                     counts: &[],
                     debug: false,
                     pdf: None,
+                    has_entry: Default::default(),
                     pe: Default::default(),
                 },
                 &mut None,
@@ -1998,6 +2018,7 @@ mod tests {
                     counts: &[],
                     debug: false,
                     pdf: None,
+                    has_entry: Default::default(),
                     pe: Default::default(),
                 },
                 &mut None,
