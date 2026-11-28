@@ -9,6 +9,8 @@ mod parite;
 mod pe;
 #[path = "common/pe_icons.rs"]
 mod pe_icons;
+#[path = "bytecode_reference/pe_unpacker.rs"]
+mod pe_unpacker;
 #[path = "bytecode_reference/scalar.rs"]
 mod scalar;
 #[path = "common/zip.rs"]

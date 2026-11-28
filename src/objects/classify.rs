@@ -423,6 +423,9 @@ impl FileType {
                     }
                 }
                 match super::upx::extract(bytes, sink)? {
+                    Handling::Unrecognized if sink.run_pe_unpackers(bytes)? => {
+                        Ok(Handling::Stopped)
+                    }
                     Handling::Unrecognized => Ok(earlier),
                     unpacked => Ok(unpacked),
                 }

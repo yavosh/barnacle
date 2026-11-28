@@ -428,12 +428,21 @@ pub fn pe_all_break() -> String {
 
 pub enum WriteFinish {
     Return,
+    Result(u32),
     Report,
     Check(u32),
     Abort,
 }
 
 pub fn write_probe(finish: WriteFinish) -> String {
+    output_probe(
+        256,
+        &format!("Local.Receipt.Trigger.{{}};Target:0;{RECEIPT_TRIGGER}"),
+        finish,
+    )
+}
+
+pub fn output_probe(hook: u64, title: &str, finish: WriteFinish) -> String {
     const WRITE: u64 = 3;
     let split = 11;
     let mut globals = name_globals(0, 6, 70);
@@ -470,16 +479,22 @@ pub fn write_probe(finish: WriteFinish) -> String {
             if matches!(other, WriteFinish::Report) {
                 instructions.push(report(2));
             }
-            instructions.push(if matches!(other, WriteFinish::Abort) {
-                format!("T{}", fixed(45, 2))
-            } else {
-                ret()
+            instructions.push(match other {
+                WriteFinish::Abort => format!("T{}", fixed(45, 2)),
+                WriteFinish::Result(value) => format!(
+                    "T{}{}{}",
+                    fixed(19, 2),
+                    number(32),
+                    immediate(value.into(), 4)
+                ),
+                _ => ret(),
             });
             vec![instructions]
         }
     };
-    image(
-        RECEIPT_TRIGGER,
+    program(
+        hook,
+        title,
         &[
             callable(&[32, 65, 32]),
             array(NAME.len() + 1, 8),
@@ -487,8 +502,11 @@ pub fn write_probe(finish: WriteFinish) -> String {
         ],
         &[(WRITE, 69, "write"), (SET_NAME, 69, "setvirusname")],
         globals,
-        &[32, 32, 32, 1, 1],
-        &blocks,
+        &[Function {
+            args: 0,
+            slots: &[32, 32, 32, 1, 1],
+            blocks: &blocks,
+        }],
     )
 }
 

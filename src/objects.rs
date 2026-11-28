@@ -53,10 +53,11 @@ pub struct PdfHooks<'a> {
     pub timeout: Duration,
 }
 
-/// Scan-time settings for conditioned PE hooks in database order.
+/// Scan-time settings for PE hooks in database order within each phase.
 #[derive(Clone, Copy)]
 pub struct PeHooks<'a> {
     pub programs: &'a [(u32, Program)],
+    pub unpackers: &'a [(Option<u32>, Program)],
     pub debug: bool,
     pub timeout: Duration,
 }
@@ -106,6 +107,7 @@ trait ChildSink {
         context: PdfHookContext<'_>,
     ) -> io::Result<HookControl>;
     fn run_pe_all_hooks(&mut self, bytes: &[u8]) -> io::Result<HookControl>;
+    fn run_pe_unpackers(&mut self, bytes: &[u8]) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
     fn at_root(&self) -> bool;
@@ -630,14 +632,7 @@ impl Traversal<'_> {
         let mut cursor = None;
         let mut recheck = false;
         loop {
-            let limits = crate::bytecode::OutputLimits {
-                file_size: self.max_file_size(),
-                scan_remaining: unlimited_if_zero(self.options.max_scan_size)
-                    .saturating_sub(self.bytes_scanned),
-                file_slot: self.options.max_files == 0
-                    || self.files_scanned < self.options.max_files,
-            };
-            let output = std::cell::RefCell::new(crate::bytecode::Output::new(limits));
+            let output = self.bytecode_output();
             let mut restored_output = false;
             let step = LogicalStep {
                 cursor: &mut cursor,
@@ -673,6 +668,18 @@ impl Traversal<'_> {
                 return Ok(recheck);
             }
         }
+    }
+
+    fn bytecode_output(&self) -> std::cell::RefCell<crate::bytecode::Output> {
+        std::cell::RefCell::new(crate::bytecode::Output::new(
+            crate::bytecode::OutputLimits {
+                file_size: self.max_file_size(),
+                scan_remaining: unlimited_if_zero(self.options.max_scan_size)
+                    .saturating_sub(self.bytes_scanned),
+                file_slot: self.options.max_files == 0
+                    || self.files_scanned < self.options.max_files,
+            },
+        ))
     }
 
     fn bytecode_child(&mut self, snapshot: Snapshot, size: u64) -> io::Result<()> {
@@ -859,6 +866,42 @@ impl ChildSink for Traversal<'_> {
             }
         }
         Ok(control)
+    }
+
+    fn run_pe_unpackers(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        let Some(hooks) = self.pe_hooks else {
+            return Ok(false);
+        };
+        // PE_ALL sorted the matched prefilter IDs before the native unpacker phase.
+        for (condition, program) in hooks.unpackers {
+            if condition.is_some_and(|id| self.pe_hook_hits.binary_search(&id).is_err()) {
+                continue;
+            }
+            let output = self.bytecode_output();
+            let result = program.run_pe_unpacker(
+                bytes,
+                (&output, self.temporary_directory),
+                hooks.debug,
+                hooks.timeout,
+                &mut *self.check,
+            )?;
+            let output = output.into_inner();
+            if let Some(reason) = output.rejected {
+                self.first_limit.get_or_insert(reason);
+            }
+            if let Some(snapshot) = output.snapshot {
+                self.bytecode_child(snapshot, output.size)?;
+                if self.stopped.is_some() {
+                    return Ok(true);
+                }
+            }
+            if let PdfHookResult::Found(name) = result
+                && self.report_hook_detection(name)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn at_root(&self) -> bool {

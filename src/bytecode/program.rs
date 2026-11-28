@@ -10,6 +10,7 @@ mod pdf;
 use memory::{Address, Frame, MemoryOp, Slot};
 
 const LOGICAL_HOOK: u64 = 256;
+const PE_UNPACKER_HOOK: u64 = 257;
 const PDF_HOOK: u64 = 258;
 const PE_ALL_HOOK: u64 = 259;
 const BREAK_RESULT: u64 = 0xcea5e;
@@ -84,7 +85,11 @@ impl Program {
         if engine_level < min || max != 0 && engine_level > max {
             return Ok(None);
         }
-        if !matches!(hook, LOGICAL_HOOK | PDF_HOOK | PE_ALL_HOOK) || exclude != 0 {
+        if !matches!(
+            hook,
+            LOGICAL_HOOK | PE_UNPACKER_HOOK | PDF_HOOK | PE_ALL_HOOK
+        ) || exclude != 0
+        {
             return Err(unsupported("hook or target exclusion"));
         }
         if field(h.number())? != 0 {
@@ -232,6 +237,10 @@ impl Program {
         self.hook == PE_ALL_HOOK
     }
 
+    pub(crate) fn is_pe_unpacker(&self) -> bool {
+        self.hook == PE_UNPACKER_HOOK
+    }
+
     pub fn uses_match_offsets(&self) -> bool {
         self.hook == LOGICAL_HOOK && self.uses_match_offsets
     }
@@ -299,7 +308,7 @@ impl Program {
         if !self.is_pdf_hook() {
             return Err(unsupported("non-PDF entry in a PDF phase"));
         }
-        self.run_hook(input, Some(context), debug, timeout, check)
+        self.run_hook(input, Some(context), None, debug, timeout, check)
     }
 
     pub fn run_pe_all(
@@ -312,13 +321,28 @@ impl Program {
         if !self.is_pe_all_hook() {
             return Err(unsupported("non-PE_ALL entry in a PE phase"));
         }
-        self.run_hook(input, None, debug, timeout, check)
+        self.run_hook(input, None, None, debug, timeout, check)
+    }
+
+    pub(crate) fn run_pe_unpacker(
+        &self,
+        input: &[u8],
+        output: (&std::cell::RefCell<super::Output>, &std::path::Path),
+        debug: bool,
+        timeout: Duration,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<PdfHookResult<'_>> {
+        if !self.is_pe_unpacker() {
+            return Err(unsupported("non-unpacker entry in PE unpacker phase"));
+        }
+        self.run_hook(input, None, Some(output), debug, timeout, check)
     }
 
     fn run_hook(
         &self,
         input: &[u8],
         pdf: Option<PdfHookContext<'_>>,
+        output: Option<(&std::cell::RefCell<super::Output>, &std::path::Path)>,
         debug: bool,
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
@@ -330,7 +354,7 @@ impl Program {
             offsets: &[0; 64],
             debug,
             pdf,
-            output: None,
+            output,
             has_entry: Default::default(),
             pe: Default::default(),
         };
@@ -582,8 +606,10 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
     let mut apis = Vec::new();
     for _ in 0..count {
         let id = field(line.number())?;
-        if id == host::WRITE && hook != LOGICAL_HOOK {
-            return Err(unsupported("write outside a logical program"));
+        if id == host::WRITE && !matches!(hook, LOGICAL_HOOK | PE_UNPACKER_HOOK) {
+            return Err(unsupported(
+                "write outside a logical program or PE unpacker",
+            ));
         }
         if id == host::MATCH_ICON && hook != LOGICAL_HOOK {
             return Err(unsupported("matchicon outside a logical program"));
@@ -603,7 +629,7 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
             DCONF_LEVEL => (b"engine_dconf_level\0", &[I32]),
             _ => host::declaration(id)
                 .or_else(|| pdf::declaration(id))
-                .ok_or_else(|| unsupported("API declaration"))?,
+                .ok_or_else(|| unsupported(&format!("API declaration {id}")))?,
         };
         let ty = user_type(types, field(line.number())?);
         if id > max_id
@@ -701,16 +727,28 @@ fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Gl
                     FILE_SIZE if offset == 0 && max_host >= FILE_SIZE => Global::FileSize,
                     PE_DATA if max_host >= PE_DATA => Global::PeField(match offset {
                         4 => host::PeField::RawEntry,
-                        52 | 280 if hook == PE_ALL_HOOK => host::PeField::EntryRva,
-                        632 if hook == PE_ALL_HOOK => host::PeField::HeaderOffset,
-                        _ => return Err(unsupported("i32 pointer outside supported host globals")),
+                        52 | 280 if matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) => {
+                            host::PeField::EntryRva
+                        }
+                        632 if matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) => {
+                            host::PeField::HeaderOffset
+                        }
+                        _ => {
+                            return Err(unsupported(&format!(
+                                "i32 PE data field at offset {offset}"
+                            )));
+                        }
                     }),
                     MATCH_OFFSETS
                         if max_host == MATCH_OFFSETS && offset % 4 == 0 && offset < 256 =>
                     {
                         Global::MatchOffset(offset / 4)
                     }
-                    _ => return Err(unsupported("i32 pointer outside supported host globals")),
+                    _ => {
+                        return Err(unsupported(&format!(
+                            "i32 pointer to global {base:#x} at offset {offset}"
+                        )));
+                    }
                 }
             }
             (66, _) | (_, Some(Type::Pointer(16))) => {
@@ -718,10 +756,16 @@ fn globals(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<Gl
                 let base = line.literal()?;
                 let field = match (base, offset) {
                     (PE_DATA, 8) if max_host >= PE_DATA => host::PeField::SectionCount,
-                    (PE_DATA, 32) if max_host >= PE_DATA && hook == PE_ALL_HOOK => {
+                    (PE_DATA, 32)
+                        if max_host >= PE_DATA
+                            && matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) =>
+                    {
                         host::PeField::OptionalSize
                     }
-                    (PE_DATA, 264) if max_host >= PE_DATA && hook == PE_ALL_HOOK => {
+                    (PE_DATA, 264)
+                        if max_host >= PE_DATA
+                            && matches!(hook, PE_ALL_HOOK | PE_UNPACKER_HOOK) =>
+                    {
                         host::PeField::OptionalMagic
                     }
                     _ => return Err(unsupported("i16 pointer outside supported host globals")),

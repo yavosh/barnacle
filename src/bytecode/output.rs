@@ -1,4 +1,4 @@
-//! Per-invocation output for logical bytecode.
+//! Per-invocation bytecode output.
 use crate::objects::{Limit, Snapshot};
 use std::io::{self, Write};
 use std::path::Path;

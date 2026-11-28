@@ -39,9 +39,9 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 76 eligible modules, including 72 logical modules, both PDF hooks, and both `PE_ALL` hooks.
+The compiler accepts 77 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and one `PE_UNPACKER`.
 The archive test loads those modules into one generation and verifies each hook count.
-The six remaining eligible modules first fail at the PE unpacker hook.
+Three remaining modules first require `extract_new`. One requires `get_environment`. One reads an unsupported 32-bit PE field at offset 60.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -139,7 +139,11 @@ Barnacle runs supported `PE_ALL` programs after overlay scanning. A matching log
 `PE_ALL` programs can read the entry RVA, PE header offset, optional header size, and optional header magic.
 The comparison covers earlier raw and overlay findings, sibling archive members, PE32+, and the `ScanPE` and unsigned bytecode options.
 On PE32+, the scan skips the overlay and hook phase. A `PE_ALL` break skips later PE checks.
-Both signed `PE_ALL` modules load in the archive test. `PE_UNPACKER` is unsupported.
+Barnacle runs supported `PE_UNPACKER` hooks when native UPX does not unpack the PE.
+An unpacker can run unconditionally or use a logical prefilter.
+The hook scans its written output before reporting its own name. A matching child takes precedence.
+The paired tests cover hook breaks, clean native unpacking, and exact file and scan-size limits.
+[PE unpacker tests](../tests/bytecode_reference/pe_unpacker.rs)
 
 Both signed PDF hooks query the current phase and configuration functionality level, which is 213.
 One queries document flags. The other uses discovery order, object offsets, and object spans.

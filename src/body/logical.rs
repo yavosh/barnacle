@@ -162,6 +162,8 @@ pub struct LogicalIndex {
     bytecode: HashMap<u32, Program>,
     pdf_bytecode: Vec<Program>,
     pe_bytecode: Vec<(u32, Program)>,
+    pe_unpackers: Vec<(Option<u32>, Program)>,
+    pe_prefilters: Vec<u32>,
     bytecode_debug: bool,
     bytecode_timeout: Duration,
 }
@@ -188,6 +190,8 @@ impl LogicalIndex {
         let mut bytecode = HashMap::new();
         let mut pdf_bytecode = Vec::new();
         let mut pe_bytecode = Vec::new();
+        let mut pe_unpackers = Vec::new();
+        let mut pe_prefilters = Vec::new();
         for &(path, official) in paths {
             let file = open(path)
                 .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
@@ -208,13 +212,17 @@ impl LogicalIndex {
                         pdf_bytecode.push(program);
                         continue;
                     }
+                    if program.is_pe_unpacker() && !program.trigger().contains(';') {
+                        pe_unpackers.push((None, program));
+                        continue;
+                    }
                     let id = builder.records.len();
                     let first_binding = builder.bindings.len();
                     builder
                         .add(program.trigger(), true, flevel, ignored)
                         .map_err(located)?;
                     if let Some(record) = builder.records.get(id) {
-                        let pe_hook = program.is_pe_all_hook();
+                        let pe_hook = program.is_pe_all_hook() || program.is_pe_unpacker();
                         if record
                             .conditions
                             .attributes
@@ -243,7 +251,12 @@ impl LogicalIndex {
                             )));
                         }
                         if pe_hook {
-                            pe_bytecode.push((id as u32, program));
+                            pe_prefilters.push(id as u32);
+                            if program.is_pe_unpacker() {
+                                pe_unpackers.push((Some(id as u32), program));
+                            } else {
+                                pe_bytecode.push((id as u32, program));
+                            }
                         } else {
                             bytecode.insert(id as u32, program);
                         }
@@ -303,6 +316,8 @@ impl LogicalIndex {
             bytecode,
             pdf_bytecode,
             pe_bytecode,
+            pe_unpackers,
+            pe_prefilters,
             bytecode_debug: false,
             bytecode_timeout,
             regexes: builder.regexes,
@@ -327,13 +342,16 @@ impl LogicalIndex {
         })
     }
 
-    /// Return PE_ALL programs in this generation's logical load order.
+    /// Return both PE hook phases in database order.
     pub fn pe_hooks(&self) -> Option<crate::objects::PeHooks<'_>> {
-        (!self.pe_bytecode.is_empty()).then_some(crate::objects::PeHooks {
-            programs: &self.pe_bytecode,
-            debug: self.bytecode_debug,
-            timeout: self.bytecode_timeout,
-        })
+        (!self.pe_bytecode.is_empty() || !self.pe_unpackers.is_empty()).then_some(
+            crate::objects::PeHooks {
+                programs: &self.pe_bytecode,
+                unpackers: &self.pe_unpackers,
+                debug: self.bytecode_debug,
+                timeout: self.bytecode_timeout,
+            },
+        )
     }
 
     /// Use the daemon's PCRE limits for this generation.
@@ -707,10 +725,7 @@ impl LogicalIndex {
                 .attributes
                 .as_ref()
                 .is_none_or(|a| a.icon_groups.is_none())
-            && self
-                .pe_bytecode
-                .binary_search_by_key(&id, |&(id, _)| id)
-                .is_err()
+            && self.pe_prefilters.binary_search(&id).is_err()
     }
 
     fn scan_image(
@@ -919,10 +934,7 @@ impl LogicalIndex {
             if e.is_some_and(|e| !self.expressions[rule.expression].matches(&e.counts)) {
                 continue;
             }
-            let pe_hook = self
-                .pe_bytecode
-                .binary_search_by_key(&id, |&(id, _)| id)
-                .is_ok();
+            let pe_hook = self.pe_prefilters.binary_search(&id).is_ok();
             if pe_hook && !context.is_valid_pe() {
                 continue;
             }
