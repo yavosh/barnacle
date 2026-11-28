@@ -1105,6 +1105,67 @@ pub fn direct_calls() -> String {
     )
 }
 
+/// Compare the complete disassembly record and returned offset supplied after the receipt.
+pub fn disasm_record() -> String {
+    const DISASM: u64 = 8;
+    let mut record = fixed(3, 1) + &number(6);
+    for field in [16, 8, 8, 8, 74, 72] {
+        record += &number(field);
+    }
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 32, 32]),
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            array(29, 8),
+            array(10, 8),
+            array(3, 73),
+            record,
+            fixed(5, 1) + &number(75),
+            callable(&[32, 76, 32]),
+            array(64, 8),
+        ],
+        &[
+            (READ, 70, "read"),
+            (SEEK, 69, "seek"),
+            (SET_NAME, 70, "setvirusname"),
+            (DISASM, 77, "disasm_x86"),
+        ],
+        name_globals(0, 3, 71),
+        &[
+            ADDRESSABLE | 75,
+            ADDRESSABLE | 78,
+            ADDRESSABLE | 32,
+            32,
+            32,
+            32,
+            1,
+            1,
+            32,
+        ],
+        &[
+            vec![
+                call(3, SEEK, &[immediate(7, 4), immediate(0, 4)]),
+                call(3, READ, &[number(2), immediate(4, 4)]),
+                call(3, READ, &[number(1), immediate(64, 4)]),
+                op(0, 0, 40, &[number(0), immediate(0xa5, 1), immediate(64, 8)]),
+                call(4, DISASM, &[number(0), immediate(0, 4)]),
+                call(5, SEEK, &[immediate(0, 4), immediate(1, 4)]),
+                op(1, 6, 21, &[number(32), number(4), number(2)]),
+                op(1, 7, 21, &[number(32), number(5), immediate(75, 4)]),
+                op(1, 6, 11, &[number(6), number(7)]),
+                op(32, 3, 43, &[number(0), number(1), immediate(64, 4)]),
+                op(1, 7, 21, &[number(32), number(3), immediate(0, 4)]),
+                op(1, 6, 11, &[number(6), number(7)]),
+                branch(6, 1, 2),
+            ],
+            vec![report(8), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
 pub fn heap_pointer_integers() -> String {
     let cast = |dest, src| op(64, dest, 50, &[number(src)]);
     let eq = |dest, lhs, rhs| op(1, dest, 21, &[number(64), number(lhs), rhs]);

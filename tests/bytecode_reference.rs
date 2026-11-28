@@ -408,6 +408,91 @@ fn stock_bytecode_host_calls_and_helpers() -> io::Result<()> {
     compare_host_calls_and_helpers(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }
 
+fn compare_disasm_records(executable: &Path, miss: &str) -> io::Result<()> {
+    let mut cases = Vec::new();
+    let mut add = |instruction: &[u8], used: u32, record: [u8; 64], found| {
+        let end = if used == 0 { u32::MAX } else { 75 + used };
+        let mut receipt = b"receipt".to_vec();
+        receipt.extend(end.to_le_bytes());
+        receipt.extend(record);
+        receipt.extend(instruction);
+        cases.push((receipt, found));
+    };
+    let record = |header: [u8; 5], args: [&[u8]; 3]| {
+        let mut bytes = [0; 64];
+        bytes[..5].copy_from_slice(&header);
+        for (i, arg) in args.iter().enumerate() {
+            let at = 5 + i * 10;
+            bytes[at..at + arg.len()].copy_from_slice(arg);
+        }
+        bytes
+    };
+    add(&[0x90], 1, record([117, 0, 0, 0, 0], [&[]; 3]), true);
+    add(&[0xf3, 0x90], 1, record([138, 0, 0, 0, 0], [&[]; 3]), true);
+    add(
+        &[0x64, 0x8b, 0x4c, 0x83, 8],
+        5,
+        record([109, 0, 0, 0, 28], [&[3, 1], &[4, 2, 0, 3, 4, 0, 8], &[]]),
+        true,
+    );
+    add(
+        &[0x67, 0x66, 0x8b, 0x40, 4],
+        5,
+        record([109, 0, 1, 1, 0], [&[3, 8], &[4, 1, 11, 14, 1, 0, 4], &[]]),
+        true,
+    );
+    add(
+        &[0x6b, 0xc2, 3],
+        3,
+        record([58, 0, 0, 0, 0], [&[3, 0], &[3, 2], &[1, 0, 3]]),
+        true,
+    );
+    add(
+        &[0x75, 0xfe],
+        2,
+        record(
+            [75, 0, 0, 0, 0],
+            [&[2, 0, 254, 255, 255, 255, 255, 255, 255, 255], &[], &[]],
+        ),
+        true,
+    );
+    add(
+        &[0x0f, 0xb6, 0xc1],
+        3,
+        record([114, 0, 0, 0, 0], [&[3, 0], &[3, 21], &[]]),
+        true,
+    );
+    let mut failure = [0xa5; 64];
+    add(&[], 0, failure, true);
+    failure[35..].fill(0);
+    add(&[0xb8], 0, failure, true);
+    failure[63] = 1;
+    add(&[0xb8], 0, failure, false);
+    let cases = cases
+        .iter()
+        .map(|(data, found)| (data.as_slice(), *found))
+        .collect::<Vec<_>>();
+    run_program(
+        executable,
+        &scalar::disasm_record(),
+        "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n",
+        &cases,
+        miss,
+    )
+}
+
+#[test]
+fn barnacle_bytecode_disasm_records() -> io::Result<()> {
+    compare_disasm_records(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_bytecode_disasm_records() -> io::Result<()> {
+    verify_stock()?;
+    compare_disasm_records(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}
+
 fn compare_memory_and_pe_queries(executable: &Path, miss: &str) -> io::Result<()> {
     let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
     run_program(

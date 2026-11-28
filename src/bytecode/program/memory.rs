@@ -22,6 +22,12 @@ impl Slot {
         let size = match (width, user_type(types, ty)) {
             (Some(w), _) => w.bytes(),
             (_, Some(Type::Bytes(n))) if addressable => *n,
+            // The pinned interpreter does not compute general structure alignment.
+            (_, Some(Type::Struct { .. }))
+                if addressable && start == 0 && super::host::disasm_record_type(ty, types) =>
+            {
+                64
+            }
             (_, _) if pointer_element(types, ty).is_some() && !addressable => 8,
             _ => return Err(unsupported("frame local type or storage")),
         };
@@ -448,8 +454,20 @@ impl Address {
     }
 
     pub(super) fn write(&self, frame: &mut Frame<'_>, bytes: &[u8]) -> Result<(), MemoryFault> {
-        let (id, range) = self.span(frame, bytes.len())?;
-        frame.writable(id, range)?.copy_from_slice(bytes);
+        self.write_at(frame, 0, bytes)
+    }
+
+    pub(super) fn write_at(
+        &self,
+        frame: &mut Frame<'_>,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), MemoryFault> {
+        let len = offset.checked_add(bytes.len()).ok_or(MemoryFault::Bounds)?;
+        let (id, range) = self.span(frame, len)?;
+        frame
+            .writable(id, range.start + offset..range.end)?
+            .copy_from_slice(bytes);
         Ok(())
     }
 }

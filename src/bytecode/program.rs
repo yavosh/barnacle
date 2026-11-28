@@ -3,6 +3,7 @@ use super::{Cursor, MAX_MEMBER_BYTES, PdfHookContext, PdfHookResult, invalid};
 use std::time::{Duration, Instant};
 use std::{io, str, sync::Arc};
 
+mod disasm;
 mod host;
 mod memory;
 mod pdf;
@@ -592,6 +593,7 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
             SEEK => (b"seek\0", &[I32, I32, I32]),
             MALLOC => (b"malloc\0", &[BYTE_POINTER, I32]),
             MEMSTR => (b"memstr\0", &[I32, BYTE_POINTER, I32, BYTE_POINTER, I32]),
+            host::DISASM => (b"disasm_x86\0", &[]),
             PE_SECTION => (b"get_pe_section\0", &[]),
             FILE_FIND => (b"file_find\0", &[I32, BYTE_POINTER, I32]),
             SET_VIRUS_NAME => (b"setvirusname\0", &[I32, BYTE_POINTER, I32]),
@@ -606,7 +608,11 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
         let ty = user_type(types, field(line.number())?);
         if id > max_id
             || apis.contains(&id)
-            || !matches!(ty, Some(Type::Function(args)) if if id == PE_SECTION { host::pe_section_prototype(args, types) } else { args == prototype })
+            || !matches!(ty, Some(Type::Function(args)) if match id {
+                host::DISASM => host::disasm_prototype(args, types),
+                PE_SECTION => host::pe_section_prototype(args, types),
+                _ => args == prototype,
+            })
         {
             return Err(invalid("invalid CBC API declaration or prototype"));
         }
@@ -1561,7 +1567,7 @@ fn host_call(
         (ENGINE_LEVEL, 0) => {
             Expression::Copy(Value::Constant(ctx.engine_level & u64::from(u32::MAX)))
         }
-        _ if id == PE_SECTION || host::declaration(id).is_some() => {
+        _ if matches!(id, PE_SECTION | host::DISASM) || host::declaration(id).is_some() => {
             Expression::Host(host::decode(id, count, line, slots, globals)?)
         }
         _ => return Err(unsupported("host call argument count")),

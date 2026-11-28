@@ -39,10 +39,9 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 73 eligible modules, including 70 logical modules, both PDF hooks, and one `PE_ALL` hook.
+The compiler accepts 76 eligible modules, including 72 logical modules, both PDF hooks, and both `PE_ALL` hooks.
 The archive test loads those modules into one generation and verifies each hook count.
-The inventory groups the remaining nine eligible modules by the first compiler rejection.
-Six use the PE unpacker hook. Three declare the unsupported `disasm_x86` host API.
+The six remaining eligible modules first fail at the PE unpacker hook.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -76,6 +75,11 @@ Host calls can seek, read, search, report the engine level, and set a detection 
 Host calls can read decimal and hexadecimal integers and emit diagnostics when clamd debug logging is enabled.
 Bytecode can read the object size, subsignature counts, and first offsets.
 PE bytecode can read the entry offset and section count, fetch section records, and translate virtual addresses.
+The `disasm_x86` host call decodes supported legacy 32-bit instructions at the current cursor.
+The return value is the next absolute offset. The cursor stays in place.
+Comparison with pinned stock covered 3,372 instruction records, including operand metadata and result length.
+Paired daemon tests cover invalid instructions, EOF, and which result bytes change on failure.
+Unmodeled encodings return an explicit unsupported error. These include x87, string operations, shifts, and several two-byte groups.
 Programs that use first offsets currently require indexed pattern subsignatures.
 An ASCII-target bytecode rule forces a normalized file map for script scanning.
 An unmapped script scan matches normalized text. Its bytecode reads the owning file map.
@@ -135,7 +139,7 @@ Barnacle runs supported `PE_ALL` programs after overlay scanning. A matching log
 `PE_ALL` programs can read the entry RVA, PE header offset, optional header size, and optional header magic.
 The comparison covers earlier raw and overlay findings, sibling archive members, PE32+, and the `ScanPE` and unsigned bytecode options.
 On PE32+, the scan skips the overlay and hook phase. A `PE_ALL` break skips later PE checks.
-One signed `PE_ALL` module loads in the archive test. The other requires unsupported host APIs. `PE_UNPACKER` is unsupported.
+Both signed `PE_ALL` modules load in the archive test. `PE_UNPACKER` is unsupported.
 
 Both signed PDF hooks query the current phase and configuration functionality level, which is 213.
 One queries document flags. The other uses discovery order, object offsets, and object spans.

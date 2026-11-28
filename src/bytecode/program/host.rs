@@ -34,6 +34,36 @@ pub(super) fn declaration(id: u64) -> Option<(&'static [u8], &'static [u64])> {
     })
 }
 
+pub(super) const DISASM: u64 = 8;
+
+pub(super) fn disasm_prototype(args: &[u64], types: &[Type]) -> bool {
+    let [I32, dest, I32] = *args else {
+        return false;
+    };
+    let Some(Type::Pointer(record)) = user_type(types, dest) else {
+        return false;
+    };
+    disasm_record_type(*record, types)
+}
+
+pub(super) fn disasm_record_type(id: u64, types: &[Type]) -> bool {
+    let Some(Type::Struct {
+        packed: false,
+        fields,
+    }) = user_type(types, id)
+    else {
+        return false;
+    };
+    let [16, 8, 8, 8, operands, extra] = fields.as_slice() else {
+        return false;
+    };
+    let Some(Type::Array { len: 3, element }) = user_type(types, *operands) else {
+        return false;
+    };
+    matches!(user_type(types, *element), Some(Type::Bytes(10)))
+        && matches!(user_type(types, *extra), Some(Type::Bytes(29)))
+}
+
 pub(super) fn pe_section_prototype(args: &[u64], types: &[Type]) -> bool {
     let [I32, dest, I32] = *args else {
         return false;
@@ -75,6 +105,7 @@ impl PeField {
 
 #[derive(Debug)]
 pub(super) enum Operation {
+    Disasm(Address),
     Number(Value),
     Write(Address, Value),
     PeField(PeField),
@@ -94,6 +125,12 @@ pub(super) fn decode(
     globals: &[Global],
 ) -> io::Result<Operation> {
     Ok(match (id, count) {
+        (DISASM, 2) => {
+            let output = Address::decode(line, slots, globals, true)?;
+            // The interpreter enforces the result structure size in place of this argument.
+            line.scalar(slots, Width::WORD)?;
+            Operation::Disasm(output)
+        }
         (WRITE, 2) => Operation::Write(
             Address::decode(line, slots, globals, false)?,
             line.scalar(slots, Width::WORD)?,
@@ -181,6 +218,29 @@ impl Operation {
                 // Stock 1.4.3 leaves the API's resource directory count zero.
                 // Its call to findres cannot enumerate any icon groups.
                 if valid { 0 } else { u32::MAX }
+            }
+            Self::Disasm(dest) => {
+                if memory::outcome(dest.check_host_span(frame, 64))?.is_none() {
+                    return Ok(None);
+                }
+                let bytes = scan.input.get(frame.cursor..).unwrap_or_default();
+                if bytes.is_empty() {
+                    return Ok(Some(u64::from(u32::MAX)));
+                }
+                match super::disasm::decode(bytes) {
+                    Ok((used, record)) => {
+                        memory::outcome(dest.write(frame, &record))?;
+                        (frame.cursor + used) as u32
+                    }
+                    Err(super::disasm::Error::Invalid) => {
+                        // Decode failure clears the reserved tail and preserves the other fields.
+                        memory::outcome(dest.write_at(frame, 35, &[0; 29]))?;
+                        u32::MAX
+                    }
+                    Err(super::disasm::Error::Unsupported) => {
+                        return Err(unsupported("x86 instruction encoding"));
+                    }
+                }
             }
             Self::PeField(field) => {
                 let pe = scan
