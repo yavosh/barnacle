@@ -41,7 +41,7 @@ The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
 The compiler accepts 78 eligible modules, including 72 logical modules, both PDF hooks, both `PE_ALL` hooks, and two `PE_UNPACKER` hooks.
 The archive test loads those modules into one generation and verifies each hook count.
-Three remaining modules first require `extract_new`. One requires `get_environment`.
+Three remaining modules first require a PE resource-directory field. One requires `get_environment`.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -143,6 +143,10 @@ Barnacle runs supported `PE_UNPACKER` hooks when native UPX does not unpack the 
 An unpacker can run unconditionally or use a logical prefilter.
 The hook scans its written output before reporting its own name. A matching child takes precedence.
 The paired tests cover hook breaks, clean native unpacking, and exact file and scan-size limits.
+The `extract_new` host call scans the current output before the VM continues.
+It returns 0 for an empty or clean output and 1 for an immediate finding.
+It reports recursion, size, and file-count limits using the pinned engine's numeric codes.
+The paired tests cover finding preservation, repeated extraction, and deferred heuristic alerts.
 [PE unpacker tests](../tests/bytecode_reference/pe_unpacker.rs)
 
 Both signed PDF hooks query the current phase and configuration functionality level, which is 213.

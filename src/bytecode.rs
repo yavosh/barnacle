@@ -9,8 +9,8 @@ use std::path::Path;
 mod output;
 pub(crate) use output::{Output, OutputLimits};
 mod program;
-pub(crate) use program::LogicalInput;
 pub use program::Program;
+pub(crate) use program::{LogicalInput, UnpackerInput};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]

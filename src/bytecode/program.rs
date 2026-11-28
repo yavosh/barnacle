@@ -15,6 +15,7 @@ const PDF_HOOK: u64 = 258;
 const PE_ALL_HOOK: u64 = 259;
 const BREAK_RESULT: u64 = 0xcea5e;
 const SET_VIRUS_NAME: u64 = 5;
+const EXTRACT_NEW: u64 = 22;
 const I32: u64 = 32;
 const BYTE_POINTER: u64 = 65;
 const FIRST_USER_TYPE: usize = 69;
@@ -286,6 +287,7 @@ impl Program {
             counts: logical.counts,
             debug,
             output: logical.output,
+            extract: None,
             has_entry: logical.has_entry.map_or_else(Default::default, Into::into),
             pdf: None,
             pe: Default::default(),
@@ -327,7 +329,7 @@ impl Program {
     pub(crate) fn run_pe_unpacker(
         &self,
         input: &[u8],
-        output: (&std::cell::RefCell<super::Output>, &std::path::Path),
+        unpacker: UnpackerInput<'_>,
         debug: bool,
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
@@ -335,14 +337,14 @@ impl Program {
         if !self.is_pe_unpacker() {
             return Err(unsupported("non-unpacker entry in PE unpacker phase"));
         }
-        self.run_hook(input, None, Some(output), debug, timeout, check)
+        self.run_hook(input, None, Some(unpacker), debug, timeout, check)
     }
 
     fn run_hook(
         &self,
         input: &[u8],
         pdf: Option<PdfHookContext<'_>>,
-        output: Option<(&std::cell::RefCell<super::Output>, &std::path::Path)>,
+        unpacker: Option<UnpackerInput<'_>>,
         debug: bool,
         timeout: Duration,
         check: impl FnMut() -> io::Result<()>,
@@ -354,7 +356,8 @@ impl Program {
             offsets: &[0; 64],
             debug,
             pdf,
-            output,
+            output: unpacker.as_ref().map(|u| (u.output, u.directory)),
+            extract: unpacker.map(|u| u.extract),
             has_entry: Default::default(),
             pe: Default::default(),
         };
@@ -476,7 +479,14 @@ pub(crate) struct LogicalInput<'a> {
     pub output: Option<(&'a std::cell::RefCell<super::Output>, &'a std::path::Path)>,
 }
 
+pub(crate) struct UnpackerInput<'a> {
+    pub output: &'a std::cell::RefCell<super::Output>,
+    pub directory: &'a std::path::Path,
+    pub extract: &'a dyn Fn() -> io::Result<Option<u32>>,
+}
+
 struct Scan<'a> {
+    extract: Option<&'a dyn Fn() -> io::Result<Option<u32>>>,
     output: Option<(&'a std::cell::RefCell<super::Output>, &'a std::path::Path)>,
     input: &'a [u8],
     offsets: &'a [u32; 64],
@@ -614,8 +624,12 @@ fn api(mut line: Cursor<'_>, types: &[Type], hook: u64) -> io::Result<Vec<u64>> 
         if id == host::MATCH_ICON && hook != LOGICAL_HOOK {
             return Err(unsupported("matchicon outside a logical program"));
         }
+        if id == EXTRACT_NEW && hook != PE_UNPACKER_HOOK {
+            return Err(unsupported("extract_new outside a PE unpacker"));
+        }
         let (name, prototype): (&[u8], &[u64]) = match id {
             READ => (b"read\0", &[I32, BYTE_POINTER, I32]),
+            EXTRACT_NEW => (b"extract_new\0", &[I32, I32]),
             SEEK => (b"seek\0", &[I32, I32, I32]),
             MALLOC => (b"malloc\0", &[BYTE_POINTER, I32]),
             MEMSTR => (b"memstr\0", &[I32, BYTE_POINTER, I32, BYTE_POINTER, I32]),
@@ -1117,6 +1131,7 @@ impl Binary {
 
 #[derive(Debug)]
 enum Expression {
+    ExtractNew,
     Binary(Binary, Width, Value, Value),
     Cast {
         source: usize,
@@ -1151,6 +1166,19 @@ impl Expression {
     ) -> io::Result<Option<u64>> {
         let input = scan.input;
         let value = match *self {
+            Self::ExtractNew => {
+                let extract = scan
+                    .extract
+                    .ok_or_else(|| unsupported("extract_new without child traversal"))?;
+                let Some(result) = extract()? else {
+                    return Ok(None);
+                };
+                if result == 1 {
+                    // The child name replaces any earlier setvirusname in this invocation.
+                    *name = None;
+                }
+                u64::from(result)
+            }
             Self::Host(ref op) => return op.eval(locals, scan, check),
             Self::Pdf(ref query) => u64::from(query.eval(locals, scan.pdf, check)?),
             Self::Allocate(size) => locals.allocate(size.get(locals) as usize)?,
@@ -1568,6 +1596,11 @@ fn host_call(
         return Err(unsupported("host call"));
     }
     Ok(match (id, count) {
+        (EXTRACT_NEW, 1) => {
+            // Stock accepts an i32 label. It does not affect the child scan.
+            line.scalar(slots, Width::WORD)?;
+            Expression::ExtractNew
+        }
         (SET_VIRUS_NAME, 2) => {
             let (bytes, _) = line.const_bytes(globals)?;
             // The VM checks the supplied length. The API reads through the first NUL.
@@ -2035,6 +2068,7 @@ mod tests {
                         debug: false,
                         pdf: None,
                         output: None,
+                        extract: None,
                         has_entry: Default::default(),
                         pe: Default::default(),
                     },
@@ -2077,6 +2111,7 @@ mod tests {
                     debug: false,
                     pdf: None,
                     output: None,
+                    extract: None,
                     has_entry: Default::default(),
                     pe: Default::default(),
                 },
@@ -2121,6 +2156,7 @@ mod tests {
                     debug: false,
                     pdf: None,
                     output: None,
+                    extract: None,
                     has_entry: Default::default(),
                     pe: Default::default(),
                 },

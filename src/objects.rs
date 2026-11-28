@@ -671,32 +671,98 @@ impl Traversal<'_> {
     }
 
     fn bytecode_output(&self) -> std::cell::RefCell<crate::bytecode::Output> {
-        std::cell::RefCell::new(crate::bytecode::Output::new(
-            crate::bytecode::OutputLimits {
-                file_size: self.max_file_size(),
-                scan_remaining: unlimited_if_zero(self.options.max_scan_size)
-                    .saturating_sub(self.bytes_scanned),
-                file_slot: self.options.max_files == 0
-                    || self.files_scanned < self.options.max_files,
-            },
-        ))
+        std::cell::RefCell::new(crate::bytecode::Output::new(self.bytecode_limits()))
+    }
+
+    fn bytecode_limits(&self) -> crate::bytecode::OutputLimits {
+        crate::bytecode::OutputLimits {
+            file_size: self.max_file_size(),
+            scan_remaining: unlimited_if_zero(self.options.max_scan_size)
+                .saturating_sub(self.bytes_scanned),
+            file_slot: self.options.max_files == 0 || self.files_scanned < self.options.max_files,
+        }
     }
 
     fn bytecode_child(&mut self, snapshot: Snapshot, size: u64) -> io::Result<()> {
+        if self.charge_bytecode_output(size) {
+            self.scan_bytecode_child(snapshot, size)?;
+        }
+        Ok(())
+    }
+
+    fn charge_bytecode_output(&mut self, size: u64) -> bool {
         // Stock extract_new charges the completed output before the recursive file scan.
         if self.skip_declared_size(size) {
-            return Ok(());
+            return false;
         }
         if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
             self.first_limit.get_or_insert(Limit::MaxFiles);
-            return Ok(());
+            return false;
         }
         self.files_scanned += 1;
         self.bytes_scanned += size;
-        if self.can_enter_child() {
-            self.visit_snapshot(snapshot, None, None)?;
+        true
+    }
+
+    fn scan_bytecode_child(&mut self, snapshot: Snapshot, size: u64) -> io::Result<Option<Limit>> {
+        self.check()?;
+        // The recursive stock scanner skips tiny files, then checks bytes before count and depth.
+        if size <= 5 {
+            return Ok(None);
         }
-        Ok(())
+        if let Some(reason) = self.size_limit(size).or_else(|| self.child_limit()) {
+            self.first_limit.get_or_insert(reason);
+            return Ok(Some(reason));
+        }
+        self.visit_snapshot(snapshot, None, None)?;
+        Ok(None)
+    }
+
+    fn extract_bytecode(
+        &mut self,
+        output: &std::cell::RefCell<crate::bytecode::Output>,
+        first_finding: &mut Option<String>,
+    ) -> io::Result<Option<u32>> {
+        let (snapshot, size) = {
+            let mut spool = output.borrow_mut();
+            if let Some(reason) = spool.rejected.take() {
+                self.first_limit.get_or_insert(reason);
+            }
+            if spool.size == 0 {
+                return Ok(Some(0));
+            }
+            if !self.charge_bytecode_output(spool.size) {
+                return Ok(Some(u32::MAX));
+            }
+            let size = std::mem::take(&mut spool.size);
+            (
+                spool.snapshot.take().expect("nonempty bytecode output"),
+                size,
+            )
+        };
+        let limit = self.scan_bytecode_child(snapshot, size)?;
+        output.borrow_mut().limits = self.bytecode_limits();
+        if let Some(stopped) = self.stopped.take() {
+            if stopped == Verdict::Incomplete && first_finding.is_some() {
+                // The API result is unknown. Stop this VM and retain the earlier detection.
+                return Ok(None);
+            }
+            let Verdict::Found(name) = stopped else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "incomplete bytecode child scan",
+                ));
+            };
+            first_finding.get_or_insert(name);
+            return Ok(Some(1));
+        }
+        Ok(Some(match limit {
+            Some(Limit::MaxRecursion) => 23,
+            Some(Limit::MaxFileSize | Limit::MaxScanSize) => 24,
+            Some(Limit::MaxFiles) => 25,
+            Some(Limit::MaxScanTime) => return Err(io::ErrorKind::TimedOut.into()),
+            None => 0,
+        }))
     }
 
     // Return whether a later stage on the same map may need to retry without a digest.
@@ -878,13 +944,24 @@ impl ChildSink for Traversal<'_> {
                 continue;
             }
             let output = self.bytecode_output();
+            let directory = self.temporary_directory;
+            let session = std::cell::RefCell::new((&mut *self, None));
             let result = program.run_pe_unpacker(
                 bytes,
-                (&output, self.temporary_directory),
+                crate::bytecode::UnpackerInput {
+                    output: &output,
+                    directory,
+                    extract: &|| {
+                        let mut state = session.borrow_mut();
+                        let (walk, first) = &mut *state;
+                        walk.extract_bytecode(&output, first)
+                    },
+                },
                 hooks.debug,
                 hooks.timeout,
-                &mut *self.check,
+                || session.borrow_mut().0.check(),
             )?;
+            let (_, extracted) = session.into_inner();
             let output = output.into_inner();
             if let Some(reason) = output.rejected {
                 self.first_limit.get_or_insert(reason);
@@ -892,12 +969,19 @@ impl ChildSink for Traversal<'_> {
             if let Some(snapshot) = output.snapshot {
                 self.bytecode_child(snapshot, output.size)?;
                 if self.stopped.is_some() {
+                    if let Some(first) = extracted {
+                        self.stopped = Some(Verdict::Found(first));
+                    }
                     return Ok(true);
                 }
             }
             if let PdfHookResult::Found(name) = result
                 && self.report_hook_detection(name)
             {
+                return Ok(true);
+            }
+            if let Some(first) = extracted {
+                self.stopped = Some(Verdict::Found(first));
                 return Ok(true);
             }
         }

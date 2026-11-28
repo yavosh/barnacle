@@ -442,6 +442,70 @@ pub fn write_probe(finish: WriteFinish) -> String {
     )
 }
 
+/// Print the marker only if the selected explicit extraction returned the expected code.
+pub fn extract_segments(first: &[u8], tail: &[u8], flush_tail: bool, expected: u32) -> String {
+    const WRITE: u64 = 3;
+    const EXTRACT_NEW: u64 = 22;
+    let mut globals = name_globals(0, 7, 70);
+    for (ty, data) in [(72, first), (73, tail)] {
+        global_array(&mut globals, ty, if data.is_empty() { &[0] } else { data });
+    }
+    global_pointer(&mut globals, 65, 3, 0);
+    global_pointer(&mut globals, 65, 4, 0);
+    let mut ops = Vec::new();
+    if !first.is_empty() {
+        ops.push(call(
+            0,
+            WRITE,
+            &[pointer(5), immediate(first.len() as u64, 4)],
+        ));
+    }
+    ops.push(call(1, EXTRACT_NEW, &[immediate(101, 4)]));
+    if !tail.is_empty() {
+        ops.push(call(
+            0,
+            WRITE,
+            &[pointer(6), immediate(tail.len() as u64, 4)],
+        ));
+    }
+    if flush_tail {
+        ops.push(call(1, EXTRACT_NEW, &[immediate(102, 4)]));
+    }
+    ops.push(op(
+        1,
+        2,
+        21,
+        &[number(32), number(1), immediate(expected.into(), 4)],
+    ));
+    ops.push(branch(2, 1, 2));
+    program(
+        257,
+        "Local.Receipt.Extract.{};Target:1;0;544:72656365697074",
+        &[
+            callable(&[32, 65, 32]),
+            array(NAME.len() + 1, 8),
+            callable(&[32, 32]),
+            array(first.len().max(1), 8),
+            array(tail.len().max(1), 8),
+        ],
+        &[
+            (WRITE, 69, "write"),
+            (DEBUG_UINT, 71, "debug_print_uint"),
+            (EXTRACT_NEW, 71, "extract_new"),
+        ],
+        globals,
+        &[Function {
+            args: 0,
+            slots: &[32, 32, 1],
+            blocks: &[
+                ops,
+                vec![call(0, DEBUG_UINT, &[immediate(871035284, 4)]), ret()],
+                vec![ret()],
+            ],
+        }],
+    )
+}
+
 pub fn output_probe(hook: u64, title: &str, finish: WriteFinish) -> String {
     const WRITE: u64 = 3;
     let split = 11;
