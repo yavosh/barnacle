@@ -39,9 +39,10 @@ The opcode set includes arithmetic, comparisons, control flow, calls, and pointe
 The host APIs include file reads, seeks, PE and PDF queries, extraction, and detection name reporting.
 The inventory reports each opcode ID and API name with its ID.
 It also checks the Rust compiler against every eligible module.
-The compiler accepts 52 of the 72 logical modules in the signed archive.
+The compiler accepts 65 of the 72 logical modules in the signed archive.
 The archive test loads their triggers together through the logical index.
-The inventory groups the remaining 30 eligible modules by the first compiler rejection.
+The inventory groups the remaining 17 eligible modules by the first compiler rejection.
+Ten require nonlogical hooks, five declare unsupported types, and two declare unsupported APIs.
 Signed-feed activation and verdict qualification remain open in [issue #4](https://github.com/yavosh/barnacle/issues/4).
 [ClamAV bytecode format](https://docs.clamav.net/manual/Signatures/BytecodeSignatures.html) · [Stock hook definitions](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav/bytecode_api.h#L63-L85)
 
@@ -63,9 +64,11 @@ The fixture SHA-256 is `36d282680ef43be4eb5fc1aec95b6d262460c3a5ffb2563a280a35db
 ## Supported execution
 
 The Rust interpreter executes logical bytecode with typed integer locals, arithmetic, comparisons, casts, branches, and loops.
-Each call gets a fresh frame, with checked addressable locals and a cursor over the current scan object.
+Direct helper calls accept integer arguments and return values. Each call gets a fresh frame.
+Calls share the scan object's cursor and execution deadline. The interpreter bounds stack depth and storage.
 The frame supports pointer arithmetic, loads, stores, byte swaps, and bounded memory operations.
 Host calls can seek, read, search, report the engine level, and set a detection name.
+Host calls can read decimal and hexadecimal integers and emit diagnostics when clamd debug logging is enabled.
 Bytecode can read the object size, subsignature counts, and first offsets.
 Programs that use first offsets currently require indexed pattern subsignatures.
 An ASCII-target bytecode rule forces a normalized file map for script scanning.
@@ -80,6 +83,7 @@ An eligible module with unsupported instructions, APIs, or metadata prevents act
 
 The comparison covers exact names, offsets, match counts, scalar widths, search boundaries, and a 1 ms timeout.
 Frame tests compare short reads, EOF, cursor position, nested archive members, and both script map modes.
+Helper tests compare nested calls and shared cursor behavior. Host-call tests cover numeric reads and debug settings.
 It also covers competing generic logical signatures.
 When both rules match, stock evaluates the one loaded first from the database directory.
 Barnacle returns its existing incomplete-scan error for misses while detection coverage remains partial.

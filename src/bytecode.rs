@@ -404,8 +404,8 @@ mod tests {
         assert_eq!(found.instructions, 15_034);
         assert_eq!(found.opcodes.len(), 44);
         assert_eq!(found.apis.len(), 28);
-        assert_eq!(found.compiled, 52);
-        assert_eq!(found.compile_errors.values().sum::<usize>(), 30);
+        assert_eq!(found.compiled, 65);
+        assert_eq!(found.compile_errors.values().sum::<usize>(), 17);
 
         let scratch = tempfile::tempdir()?;
         let mut sources = Vec::new();

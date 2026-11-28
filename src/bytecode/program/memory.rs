@@ -199,6 +199,17 @@ impl Address {
         Ok(object.start + start..object.start + end)
     }
 
+    pub(super) fn remaining<'a>(&'a self, frame: &'a Frame<'_>) -> Result<&'a [u8], MemoryFault> {
+        match self {
+            Self::Constant(bytes, off) => bytes.get(*off..).ok_or(MemoryFault::Bounds),
+            _ => {
+                let (i, _) = self.local_pointer(frame)?;
+                let start = self.range(frame, 0)?.start;
+                Ok(&frame.bytes[start..frame.slots[i].end()])
+            }
+        }
+    }
+
     pub(super) fn read<'a>(
         &'a self,
         frame: &'a Frame<'_>,

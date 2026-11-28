@@ -156,6 +156,7 @@ pub struct LogicalIndex {
     max_icons: usize,
     search: SearchIndex,
     bytecode: HashMap<u32, Program>,
+    bytecode_debug: bool,
     bytecode_timeout: Duration,
 }
 
@@ -280,12 +281,19 @@ impl LogicalIndex {
             icons: IconDatabase::default(),
             max_icons: 100,
             bytecode,
+            bytecode_debug: false,
             bytecode_timeout,
             regexes: builder.regexes,
             zero_triggers: builder.zero_triggers,
             pcre_limits: PcreLimits::default(),
             search,
         })
+    }
+
+    /// Use the daemon's debug setting for bytecode diagnostics.
+    pub fn with_bytecode_debug(mut self, enabled: bool) -> Self {
+        self.bytecode_debug = enabled;
+        self
     }
 
     /// Use the daemon's PCRE limits for this generation.
@@ -617,9 +625,14 @@ impl LogicalIndex {
                     .matches
                     .get(&id)
                     .map_or(&[][..], |entry| entry.counts.as_slice());
-                if let Some(name) =
-                    program.run(input, offsets, counts, self.bytecode_timeout, &mut *check)?
-                {
+                if let Some(name) = program.run(
+                    input,
+                    offsets,
+                    counts,
+                    self.bytecode_debug,
+                    self.bytecode_timeout,
+                    &mut *check,
+                )? {
                     finding = Ok(Some(name));
                     break;
                 }

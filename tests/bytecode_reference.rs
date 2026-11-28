@@ -332,3 +332,67 @@ fn stock_bytecode_frame_and_cursor() -> io::Result<()> {
     verify_stock()?;
     compare_read_cursor(Path::new("/usr/sbin/clamd"), STOCK_MISS)
 }
+
+fn compare_host_calls_and_helpers(executable: &Path, miss: &str) -> io::Result<()> {
+    let options = "BytecodeUnsigned yes\nBytecodeMode ForceInterpreter\n";
+    run_program(
+        executable,
+        &scalar::numeric_read(10, 42, 27),
+        options,
+        &[
+            (b"receipt------------------42................", true),
+            (b"receipt------------------43................", false),
+        ],
+        miss,
+    )?;
+    run_program(
+        executable,
+        &scalar::numeric_read(16, 42, 19),
+        options,
+        &[(b"receipt--------0x2A................", true)],
+        miss,
+    )?;
+    run_program(
+        executable,
+        &scalar::numeric_read(10, u32::MAX, 7),
+        options,
+        &[
+            (b"receipt..............42", true),
+            (b"receipt................", false),
+        ],
+        miss,
+    )?;
+    for debug in [false, true] {
+        let options = format!("{options}Debug {}\n", if debug { "yes" } else { "no" });
+        run_program(
+            executable,
+            &scalar::diagnostics(debug),
+            &options,
+            &[(b"receipt diagnostic", true)],
+            miss,
+        )?;
+    }
+    run_program(
+        executable,
+        &scalar::direct_calls(),
+        options,
+        &[
+            (b"receiptQ", true),
+            (b"receiptX", false),
+            (b"receipt", false),
+        ],
+        miss,
+    )
+}
+
+#[test]
+fn barnacle_bytecode_host_calls_and_helpers() -> io::Result<()> {
+    compare_host_calls_and_helpers(Path::new(env!("CARGO_BIN_EXE_barnacle")), PARTIAL_MISS)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_bytecode_host_calls_and_helpers() -> io::Result<()> {
+    verify_stock()?;
+    compare_host_calls_and_helpers(Path::new("/usr/sbin/clamd"), STOCK_MISS)
+}

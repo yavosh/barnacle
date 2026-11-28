@@ -7,8 +7,14 @@ const ADDRESSABLE: u64 = 1 << 15;
 const READ: u64 = 2;
 const SEEK: u64 = 4;
 const SET_NAME: u64 = 5;
+const DEBUG_STRING: u64 = 6;
+const DEBUG_UINT: u64 = 7;
 const FIND: u64 = 16;
 const BYTE_AT: u64 = 17;
+const READ_NUMBER: u64 = 23;
+const RUNTIME_ERROR: u64 = 42;
+const DEBUG_START: u64 = 54;
+const DEBUG_BYTES: u64 = 55;
 const FIND_LIMIT: u64 = 65;
 const ENGINE_LEVEL: u64 = 66;
 
@@ -61,6 +67,11 @@ fn call(output: u64, id: u64, args: &[String]) -> String {
     op(32, output, 33, &[arguments])
 }
 
+fn call_direct(output: u64, id: u64, args: &[String]) -> String {
+    let arguments = fixed(args.len() as u64, 1) + &number(id) + &args.concat();
+    op(32, output, 32, &[arguments])
+}
+
 fn branch(condition: u64, yes: u64, no: u64) -> String {
     format!(
         "T{}{}{}{}",
@@ -73,6 +84,10 @@ fn branch(condition: u64, yes: u64, no: u64) -> String {
 
 fn ret() -> String {
     format!("T{}{}{}", fixed(19, 2), number(32), immediate(7, 4))
+}
+
+fn ret_local(local: u64) -> String {
+    format!("T{}{}{}", fixed(19, 2), number(32), number(local))
 }
 
 fn report(output: u64) -> String {
@@ -122,6 +137,32 @@ fn image(
     locals: &[u64],
     blocks: &[Vec<String>],
 ) -> String {
+    module(
+        trigger,
+        types,
+        apis,
+        globals,
+        &[Function {
+            args: 0,
+            slots: locals,
+            blocks,
+        }],
+    )
+}
+
+struct Function<'a> {
+    args: usize,
+    slots: &'a [u64],
+    blocks: &'a [Vec<String>],
+}
+
+fn module(
+    trigger: &str,
+    types: &[String],
+    apis: &[(u64, u64, &str)],
+    globals: String,
+    functions: &[Function<'_>],
+) -> String {
     let mut head = String::from("ClamBC");
     for field in [
         number(7),
@@ -134,7 +175,7 @@ fn image(
         number(0),
         string("Barnacle Rust fixture"),
         number(5 + types.len() as u64),
-        number(1),
+        number(functions.len() as u64),
         number(0x53e5493e9f3d1c30),
         fixed(42, 2),
     ] {
@@ -148,25 +189,39 @@ fn image(
     for &(id, type_id, name) in apis {
         api += &(number(id) + &number(type_id) + &string(name));
     }
-    let mut entry = format!(
-        "A{}{}L{}",
-        fixed(0, 1),
-        number(32),
-        number(locals.len() as u64)
-    );
-    for &local in locals {
-        entry += &(number(local & !ADDRESSABLE) + &fixed(u64::from(local & ADDRESSABLE != 0), 1));
-    }
-    let instructions: usize = blocks.iter().map(Vec::len).sum();
-    entry += &(String::from("F") + &number(instructions as u64) + &number(blocks.len() as u64));
     let mut cbc = format!(
-        "{head}:4096\nLocal.Receipt.Trigger.{{}};Target:0;{trigger}\nT{}{}\n{api}\n{globals}\n{entry}\n",
+        "{head}:4096\nLocal.Receipt.Trigger.{{}};Target:0;{trigger}\nT{}{}\n{api}\n{globals}\n",
         fixed(69, 2),
         types.concat()
     );
-    for (i, block) in blocks.iter().enumerate() {
-        let end = if i + 1 == blocks.len() { "E" } else { "" };
-        writeln!(cbc, "B{}{end}", block.concat()).unwrap();
+    for function in functions {
+        write!(
+            cbc,
+            "A{}{}L{}",
+            fixed(function.args as u64, 1),
+            number(32),
+            number((function.slots.len() - function.args) as u64)
+        )
+        .unwrap();
+        for &local in function.slots {
+            cbc += &(number(local & !ADDRESSABLE) + &fixed(u64::from(local & ADDRESSABLE != 0), 1));
+        }
+        let instructions: usize = function.blocks.iter().map(Vec::len).sum();
+        writeln!(
+            cbc,
+            "F{}{}",
+            number(instructions as u64),
+            number(function.blocks.len() as u64)
+        )
+        .unwrap();
+        for (i, block) in function.blocks.iter().enumerate() {
+            let end = if i + 1 == function.blocks.len() {
+                "E"
+            } else {
+                ""
+            };
+            writeln!(cbc, "B{}{end}", block.concat()).unwrap();
+        }
     }
     cbc += "S\n";
     cbc
@@ -560,4 +615,155 @@ pub fn normalized_script(mapped: bool) -> String {
     } else {
         program
     }
+}
+
+pub fn numeric_read(radix: u64, value: u32, position: u64) -> String {
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32, 32]),
+            callable(&[32, 32]),
+            array(NAME.len() + 1, 8),
+        ],
+        &[
+            (SEEK, 70, "seek"),
+            (SET_NAME, 69, "setvirusname"),
+            (READ_NUMBER, 71, "read_number"),
+        ],
+        name_globals(0, 3, 72),
+        &[32, 32, 32, 1, 1, 1, 32],
+        &[
+            vec![
+                call(0, SEEK, &[immediate(7, 4), immediate(0, 4)]),
+                call(1, READ_NUMBER, &[immediate(radix, 4)]),
+                call(2, SEEK, &[immediate(0, 4), immediate(1, 4)]),
+                op(
+                    1,
+                    3,
+                    21,
+                    &[number(32), number(1), immediate(value.into(), 4)],
+                ),
+                op(1, 4, 21, &[number(32), number(2), immediate(position, 4)]),
+                op(1, 5, 11, &[number(3), number(4)]),
+                branch(5, 1, 2),
+            ],
+            vec![report(6), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
+pub fn diagnostics(debug: bool) -> String {
+    let mut globals = name_globals(0, 5, 71);
+    global_array(&mut globals, 72, b"note\0");
+    global_pointer(&mut globals, 65, 3, 0);
+    let text = [pointer(4), immediate(4, 4)];
+    let printed_number = if debug { 3 } else { 0 };
+    let printed_bytes = if debug { 4 } else { 0 };
+    image(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32]),
+            array(NAME.len() + 1, 8),
+            array(5, 8),
+        ],
+        &[
+            (SET_NAME, 69, "setvirusname"),
+            (DEBUG_STRING, 69, "debug_print_str"),
+            (DEBUG_UINT, 70, "debug_print_uint"),
+            (RUNTIME_ERROR, 70, "bytecode_rt_error"),
+            (DEBUG_START, 69, "debug_print_str_start"),
+            (DEBUG_BYTES, 69, "debug_print_str_nonl"),
+        ],
+        globals,
+        &[32, 32, 32, 32, 32, 1, 1, 1, 32],
+        &[
+            vec![
+                call(0, DEBUG_STRING, &text),
+                call(1, DEBUG_START, &text),
+                call(2, DEBUG_UINT, &[immediate(u64::from((-12i32) as u32), 4)]),
+                call(3, DEBUG_BYTES, &text),
+                call(4, RUNTIME_ERROR, &[immediate(9 << 8 | 2, 4)]),
+                op(
+                    1,
+                    5,
+                    21,
+                    &[number(32), number(2), immediate(printed_number, 4)],
+                ),
+                op(
+                    1,
+                    6,
+                    21,
+                    &[number(32), number(3), immediate(printed_bytes, 4)],
+                ),
+                op(1, 7, 11, &[number(5), number(6)]),
+                branch(7, 1, 2),
+            ],
+            vec![report(8), ret()],
+            vec![ret()],
+        ],
+    )
+}
+
+/// Pass a scalar argument through a helper that calls a second function.
+pub fn direct_calls() -> String {
+    module(
+        RECEIPT_TRIGGER,
+        &[
+            callable(&[32, 65, 32]),
+            callable(&[32, 32, 32]),
+            array(NAME.len() + 1, 8),
+        ],
+        &[
+            (READ, 69, "read"),
+            (SEEK, 70, "seek"),
+            (SET_NAME, 69, "setvirusname"),
+        ],
+        name_globals(0, 3, 71),
+        &[
+            Function {
+                args: 0,
+                slots: &[32, 32, 32, 1, 1, 1, 32],
+                blocks: &[
+                    vec![
+                        call(0, SEEK, &[immediate(7, 4), immediate(0, 4)]),
+                        call_direct(1, 2, &[immediate(5, 4)]),
+                        call(2, SEEK, &[immediate(0, 4), immediate(1, 4)]),
+                        op(
+                            1,
+                            3,
+                            21,
+                            &[number(32), number(1), immediate(u64::from(b'Q') + 5, 4)],
+                        ),
+                        op(1, 4, 21, &[number(32), number(2), immediate(8, 4)]),
+                        op(1, 5, 11, &[number(3), number(4)]),
+                        branch(5, 1, 2),
+                    ],
+                    vec![report(6), ret()],
+                    vec![ret()],
+                ],
+            },
+            Function {
+                args: 1,
+                slots: &[32, 32, 32],
+                blocks: &[vec![
+                    call_direct(1, 3, &[]),
+                    op(32, 2, 1, &[number(0), number(1)]),
+                    ret_local(2),
+                ]],
+            },
+            Function {
+                args: 0,
+                slots: &[ADDRESSABLE | 8, 32, 8, 32],
+                blocks: &[vec![
+                    call(1, READ, &[number(0), immediate(1, 4)]),
+                    op(8, 2, 39, &[number(0)]),
+                    op(32, 3, 16, &[number(2)]),
+                    ret_local(3),
+                ]],
+            },
+        ],
+    )
 }

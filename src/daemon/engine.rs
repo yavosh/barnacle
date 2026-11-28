@@ -316,6 +316,7 @@ impl Generation {
             config.bytecode_timeout,
             open_snapshot,
         )?
+        .with_bytecode_debug(config.debug)
         .with_pcre_limits(config.pcre)
         .with_image_fuzzy_hash(config.objects.scan_image && config.scan_image_fuzzy_hash)
         .with_icons(&icon_paths, &ignores, config.max_icons_pe, open_snapshot)?;
