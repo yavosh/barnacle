@@ -295,6 +295,12 @@ struct Decoder<'a> {
     last: u32,
 }
 
+enum Step {
+    Literal(u8),
+    Match { distance: usize, count: usize },
+    End,
+}
+
 impl<'a> Decoder<'a> {
     fn new(method: Method, input: &'a [u8], size: usize, out: Option<Vec<u8>>) -> Self {
         Self {
@@ -321,15 +327,26 @@ impl<'a> Decoder<'a> {
                 next_check = self.len.saturating_add(CHECK_BLOCK);
             }
             match self.step() {
-                Some(true) => {}
-                Some(false) => return Ok(true),
+                Some(Step::Literal(byte)) => {
+                    if let Some(out) = &mut self.out {
+                        out.push(byte);
+                    }
+                    self.len += 1;
+                }
+                Some(Step::Match { distance, count }) => {
+                    if let Some(out) = &mut self.out {
+                        copy_match(out, distance, count, &mut next_check, check)?;
+                    }
+                    self.len += count;
+                }
+                Some(Step::End) => return Ok(true),
                 None => return Ok(false),
             }
         }
     }
 
-    /// Decode one literal or one match. Return false after the end marker.
-    fn step(&mut self) -> Option<bool> {
+    /// Read one token and validate its output bounds.
+    fn step(&mut self) -> Option<Step> {
         let nrv2b = self.method == Method::Nrv2b;
         let bits = &mut self.bits;
         if bits.bit()? == 1 {
@@ -337,11 +354,7 @@ impl<'a> Decoder<'a> {
             if self.len == self.size {
                 return None;
             }
-            self.len += 1;
-            if let Some(out) = &mut self.out {
-                out.push(byte);
-            }
-            return Some(true);
+            return Some(Step::Literal(byte));
         }
         let offset = if nrv2b {
             bits.gamma(1)?
@@ -360,7 +373,7 @@ impl<'a> Decoder<'a> {
         } else {
             let offset = (offset - 3).checked_mul(256)? | u32::from(bits.byte()?);
             if offset == u32::MAX {
-                return Some(false);
+                return Some(Step::End);
             }
             // NRV2D and NRV2E keep the inverted first length bit in the lowest offset bit.
             let (offset, low) = if nrv2b {
@@ -391,16 +404,31 @@ impl<'a> Decoder<'a> {
         if distance > self.len || count > self.size - self.len {
             return None;
         }
-        if let Some(out) = &mut self.out {
-            let start = out.len() - distance;
-            for at in start..start + count {
-                let byte = out[at];
-                out.push(byte);
-            }
-        }
-        self.len += count;
-        Some(true)
+        Some(Step::Match { distance, count })
     }
+}
+
+fn copy_match(
+    out: &mut Vec<u8>,
+    distance: usize,
+    count: usize,
+    next_check: &mut usize,
+    check: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let end = out.len() + count;
+    while out.len() < end {
+        let chunk = end.min(*next_check) - out.len();
+        let start = out.len() - distance;
+        // A match may read bytes it appended earlier in the same chunk.
+        for at in start..start + chunk {
+            out.push(out[at]);
+        }
+        if out.len() < end {
+            check()?;
+            *next_check = out.len().saturating_add(CHECK_BLOCK);
+        }
+    }
+    Ok(())
 }
 
 /// Decode exactly `size` bytes from the whole input.
@@ -440,7 +468,7 @@ fn ends(
 
 #[cfg(test)]
 mod tests {
-    use super::{Method, Packed, decode, ends};
+    use super::{CHECK_BLOCK, Method, Packed, copy_match, decode, ends};
     use crate::objects::{Options, Verdict};
     use std::io;
 
@@ -549,6 +577,32 @@ mod tests {
             assert!(decode(method, &[0; 64], 0x10000, 0, &mut || Ok(()))?.is_none());
         }
         Ok(())
+    }
+
+    #[test]
+    fn overlapping_copy_stops_at_the_output_checkpoint() {
+        let seed = b"abc";
+        let mut out = seed.to_vec();
+        let mut next_check = CHECK_BLOCK;
+        let mut checks = 0;
+        let error = copy_match(
+            &mut out,
+            seed.len(),
+            3 * CHECK_BLOCK,
+            &mut next_check,
+            &mut || {
+                checks += 1;
+                if checks == 2 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(checks, 2);
+        assert_eq!(out.len(), 2 * CHECK_BLOCK);
+        assert!(out.iter().zip(seed.iter().cycle()).all(|(a, b)| a == b));
     }
 
     #[test]
