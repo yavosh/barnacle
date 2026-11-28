@@ -462,10 +462,62 @@ fn compare_disasm_records(executable: &Path, miss: &str) -> io::Result<()> {
         record([114, 0, 0, 0, 0], [&[3, 0], &[3, 21], &[]]),
         true,
     );
+    add(
+        &[0xd1, 0x63, 0xfc],
+        3,
+        record(
+            [169, 0, 0, 0, 0],
+            [&[4, 2, 3, 54, 1, 0, 252, 255, 255, 255], &[1, 1, 1], &[]],
+        ),
+        true,
+    );
+    add(
+        &[0x66, 0xd3, 0xf8],
+        3,
+        record([146, 0, 1, 0, 0], [&[3, 8], &[3, 21], &[]]),
+        true,
+    );
+    add(
+        &[0x0f, 0xac, 0xd1, 7],
+        4,
+        record([172, 0, 0, 0, 0], [&[3, 1], &[3, 2], &[1, 0, 7]]),
+        true,
+    );
+    add(
+        &[0xf7, 0x5b, 0xf8],
+        3,
+        record(
+            [116, 0, 0, 0, 0],
+            [&[4, 2, 3, 54, 1, 0, 248, 255, 255, 255], &[], &[]],
+        ),
+        true,
+    );
+    add(
+        &[0xa1, 248, 255, 255, 255],
+        5,
+        record(
+            [109, 0, 0, 0, 0],
+            [&[3, 0], &[4, 2, 54, 54, 0, 0, 248, 255, 255, 255], &[]],
+        ),
+        true,
+    );
+    add(
+        &[0x67, 0x66, 0xa3, 248, 255],
+        5,
+        record(
+            [109, 0, 1, 1, 0],
+            [&[4, 1, 54, 54, 0, 0, 248, 255], &[3, 8], &[]],
+        ),
+        true,
+    );
+    add(&[0x66, 0xa7], 2, record([45, 0, 1, 0, 0], [&[]; 3]), true);
+    add(&[0x64, 0xac], 2, record([101, 0, 0, 0, 28], [&[]; 3]), true);
     let mut failure = [0xa5; 64];
     add(&[], 0, failure, true);
     failure[35..].fill(0);
     add(&[0xb8], 0, failure, true);
+    add(&[0xc1, 0xe0], 0, failure, true);
+    add(&[0xa1], 0, failure, true);
     failure[63] = 1;
     add(&[0xb8], 0, failure, false);
     let cases = cases

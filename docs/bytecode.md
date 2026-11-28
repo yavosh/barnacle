@@ -77,9 +77,9 @@ Bytecode can read the object size, subsignature counts, and first offsets.
 PE bytecode can read the entry offset and section count, fetch section records, and translate virtual addresses.
 The `disasm_x86` host call decodes supported legacy 32-bit instructions at the current cursor.
 The return value is the next absolute offset. The cursor stays in place.
-Comparison with pinned stock covered 3,372 instruction records, including operand metadata and result length.
+Comparison with pinned stock covered 6,384 instruction records, including operand metadata and result length.
 Paired daemon tests cover invalid instructions, EOF, and which result bytes change on failure.
-Unmodeled encodings return an explicit unsupported error. These include x87, string operations, shifts, and several two-byte groups.
+Unmodeled encodings return an explicit unsupported error. These include x87, indirect calls and jumps, and several two-byte groups.
 Programs that use first offsets currently require indexed pattern subsignatures.
 An ASCII-target bytecode rule forces a normalized file map for script scanning.
 An unmapped script scan matches normalized text. Its bytecode reads the owning file map.
@@ -176,6 +176,10 @@ Use the effective daemon options and engine module flags together to determine w
 | RIFF | Named finding parity is open. |
 | XZ dictionary limit | A final decoder memory refusal reports `Heuristics.XZ.DicSizeLimit` and discards the decoded prefix. The stock test forces a refusal on an ordinary receipt. |
 | URL phishing checks | Verified URL rule loading and detection are tracked in [issue #10](https://github.com/yavosh/barnacle/issues/10). |
+
+When Parite and Magistr both match, pinned stock can report either name with default settings.
+Barnacle consistently reports Magistr in that case. Immediate heuristic precedence reports Parite in both scanners.
+[Pinned alert selection](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/libclamav_rust/src/evidence.rs#L116-L119)
 
 The pinned profile disables the encrypted-document, partition-intersection, and scan-limit alerts.
 Separate opt-in fixtures verify encrypted PDF and partition-intersection precedence against stock.

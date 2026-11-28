@@ -412,7 +412,7 @@ impl FileType {
                             .last_pe_section()
                             .and_then(|section| magistr(bytes, header, section))
                     };
-                    // Immediate reporting takes the first PE alert. Deferred reporting keeps the last.
+                    // Immediate reporting takes the first PE alert. Use a stable order when deferring both.
                     let name = if options.heuristic_scan_precedence {
                         parite.or_else(magistr)
                     } else {

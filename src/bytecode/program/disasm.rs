@@ -174,6 +174,17 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
                     args[0] = input.immediate(wide, true)?;
                     70 + u16::from(second - 0x80)
                 }
+                0xa4 | 0xa5 | 0xac | 0xad => {
+                    let (reg, rm) = input.modrm(wide, address16)?;
+                    args[0] = rm;
+                    args[1] = register(reg, wide);
+                    args[2] = if second & 1 == 0 {
+                        input.immediate(0, false)?
+                    } else {
+                        register(1, 0)
+                    };
+                    if second < 0xac { 170 } else { 172 } // SHLD, SHRD
+                }
                 _ => return Err(Error::Unsupported),
             }
         }
@@ -191,6 +202,24 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
             args[1] = rm;
             args[2] = input.immediate(if opcode == 0x69 { wide } else { 0 }, false)?;
             58
+        }
+        0x6c..=0x6f | 0xa4..=0xa7 | 0xaa..=0xaf => {
+            // Stock omits implicit string operands and reports the element width in the opcode.
+            let dword: u16 = match opcode & !1 {
+                0x6c => 61,  // INS
+                0x6e => 121, // OUTS
+                0xa4 => 110, // MOVS
+                0xa6 => 44,  // CMPS
+                0xaa => 174, // STOS
+                0xac => 99,  // LODS
+                _ => 148,    // SCAS
+            };
+            dword
+                + if opcode & 1 == 0 {
+                    2
+                } else {
+                    u16::from(record[2])
+                }
         }
         0x70..=0x7f => {
             args[0] = input.immediate(0, true)?;
@@ -223,6 +252,16 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
             args[1] = register(0, wide);
             193
         }
+        0xa0..=0xa3 => {
+            let memory = usize::from(opcode < 0xa2);
+            args[1 - memory] = register(0, size);
+            args[memory][..4].copy_from_slice(&[4, size, NO_REGISTER, NO_REGISTER]);
+            let length = if address16 { 2 } else { 4 };
+            for out in &mut args[memory][6..6 + length] {
+                *out = input.byte()?;
+            }
+            109 // MOV accumulator to/from an absolute memory offset
+        }
         0xa8 | 0xa9 => {
             args[0] = register(0, size);
             args[1] = input.immediate(size, false)?;
@@ -233,6 +272,27 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
             args[0] = register(opcode & 7, size);
             args[1] = input.immediate(size, false)?;
             109
+        }
+        0xc0 | 0xc1 | 0xd0..=0xd3 => {
+            let (extension, rm) = input.modrm(size, address16)?;
+            args[0] = rm;
+            let operation = match extension {
+                0 => 142, // ROL
+                1 => 143, // ROR
+                2 => 133, // RCL
+                3 => 134, // RCR
+                4 => 169, // SHL
+                5 => 171, // SHR
+                7 => 146, // SAR
+                _ => return Err(Error::Invalid),
+            };
+            args[1] = match opcode {
+                0xc0 | 0xc1 => input.immediate(0, false)?,
+                // Stock reports the implicit count of one as a word-sized immediate.
+                0xd0 | 0xd1 => [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                _ => register(1, 0), // CL
+            };
+            operation
         }
         0xc2 => {
             args[0] = input.immediate(1, false)?;
@@ -257,10 +317,37 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
         0xf0 => 98,
         0xf2 => 139,
         0xf3 => 138,
+        0xf6 | 0xf7 => {
+            let (extension, rm) = input.modrm(size, address16)?;
+            args[0] = rm;
+            match extension {
+                0 => {
+                    args[1] = input.immediate(size, false)?;
+                    186 // TEST
+                }
+                2 => 118, // NOT
+                3 => 116, // NEG
+                4 => 115, // MUL
+                5 => 58,  // IMUL
+                6 => 53,  // DIV
+                7 => 57,  // IDIV
+                _ => return Err(Error::Invalid),
+            }
+        }
         0xf8 => 22,
         0xf9 => 178,
         0xfc => 23,
         0xfd => 179,
+        0xfe | 0xff => {
+            let (extension, rm) = input.modrm(size, address16)?;
+            args[0] = rm;
+            match extension {
+                0 => 59, // INC
+                1 => 52, // DEC
+                2..=6 if opcode == 0xff => return Err(Error::Unsupported),
+                _ => return Err(Error::Invalid),
+            }
+        }
         _ => return Err(Error::Unsupported),
     };
     record[..2].copy_from_slice(&operation.to_le_bytes());
