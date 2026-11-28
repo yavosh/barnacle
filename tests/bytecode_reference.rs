@@ -437,6 +437,20 @@ fn compare_disasm_records(executable: &Path, miss: &str) -> io::Result<()> {
     };
     add(&[0x60], 1, record([125, 0, 0, 0, 0], [&[]; 3]), true);
     add(&[0x66, 0x60], 2, record([126, 0, 1, 0, 0], [&[]; 3]), true);
+    for reg in 0..8 {
+        add(
+            &[0x0f, 0xc8 + reg],
+            2,
+            record([12, 0, 0, 0, 0], [&[3, reg], &[], &[]]),
+            true,
+        );
+    }
+    add(
+        &[0x66, 0x0f, 0xcf],
+        3,
+        record([12, 0, 1, 0, 0], [&[3, 7], &[], &[]]),
+        true,
+    );
     add(&[0x90], 1, record([117, 0, 0, 0, 0], [&[]; 3]), true);
     add(&[0xf3, 0x90], 1, record([138, 0, 0, 0, 0], [&[]; 3]), true);
     add(

@@ -185,6 +185,11 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(usize, [u8; 64])> {
                     };
                     if second < 0xac { 170 } else { 172 } // SHLD, SHRD
                 }
+                0xc8..=0xcf => {
+                    // Stock keeps the register 32-bit with an operand-size prefix.
+                    args[0] = register(second & 7, 2);
+                    12 // BSWAP
+                }
                 _ => return Err(Error::Unsupported),
             }
         }

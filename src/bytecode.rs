@@ -561,4 +561,68 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[ignore = "requires the pinned Linux architecture and BARNACLE_CVD_DIR"]
+    fn signed_pe_unpacker_recursive_receipt() -> io::Result<()> {
+        use crate::objects::{self, Verdict};
+
+        let dir = std::path::PathBuf::from(std::env::var_os("BARNACLE_CVD_DIR").unwrap());
+        let index = verified_index(&dir.join(PINNED_ARCHIVE.0))?;
+        let hooks = index.pe_hooks().unwrap();
+        let scratch = tempfile::tempdir()?;
+        let packed = include_bytes!("../tests/fixtures/upx/ledger-nrv2b.exe");
+        let scan = |hooks| {
+            let mut visits = Vec::new();
+            let mut checks = 0;
+            let verdict = objects::scan_with_hooks(
+                packed,
+                &objects::Options::default(),
+                scratch.path(),
+                index.pdf_hooks(),
+                Some(hooks),
+                |object, check| {
+                    let depth = object.parents.len();
+                    let matches = index.match_step(
+                        object.bytes,
+                        object.context,
+                        object.logical,
+                        false,
+                        Some(object.logical_step),
+                        &mut &mut *check,
+                    )?;
+                    assert!(matches.handlers.is_empty());
+                    assert_eq!(matches.finding, Ok(None));
+                    if let Some(hits) = object.pe_hook_hits {
+                        hits.extend_from_slice(&matches.pe_hooks);
+                    }
+                    visits.push((depth, object.bytes.len(), matches.pe_hooks));
+                    Ok(Verdict::Miss)
+                },
+                || {
+                    checks += 1;
+                    Ok(())
+                },
+            )?;
+            assert_eq!(verdict, Verdict::Miss);
+            Ok::<_, io::Error>((visits, checks))
+        };
+        let (baseline, baseline_checks) = scan(objects::PeHooks {
+            unpackers: &[],
+            ..hooks
+        })?;
+        let (visits, checks) = scan(hooks)?;
+        assert_eq!(visits, baseline);
+        assert_eq!(visits.len(), 2);
+        assert_eq!(visits[0], (0, packed.len(), vec![]));
+        let (depth, size, hits) = &visits[1];
+        assert_eq!((*depth, *size), (1, 69_632));
+        let [selected] = hits.as_slice() else {
+            panic!("expected one PE hook on the reconstructed ledger");
+        };
+        assert!(hooks.unpackers.iter().any(|(id, _)| *id == Some(*selected)));
+        assert_eq!(checks, baseline_checks + 3290);
+        Ok(())
+    }
 }

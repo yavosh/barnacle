@@ -105,6 +105,7 @@ The `disasm_x86` host call decodes supported legacy 32-bit instructions at the c
 The return value is the next absolute offset. The cursor stays in place.
 Comparison with pinned stock covered 6,384 instruction records, including operand metadata and result length.
 One verified module checks for `PUSHAD`. Paired daemon tests check the complete records and next offsets for `PUSHAD` and `PUSHA`.
+Another verified module checks for `BSWAP`. Tests cover all eight registers and confirm that the operand-size prefix preserves the 32-bit register.
 Paired daemon tests cover invalid instructions, EOF, and which result bytes change on failure.
 Unmodeled encodings return an explicit unsupported error. These include x87, indirect calls and jumps, and several two-byte groups.
 Programs that use first offsets currently require indexed pattern subsignatures.
@@ -175,13 +176,16 @@ The Rust qualification selects the program through the actual logical index.
 It requires exactly 3,290 VM checks, `Continue`, and no output.
 Stock counts one synthetic entry call. Rust enters the function directly.
 An inactive PE32 control selects no PE hooks.
-Stock also runs the unpacker on the existing UPX fixture's recursive child. Barnacle's signed recursive path remains unqualified.
+The packed ledger selects no signed hook at its root. Stock runs the unpacker on the reconstructed child.
+Barnacle selects one unpacker on the 69,632-byte child at depth one. Enabling it adds 3,290 checks.
+Both Barnacle traversals visit only the packed file and its child and return a matcher miss.
 The production official-feed gate stays in effect. Signed detection and extraction branches still need coverage.
 Native macOS arm64 leaves the architecture field unmodeled. This runtime qualification is limited to Linux arm64.
 [Signed unpacker controls](../tests/bytecode_reference/pe_unpacker.rs)
 
 ```sh
 BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --lib signed_pe_unpacker_receipt -- --ignored
+BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --lib signed_pe_unpacker_recursive_receipt -- --ignored
 BARNACLE_CVD_DIR=/path/to/snapshot cargo test --locked --test bytecode_reference stock_signed_receipt_selection -- --ignored
 ```
 
